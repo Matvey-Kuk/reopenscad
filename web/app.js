@@ -141,9 +141,13 @@ const QUEUE_RETRY_LIMIT = 3;
 // exists purely so browser downloads land with a meaningful name on disk.
 let downloadBaseName = 'model';
 let projection = 'perspective';
+// [panX, panY, panZ, pitch, unused, yaw, distance]. The first three are the pan offset in
+// world millimetres: the view presets below are literals of this same shape, which is why
+// picking one resets the pan for free.
 let camera = [0, 0, 0, 58, 0, 28, 140];
 let hasMesh = false;
 let orbitStart = null;
+let panStart = null;
 let renderDebounce = null;
 let workspaceSaveDebounce = null;
 let workspaceSavePromise = null;
@@ -178,6 +182,10 @@ const funnyWords = {
 // --- Ground surface ---------------------------------------------------------------
 // The viewport draws a real Z=0 surface whose divisions carry a millimetre value, so the
 // grid reads as a ruler for the part rather than as decoration.
+// One definition of the perspective field of view: the projection matrix, the grid's
+// view span and the pan scale all have to agree on it or a drag stops tracking the cursor.
+const VIEW_FOV = 32 * Math.PI / 180;
+
 const GROUND_MAJOR_EVERY = 5; // every 5th minor line is promoted to a major line
 const GROUND_TARGET_CELLS = 20; // aim for ~20 minor divisions across the visible span
 const GROUND_MAX_CELLS = 40; // half-count ceiling, bounds the line buffer
@@ -421,6 +429,9 @@ class MeshViewport {
     this.bounds = { min, max };
     this.center = min.map((value, axis) => (value + max[axis]) / 2);
     this.radius = Math.max(1, Math.hypot(...max.map((value, axis) => (value - min[axis]) / 2)));
+    // A new mesh re-frames: the distance is refitted, so the pan offset has to go with it,
+    // or the refitted view would be aimed at empty space beside the model.
+    camera[0] = camera[1] = camera[2] = 0;
     camera[6] = Math.max(this.radius * 4, 20);
     this.draw();
   }
@@ -446,15 +457,56 @@ class MeshViewport {
     return new Float32Array([x[0], y[0], z[0], 0, x[1], y[1], z[1], 0, x[2], y[2], z[2], 0, -dot(x, eye), -dot(y, eye), -dot(z, eye), 1]);
   }
 
+  // The camera target. camera[0..2] is the pan offset the user has dragged the view by,
+  // in world millimetres; everything that framed on the model centre now frames on this,
+  // so orbiting and zooming happen around what the user actually pulled into view.
+  pivot() {
+    return this.center.map((value, axis) => value + camera[axis]);
+  }
+
+  // Half the world height of the orthographic frame. Shared by the projection matrix, the
+  // grid's view span and the pan scale so they can never drift out of agreement.
+  orthoHalfHeight() {
+    return Math.max(this.radius * 1.35, camera[6] * 0.36);
+  }
+
+  // The +X-on-screen and +Y-on-screen directions expressed in world space, derived from
+  // yaw/pitch analytically so they match the basis lookAt() builds for the same angles.
+  screenBasis() {
+    const pitch = camera[3] * Math.PI / 180;
+    const yaw = camera[5] * Math.PI / 180;
+    return [
+      [-Math.sin(yaw), Math.cos(yaw), 0],
+      [-Math.sin(pitch) * Math.cos(yaw), -Math.sin(pitch) * Math.sin(yaw), Math.cos(pitch)],
+    ];
+  }
+
+  // World height of the visible frame in the plane through the pivot, for the active
+  // projection. The grid sizes its divisions against it and a pan drag divides by it.
+  frameHeight() {
+    if (projection === 'orthographic') return this.orthoHalfHeight() * 2;
+    return 2 * camera[6] * Math.tan(VIEW_FOV / 2);
+  }
+
+  // World millimetres per CSS pixel in that same plane. This is what makes a pan drag 1:1 —
+  // the point under the cursor stays under the cursor. Both projections are uniform in X
+  // and Y (the aspect divides out), so one number covers both axes.
+  worldPerPixel() {
+    return this.frameHeight() / Math.max(1, this.canvas.clientHeight);
+  }
+
   projectionMatrix(aspect) {
+    // Panning slides the model sideways without changing its distance, but it does push the
+    // far corners of the grid further away, so the pan offset extends the far plane.
+    const panned = Math.hypot(camera[0], camera[1], camera[2]);
     const near = Math.max(0.01, camera[6] - this.radius * 2.2);
-    const far = camera[6] + this.radius * 4 + 100;
+    const far = camera[6] + this.radius * 4 + panned + 100;
     if (projection === 'orthographic') {
-      const height = Math.max(this.radius * 1.35, camera[6] * 0.36);
+      const height = this.orthoHalfHeight();
       const width = height * aspect;
       return new Float32Array([1 / width, 0, 0, 0, 0, 1 / height, 0, 0, 0, 0, -2 / (far - near), 0, 0, 0, -(far + near) / (far - near), 1]);
     }
-    const f = 1 / Math.tan((32 * Math.PI / 180) / 2);
+    const f = 1 / Math.tan(VIEW_FOV / 2);
     return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) / (near - far), -1, 0, 0, (2 * far * near) / (near - far), 0]);
   }
 
@@ -509,8 +561,10 @@ class MeshViewport {
     return this.axesBuffer;
   }
 
+  // Measured from the pivot rather than the model centre: panning away from the origin has
+  // to lengthen the rays, otherwise the datum they mark stops reaching the visible frame.
   axisLength() {
-    const originOffset = Math.hypot(...this.center);
+    const originOffset = Math.hypot(...this.pivot());
     return Math.max(this.radius * 1.6, (originOffset + this.radius) * 1.15, 1);
   }
 
@@ -528,11 +582,7 @@ class MeshViewport {
   // Divisions are chosen against this, so a square is a comparable size on screen at any zoom.
   viewSpan() {
     const aspect = this.canvas.width / Math.max(1, this.canvas.height);
-    if (projection === 'orthographic') {
-      const height = Math.max(this.radius * 1.35, camera[6] * 0.36) * 2;
-      return Math.max(height, height * aspect);
-    }
-    const height = 2 * camera[6] * Math.tan((32 * Math.PI / 180) / 2);
+    const height = this.frameHeight();
     return Math.max(height, height * aspect);
   }
 
@@ -739,12 +789,15 @@ class MeshViewport {
     }
     const pitch = camera[3] * Math.PI / 180;
     const yaw = camera[5] * Math.PI / 180;
+    // Orbit and zoom are both defined against the pivot, so a panned view stays panned
+    // through a rotation instead of snapping back to the middle of the model.
+    const pivot = this.pivot();
     const eye = [
-      this.center[0] + camera[6] * Math.cos(pitch) * Math.cos(yaw),
-      this.center[1] + camera[6] * Math.cos(pitch) * Math.sin(yaw),
-      this.center[2] + camera[6] * Math.sin(pitch),
+      pivot[0] + camera[6] * Math.cos(pitch) * Math.cos(yaw),
+      pivot[1] + camera[6] * Math.cos(pitch) * Math.sin(yaw),
+      pivot[2] + camera[6] * Math.sin(pitch),
     ];
-    const view = this.lookAt(eye, this.center, [0, 0, 1]);
+    const view = this.lookAt(eye, pivot, [0, 0, 1]);
     const mvp = this.multiply(this.projectionMatrix(width / height), view);
     this.mvp = mvp;
     this.eye = eye;
@@ -1886,13 +1939,20 @@ const viewCameras = {
   front: [0, 0, 0, 0, 0, -90, 140],
   right: [0, 0, 0, 0, 0, 0, 140],
 };
+// A named view is a promise about framing, so it restores the standard one whole: the
+// preset literals carry a zero pan offset, which puts the model back in the middle.
 $$('[data-view]').forEach((button) => button.addEventListener('click', () => {
   const distance = camera[6];
   camera = [...viewCameras[button.dataset.view]];
   camera[6] = distance;
   meshViewport.draw();
 }));
-$('#fitView').addEventListener('click', () => { camera[6] = Math.max(meshViewport.radius * 4, 20); meshViewport.draw(); });
+// Fit means "show me the model", which it cannot honour while the view is panned off it.
+$('#fitView').addEventListener('click', () => {
+  camera[0] = camera[1] = camera[2] = 0;
+  camera[6] = Math.max(meshViewport.radius * 4, 20);
+  meshViewport.draw();
+});
 $('#zoomIn').addEventListener('click', () => { camera[6] = Math.max(meshViewport.radius * 1.15, camera[6] * .82); meshViewport.draw(); });
 $('#zoomOut').addEventListener('click', () => { camera[6] = Math.min(meshViewport.radius * 30, camera[6] * 1.2); meshViewport.draw(); });
 $('#edgesToggle').addEventListener('change', (event) => { meshViewport.showEdges = event.target.checked; meshViewport.draw(); });
@@ -1995,18 +2055,59 @@ $('#plateSelect').addEventListener('change', (event) => {
   log(plate ? `Build plate: ${plate.label} (${plate.size.join(' × ')} mm).` : 'Build plate cleared.', 'info');
 });
 
+// Panning translates the camera target along the two screen axes. The screen->world scale
+// is taken from the live camera, so the drag is 1:1 in either projection: the world point
+// that was under the cursor when the drag began is still under it when it ends.
+function panView(from, dxPixels, dyPixels) {
+  const [right, up] = meshViewport.screenBasis();
+  const scale = meshViewport.worldPerPixel();
+  for (let axis = 0; axis < 3; axis += 1) {
+    camera[axis] = from[axis] - right[axis] * dxPixels * scale + up[axis] * dyPixels * scale;
+  }
+  meshViewport.draw();
+}
+
 $('#viewport').addEventListener('wheel', (event) => {
   if (!hasMesh) return;
   event.preventDefault();
+  // Shift + wheel pans: the trackpad answer to a middle mouse button. A plain two-finger
+  // scroll deliberately stays on zoom — the browser reports it as an ordinary wheel event,
+  // so claiming it for pan would take scroll-zoom away from every mouse user to no gain.
+  if (event.shiftKey) {
+    panView([camera[0], camera[1], camera[2]], -event.deltaX, -event.deltaY);
+    return;
+  }
   camera[6] = Math.max(meshViewport.radius * 1.15, Math.min(meshViewport.radius * 30, camera[6] * (event.deltaY > 0 ? 1.1 : .9)));
   meshViewport.draw();
 }, { passive: false });
 
+// Pan uses the bindings CAD users already have in their fingers: the middle mouse button
+// (Fusion 360 and every slicer), a right-button drag (PrusaSlicer, Cura, Bambu Studio) and
+// Shift + left drag for laptops and trackpads with no third button. Orbit keeps the plain
+// left drag, so no single press can ever mean both gestures.
+function isPanGesture(event) {
+  return event.button === 1 || event.button === 2 || (event.button === 0 && event.shiftKey);
+}
+
 renderCanvas.addEventListener('pointerdown', (event) => {
-  orbitStart = { x: event.clientX, y: event.clientY, rx: camera[3], rz: camera[5] };
+  // A second pointer (or a second button) must not hijack a gesture already in progress:
+  // the drag that owns the capture is the one that gets to finish.
+  if (orbitStart || panStart) return;
+  if (isPanGesture(event)) {
+    // Stops the middle-click autoscroll widget from stealing the drag on Windows.
+    event.preventDefault();
+    panStart = { x: event.clientX, y: event.clientY, offset: [camera[0], camera[1], camera[2]] };
+    renderCanvas.classList.add('panning');
+  } else if (event.button === 0) {
+    orbitStart = { x: event.clientX, y: event.clientY, rx: camera[3], rz: camera[5] };
+  } else return;
   renderCanvas.setPointerCapture(event.pointerId);
 });
 renderCanvas.addEventListener('pointermove', (event) => {
+  if (panStart) {
+    panView(panStart.offset, event.clientX - panStart.x, event.clientY - panStart.y);
+    return;
+  }
   if (!orbitStart) return;
   const dx = event.clientX - orbitStart.x;
   const dy = event.clientY - orbitStart.y;
@@ -2014,10 +2115,16 @@ renderCanvas.addEventListener('pointermove', (event) => {
   camera[5] = orbitStart.rz + dx * .45;
   meshViewport.draw();
 });
-renderCanvas.addEventListener('pointerup', () => {
-  if (!orbitStart) return;
+function endViewportDrag() {
   orbitStart = null;
-});
+  panStart = null;
+  renderCanvas.classList.remove('panning');
+}
+renderCanvas.addEventListener('pointerup', endViewportDrag);
+renderCanvas.addEventListener('pointercancel', endViewportDrag);
+// A right-button drag is a pan here, as it is in every slicer, so the canvas must not
+// raise the browser menu on top of the model mid-gesture.
+renderCanvas.addEventListener('contextmenu', (event) => event.preventDefault());
 
 $('#customizerButton').addEventListener('click', () => $('#customizer').classList.toggle('closed'));
 $('#closeCustomizer').addEventListener('click', () => $('#customizer').classList.add('closed'));
@@ -2517,6 +2624,89 @@ window.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') closeMcpPanel();
 });
 
+// ---- First-use disclaimer ---------------------------------------------------
+// The acknowledgement key carries a revision. Bump DISCLAIMER_REVISION whenever
+// the terms in #disclaimerModal materially change and everyone sees the dialog
+// again, because their stored consent was to the previous text, not this one.
+const DISCLAIMER_REVISION = 1;
+const DISCLAIMER_STORAGE_KEY = `reopenscad.disclaimerAck.v${DISCLAIMER_REVISION}`;
+let disclaimerReturnFocus = null;
+
+// Storage throws in a blocked-cookie or private context. A disclaimer that
+// cannot remember itself is a nuisance; one that throws out of bootstrap would
+// take the whole app down with it, so both sides are guarded.
+function disclaimerAcknowledged() {
+  try {
+    return localStorage.getItem(DISCLAIMER_STORAGE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function openDisclaimer() {
+  const modal = $('#disclaimerModal');
+  if (!modal.hidden) return;
+  // Lifted verbatim out of the status bar rather than restated, so the
+  // non-affiliation sentence has exactly one author and cannot drift.
+  $('#disclaimerAffiliation').textContent = $('.status-attribution > span')?.textContent.trim() ?? '';
+  disclaimerReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  modal.hidden = false;
+  $('#acceptDisclaimer').focus();
+}
+
+function closeDisclaimer() {
+  const modal = $('#disclaimerModal');
+  if (modal.hidden) return;
+  modal.hidden = true;
+  const restore = disclaimerReturnFocus;
+  disclaimerReturnFocus = null;
+  // On first use nothing was focused yet (activeElement was <body>), so hand the
+  // caret to the editor — the thing the reader came here to type in.
+  if (restore && restore.isConnected && restore !== document.body) restore.focus();
+  else editor.focus();
+}
+
+function acceptDisclaimer() {
+  try {
+    localStorage.setItem(DISCLAIMER_STORAGE_KEY, '1');
+  } catch {
+    // Unable to persist: the dialog will return next load. Better than failing.
+  }
+  closeDisclaimer();
+}
+
+function disclaimerFocusables() {
+  return $$('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])', $('#disclaimerModal'))
+    .filter((element) => !element.disabled && element.tabIndex !== -1);
+}
+
+$('#acceptDisclaimer').addEventListener('click', acceptDisclaimer);
+$('#showDisclaimer').addEventListener('click', openDisclaimer);
+// Deliberately no Escape handler and no scrim click: acknowledging is the point
+// of the dialog, and a reflex keypress is not an acknowledgement. The button is
+// the only exit, which is also why it is the element that takes focus on open.
+$('#disclaimerModal').addEventListener('keydown', (event) => {
+  if (event.key !== 'Tab') return;
+  const focusable = disclaimerFocusables();
+  if (!focusable.length) { event.preventDefault(); return; }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  const inside = $('#disclaimerModal').contains(document.activeElement);
+  if (event.shiftKey && (!inside || document.activeElement === first)) { event.preventDefault(); last.focus(); }
+  else if (!event.shiftKey && (!inside || document.activeElement === last)) { event.preventDefault(); first.focus(); }
+});
+// Backstop for focus the trap above cannot see: programmatic focus from the
+// booting app, or the browser restoring focus after the address bar.
+document.addEventListener('focusin', (event) => {
+  const modal = $('#disclaimerModal');
+  if (modal.hidden || modal.contains(event.target)) return;
+  $('#acceptDisclaimer').focus();
+});
+
+function showDisclaimerIfUnacknowledged() {
+  if (!disclaimerAcknowledged()) openDisclaimer();
+}
+
 const syncControl = $('#syncState');
 syncControl.setAttribute('role', 'button');
 syncControl.tabIndex = 0;
@@ -2603,6 +2793,10 @@ function workspaceIdFromLocation() {
 }
 
 async function bootstrap() {
+  // Synchronous, awaits nothing, and nothing below awaits it: the workspace is
+  // created and the first preview is rendered underneath the dialog exactly as
+  // it would be without one.
+  showDisclaimerIfUnacknowledged();
   const requestedId = workspaceIdFromLocation();
   // Legacy unscoped cache: it belonged to whichever workspace was edited last, so visiting
   // "/" used to clone that source into a brand new workspace. Drop it for good.

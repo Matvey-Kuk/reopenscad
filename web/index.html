@@ -140,7 +140,12 @@
               <p class="render-note" id="renderNote" hidden>Still compiling. Exact boolean geometry on a large model can take a minute.</p>
               <button type="button" class="overlay-cancel" id="overlayCancel">Cancel render</button>
             </div>
-            <div class="view-hint"><span>DRAG</span> orbit <span>SCROLL</span> zoom</div>
+            <!-- Two lines, because one would run under the scale badge on the left and the
+                 zoom cluster on the right at the pane's usual width. -->
+            <div class="view-hint">
+              <div><span>DRAG</span> orbit <span>SCROLL</span> zoom</div>
+              <div><span>MIDDLE / SHIFT+DRAG</span> pan</div>
+            </div>
             <div class="viewport-fab">
               <button id="zoomIn" aria-label="Zoom in">+</button>
               <button id="zoomOut" aria-label="Zoom out">−</button>
@@ -167,7 +172,7 @@
 
       <footer class="status-bar">
         <div><span class="status-ready" id="statusDot"></span><span id="statusText">Ready</span></div>
-        <div class="status-attribution"><span>Independent reimplementation — not affiliated with or endorsed by the <a href="https://openscad.org" target="_blank" rel="noreferrer noopener">OpenSCAD project</a>.<span class="attribution-more"> Implements the OpenSCAD language; contains no OpenSCAD source code.</span></span></div>
+        <div class="status-attribution"><span>Independent reimplementation — not affiliated with or endorsed by the <a href="https://openscad.org" target="_blank" rel="noreferrer noopener">OpenSCAD project</a>.<span class="attribution-more"> Implements the OpenSCAD language; contains no OpenSCAD source code.</span></span><button type="button" class="status-disclaimer" id="showDisclaimer" title="Show the first-use disclaimer again">Disclaimer</button></div>
         <div class="status-right"><span id="cursorPosition">Ln 1, Col 1</span><span>Spaces: 2</span><span>UTF-8</span><span id="renderTime">No render yet</span></div>
       </footer>
     </div>
@@ -225,6 +230,31 @@
             <div class="mcp-tool-grid" id="mcpToolGrid"><div class="mcp-tools-empty">Run the connection check to list the tools this server actually advertises.</div></div>
           </section>
         </div>
+      </div>
+    </div>
+
+    <!-- First-use disclaimer. Same modal furniture as #mcpModal (scrim, dialog,
+         crop ticks) so there is one modal system, not two — but this one has no
+         close affordance and no scrim click: the only way out is the button. -->
+    <div class="mcp-modal disclaimer-modal" id="disclaimerModal" hidden>
+      <div class="mcp-scrim"></div>
+      <div class="mcp-dialog disclaimer-dialog" role="dialog" aria-modal="true" aria-labelledby="disclaimerTitle" aria-describedby="disclaimerBody">
+        <header class="mcp-head">
+          <div class="mcp-head-text">
+            <span class="eyebrow">Before you start</span>
+            <h2 id="disclaimerTitle">A hobby project, for demonstration only</h2>
+          </div>
+        </header>
+        <div class="mcp-body disclaimer-body" id="disclaimerBody">
+          <p>ReOpenSCAD is a hobby project, published for demonstration purposes. It is provided <b>as is</b>, with <b>no warranty</b> and <b>no liability</b> of any kind.</p>
+          <p><b>Workspaces are not private.</b> There is no login — the URL is the only key, so anyone holding the link can read and change your work.</p>
+          <p><b>This is not storage you can rely on.</b> A workspace is deleted 14 days after its last change, and only the 512 most recent are kept. Keep your own copy of anything that matters.</p>
+          <p>Exported geometry is not checked for you. Verify it before you print or manufacture from it.</p>
+          <p class="disclaimer-affiliation" id="disclaimerAffiliation"></p>
+        </div>
+        <footer class="disclaimer-foot">
+          <button type="button" class="disclaimer-accept" id="acceptDisclaimer">I understand</button>
+        </footer>
       </div>
     </div>
 

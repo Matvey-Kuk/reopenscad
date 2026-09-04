@@ -581,7 +581,7 @@ test('no orphaned element ids or unreachable CSS classes accumulate in the shell
   // Every id in the markup is used by a script, a stylesheet, or an ARIA relationship.
   const orphanIds = [...html.matchAll(/\sid="([^"]+)"/g)]
     .map((match) => match[1])
-    .filter((id) => !javascript.includes(id) && !css.includes(`#${id}`) && !html.includes(`labelledby="${id}"`));
+    .filter((id) => !javascript.includes(id) && !css.includes(`#${id}`) && !html.includes(`labelledby="${id}"`) && !html.includes(`describedby="${id}"`));
   assert.deepEqual(orphanIds, [], 'ids nothing references');
   // Every class the stylesheet targets is emitted somewhere. `tok-*` is built by template
   // (`tok-${type}`) and is exempted by prefix rather than by name.
@@ -719,4 +719,296 @@ test('render response geometry is decoded once, not once per copy', () => {
   assert.doesNotMatch(setMesh, /const combined = this\.decodeStl/);
   // Batch extents are what the union above is built from.
   assert.match(javascript, /triangles: decoded\.triangles, min: decoded\.min, max: decoded\.max/);
+});
+
+test('the first-use disclaimer states the terms it exists to state', () => {
+  const dialog = html.slice(html.indexOf('<div class="mcp-modal disclaimer-modal"'), html.indexOf('<script src="/app.js"'));
+  assert.match(dialog, /hobby project/i);
+  assert.match(dialog, /demonstration purposes/i);
+  assert.match(dialog, /<b>as is<\/b>/);
+  assert.match(dialog, /<b>no warranty<\/b>/);
+  assert.match(dialog, /<b>no liability<\/b>/);
+  assert.match(dialog, /<b>Workspaces are not private\.<\/b>/);
+  assert.match(dialog, /the URL is the only key/);
+  // The retention claims must be the server's real numbers, not a guess:
+  // WORKSPACE_TTL_MS = 14 days and MAX_WORKSPACES = 512 in backend/src/main.rs.
+  assert.match(dialog, /deleted 14 days after its last change/);
+  assert.match(dialog, /only the 512 most recent are kept/);
+  assert.match(dialog, /Verify it before you print or manufacture/);
+});
+
+test('the disclaimer reuses the status bar non-affiliation sentence instead of restating it', () => {
+  const dialog = html.slice(html.indexOf('<div class="mcp-modal disclaimer-modal"'), html.indexOf('<script src="/app.js"'));
+  // The dialog ships an empty slot; the wording is lifted out of the status bar
+  // at open time, so there is exactly one copy of the sentence in the product.
+  assert.match(dialog, /<p class="disclaimer-affiliation" id="disclaimerAffiliation"><\/p>/);
+  assert.doesNotMatch(dialog, /not affiliated/i);
+  assert.match(javascript, /\$\('#disclaimerAffiliation'\)\.textContent = \$\('\.status-attribution > span'\)\?\.textContent\.trim\(\)/);
+  assert.equal((html.match(/not affiliated with or endorsed by/g) || []).length, 1);
+});
+
+test('the disclaimer is acknowledged once, under a versioned key', () => {
+  assert.match(javascript, /const DISCLAIMER_REVISION = \d+;/);
+  assert.match(javascript, /const DISCLAIMER_STORAGE_KEY = `reopenscad\.disclaimerAck\.v\$\{DISCLAIMER_REVISION\}`;/);
+  const gate = javascript.slice(javascript.indexOf('function disclaimerAcknowledged'), javascript.indexOf('function openDisclaimer'));
+  assert.match(gate, /localStorage\.getItem\(DISCLAIMER_STORAGE_KEY\) === '1'/);
+  // Storage is unavailable in some contexts; neither reading nor writing it may
+  // throw out of bootstrap.
+  assert.match(gate, /catch \{\s*return false;/);
+  const accept = javascript.slice(javascript.indexOf('function acceptDisclaimer'), javascript.indexOf('function disclaimerFocusables'));
+  assert.match(accept, /try \{\s*localStorage\.setItem\(DISCLAIMER_STORAGE_KEY, '1'\);\s*\} catch/);
+  assert.match(accept, /closeDisclaimer\(\)/);
+});
+
+test('dismissing the disclaimer takes a deliberate press of its one button', () => {
+  const dialog = html.slice(html.indexOf('<div class="mcp-modal disclaimer-modal"'), html.indexOf('<script src="/app.js"'));
+  assert.match(dialog, /id="acceptDisclaimer">I understand</);
+  // No close glyph and, unlike #mcpScrim, no id on the scrim to hang a
+  // click-to-dismiss listener from.
+  assert.doesNotMatch(dialog, /mcp-close/);
+  assert.match(dialog, /<div class="mcp-scrim"><\/div>/);
+  assert.match(javascript, /\$\('#acceptDisclaimer'\)\.addEventListener\('click', acceptDisclaimer\)/);
+  // Escape closes the MCP panel and must not close this one: a reflex keypress
+  // is not an acknowledgement.
+  const wiring = javascript.slice(javascript.indexOf('// ---- First-use disclaimer'), javascript.indexOf("const syncControl = $('#syncState')"));
+  assert.doesNotMatch(wiring, /'Escape'/);
+});
+
+test('the disclaimer is a labelled modal that traps focus and gives it back', () => {
+  const dialog = html.slice(html.indexOf('<div class="mcp-modal disclaimer-modal"'), html.indexOf('<script src="/app.js"'));
+  assert.match(dialog, /role="dialog" aria-modal="true" aria-labelledby="disclaimerTitle" aria-describedby="disclaimerBody"/);
+  assert.match(dialog, /<h2 id="disclaimerTitle">/);
+  const open = javascript.slice(javascript.indexOf('function openDisclaimer'), javascript.indexOf('function closeDisclaimer'));
+  assert.match(open, /disclaimerReturnFocus = document\.activeElement/);
+  assert.match(open, /\$\('#acceptDisclaimer'\)\.focus\(\)/);
+  const close = javascript.slice(javascript.indexOf('function closeDisclaimer'), javascript.indexOf('function acceptDisclaimer'));
+  assert.match(close, /restore\.isConnected && restore !== document\.body\) restore\.focus\(\)/);
+  assert.match(close, /else editor\.focus\(\)/);
+  // Tab wraps inside the dialog, and a focusin backstop catches focus the app
+  // moves programmatically while the dialog is up.
+  const wiring = javascript.slice(javascript.indexOf('// ---- First-use disclaimer'), javascript.indexOf("const syncControl = $('#syncState')"));
+  assert.match(wiring, /if \(event\.key !== 'Tab'\) return;/);
+  assert.match(wiring, /event\.preventDefault\(\); last\.focus\(\);/);
+  assert.match(wiring, /event\.preventDefault\(\); first\.focus\(\);/);
+  assert.match(wiring, /document\.addEventListener\('focusin'/);
+});
+
+test('the disclaimer never blocks the boot path, and can be reopened later', () => {
+  const boot = javascript.slice(javascript.indexOf('async function bootstrap()'), javascript.indexOf('// Back/forward moves between workspaces'));
+  // Fire-and-forget: not awaited, and it precedes nothing it could reorder.
+  assert.match(boot, /^ {2}showDisclaimerIfUnacknowledged\(\);$/m);
+  assert.doesNotMatch(boot, /await showDisclaimerIfUnacknowledged/);
+  assert.ok(boot.indexOf('showDisclaimerIfUnacknowledged()') < boot.indexOf('createWorkspace'));
+  assert.match(boot, /await createWorkspace\(''\)/);
+  assert.match(boot, /setTimeout\(\(\) => render\('preview'\), 180\)/);
+  // Dismissal is not irreversible: the status bar keeps a way back to it.
+  assert.match(html, /id="showDisclaimer"/);
+  assert.match(javascript, /\$\('#showDisclaimer'\)\.addEventListener\('click', openDisclaimer\)/);
+});
+
+test('the disclaimer borrows the MCP modal shell rather than adding a second one', () => {
+  const dialog = html.slice(html.indexOf('<div class="mcp-modal disclaimer-modal"'), html.indexOf('<script src="/app.js"'));
+  assert.match(dialog, /class="mcp-modal disclaimer-modal"/);
+  assert.match(dialog, /class="mcp-dialog disclaimer-dialog"/);
+  assert.match(dialog, /class="mcp-body disclaimer-body"/);
+  assert.match(css, /\.disclaimer-dialog \{ grid-template-rows: auto minmax\(0, 1fr\) auto;/);
+  // It sits above the MCP modal's z-index so it can never be buried.
+  assert.match(css, /\.disclaimer-modal \{ z-index: 60; \}/);
+  // Reading width, not the MCP panel's 960px workbench.
+  assert.match(css, /\.disclaimer-dialog \{[^}]*width: min\(520px, 100%\)/);
+});
+
+// The camera maths is pulled out of the source and run for real rather than pattern
+// matched: a pan that is off by a factor is the difference between "feels like Fusion"
+// and "feels broken", and only arithmetic can catch that.
+function cameraModule() {
+  const methods = javascript.slice(javascript.indexOf('  multiply(a, b) {'), javascript.indexOf('  scaleMatrix(scale) {'));
+  const panning = javascript.slice(javascript.indexOf('function panView('), javascript.indexOf("$('#viewport').addEventListener('wheel'"));
+  // Taken from the source too, so the harness cannot drift from the field of view the
+  // projection matrix actually uses.
+  const fov = javascript.match(/const VIEW_FOV = ([^;]+);/)[1];
+  return new Function('camera', 'projection', `
+    const VIEW_FOV = ${fov};
+    class View { ${methods} }
+    const view = new View();
+    view.center = [4, -6, 3];
+    view.radius = 50;
+    view.draw = () => {};
+    view.canvas = { width: 800, height: 600, clientWidth: 800, clientHeight: 600 };
+    const meshViewport = view;
+    ${panning}
+    return { view, panView };
+  `);
+}
+
+// Mirrors draw()'s eye placement so a projected point can be checked without a GL context.
+// The static assertions below pin draw() to this same formula.
+function projectThrough(view, camera, point) {
+  const pitch = camera[3] * Math.PI / 180;
+  const yaw = camera[5] * Math.PI / 180;
+  const pivot = view.pivot();
+  const eye = [
+    pivot[0] + camera[6] * Math.cos(pitch) * Math.cos(yaw),
+    pivot[1] + camera[6] * Math.cos(pitch) * Math.sin(yaw),
+    pivot[2] + camera[6] * Math.sin(pitch),
+  ];
+  const mvp = view.multiply(view.projectionMatrix(view.canvas.width / view.canvas.height), view.lookAt(eye, pivot, [0, 0, 1]));
+  const clip = [0, 1, 2, 3].map((row) => mvp[row] * point[0] + mvp[4 + row] * point[1] + mvp[8 + row] * point[2] + mvp[12 + row]);
+  return {
+    x: (clip[0] / clip[3] * 0.5 + 0.5) * view.canvas.width,
+    y: (0.5 - clip[1] / clip[3] * 0.5) * view.canvas.height,
+  };
+}
+
+test('a pan drag moves the world 1:1 under the cursor, in both projections', () => {
+  const make = cameraModule();
+  for (const projection of ['perspective', 'orthographic']) {
+    for (const angles of [[58, 28, 140], [-23, 137, 88], [0, -90, 300]]) {
+      const camera = [0, 0, 0, angles[0], 0, angles[1], angles[2]];
+      const { view, panView } = make(camera, projection);
+      // Witnesses in the plane through the pivot perpendicular to the view axis: that is
+      // the plane a pan is defined against, so tracking there must be exact.
+      const [right, up] = view.screenBasis();
+      const pivot = view.pivot();
+      const witnesses = [[0, 0], [21, 0], [0, -17], [-33, 12]]
+        .map(([a, b]) => [0, 1, 2].map((i) => pivot[i] + right[i] * a + up[i] * b));
+      const before = witnesses.map((point) => projectThrough(view, camera, point));
+      const dx = 62;
+      const dy = -41;
+      panView([camera[0], camera[1], camera[2]], dx, dy);
+      const after = witnesses.map((point) => projectThrough(view, camera, point));
+      const label = `${projection} ${angles.join('/')}`;
+      // Tolerance is float32 noise from the Float32Array matrices, not slop in the mapping:
+      // a thousandth of a pixel is three orders of magnitude tighter than "feels 1:1".
+      after.forEach((q, index) => {
+        assert.ok(Math.abs(q.x - before[index].x - dx) < 1e-3, `${label}: x moved ${q.x - before[index].x}, wanted ${dx}`);
+        assert.ok(Math.abs(q.y - before[index].y - dy) < 1e-3, `${label}: y moved ${q.y - before[index].y}, wanted ${dy}`);
+      });
+    }
+  }
+});
+
+test('the screen basis a pan translates along is the one lookAt builds', () => {
+  const make = cameraModule();
+  for (const angles of [[58, 28], [-23, 137], [12, -90]]) {
+    const camera = [0, 0, 0, angles[0], 0, angles[1], 140];
+    const { view } = make(camera, 'perspective');
+    const pitch = camera[3] * Math.PI / 180;
+    const yaw = camera[5] * Math.PI / 180;
+    const pivot = view.pivot();
+    const eye = [
+      pivot[0] + camera[6] * Math.cos(pitch) * Math.cos(yaw),
+      pivot[1] + camera[6] * Math.cos(pitch) * Math.sin(yaw),
+      pivot[2] + camera[6] * Math.sin(pitch),
+    ];
+    const m = view.lookAt(eye, pivot, [0, 0, 1]);
+    // Column-major view matrix: row 0 is screen right, row 1 is screen up, in world space.
+    const [right, up] = view.screenBasis();
+    [0, 1, 2].forEach((axis) => {
+      assert.ok(Math.abs(right[axis] - m[axis * 4]) < 1e-6, `right[${axis}] ${right[axis]} vs ${m[axis * 4]}`);
+      assert.ok(Math.abs(up[axis] - m[axis * 4 + 1]) < 1e-6, `up[${axis}] ${up[axis]} vs ${m[axis * 4 + 1]}`);
+    });
+  }
+});
+
+test('each projection supplies its own screen-to-world scale', () => {
+  const make = cameraModule();
+  const camera = [0, 0, 0, 58, 0, 28, 140];
+  const perspective = make(camera, 'perspective').view;
+  // 32 degree vertical field of view, measured in the plane through the pivot.
+  assert.ok(Math.abs(perspective.worldPerPixel() - 2 * 140 * Math.tan(16 * Math.PI / 180) / 600) < 1e-9);
+  const orthographic = make(camera, 'orthographic').view;
+  assert.ok(Math.abs(orthographic.worldPerPixel() - 2 * Math.max(50 * 1.35, 140 * 0.36) / 600) < 1e-9);
+  // Getting the two confused is the classic pan bug, so they must actually differ here.
+  assert.notEqual(perspective.worldPerPixel(), orthographic.worldPerPixel());
+  // Each frame constant has exactly one definition, shared by the projection matrix, the
+  // grid's view span and the pan scale: three copies of the field of view is how a pan
+  // silently stops tracking the cursor.
+  const viewport = javascript.slice(javascript.indexOf('class MeshViewport'), javascript.indexOf('const meshViewport = new MeshViewport'));
+  assert.equal((viewport.match(/this\.radius \* 1\.35, camera\[6\] \* 0\.36/g) || []).length, 1);
+  assert.equal((javascript.match(/32 \* Math\.PI \/ 180/g) || []).length, 1, 'the field of view is a named constant, not a repeated literal');
+  assert.match(viewport, /orthoHalfHeight\(\) \{/);
+  assert.match(viewport, /frameHeight\(\) \{/);
+  // viewSpan and worldPerPixel are the same frame measured two ways, so they share it.
+  const span = javascript.slice(javascript.indexOf('  viewSpan() {'), javascript.indexOf('  groundSpan() {'));
+  assert.match(span, /const height = this\.frameHeight\(\);/);
+});
+
+test('the whole view frames on the panned target, not the model centre', () => {
+  const make = cameraModule();
+  const camera = [0, 0, 0, 58, 0, 28, 140];
+  const { view, panView } = make(camera, 'perspective');
+  assert.deepEqual(view.pivot(), [4, -6, 3]);
+  panView([0, 0, 0], 40, -20);
+  assert.deepEqual(view.pivot(), [4 + camera[0], -6 + camera[1], 3 + camera[2]]);
+  assert.notDeepEqual(view.pivot(), view.center);
+  // camera[0..2] is the pan offset, so orbit and zoom stay untouched by a pan.
+  assert.equal(camera[3], 58);
+  assert.equal(camera[5], 28);
+  assert.equal(camera[6], 140);
+
+  // Orbit and zoom are both defined against the pivot, so a panned view survives them.
+  const drawing = javascript.slice(javascript.indexOf('  draw() {'), javascript.indexOf('  projectPoint(point) {'));
+  assert.match(drawing, /const pivot = this\.pivot\(\);/);
+  assert.match(drawing, /pivot\[0\] \+ camera\[6\] \* Math\.cos\(pitch\) \* Math\.cos\(yaw\)/);
+  assert.match(drawing, /this\.lookAt\(eye, pivot, \[0, 0, 1\]\)/);
+  assert.doesNotMatch(drawing, /this\.lookAt\(eye, this\.center/);
+  // The axes are world geometry: their reach is measured from the pivot too, or panning
+  // away from the origin would leave the datum short of the frame.
+  assert.match(javascript, /const originOffset = Math\.hypot\(\.\.\.this\.pivot\(\)\);/);
+});
+
+test('pan uses the bindings CAD users already have, and orbit keeps the plain drag', () => {
+  assert.match(javascript, /function isPanGesture\(event\) \{[\s\S]*?event\.button === 1 \|\| event\.button === 2 \|\| \(event\.button === 0 && event\.shiftKey\)/);
+  const pointer = javascript.slice(javascript.indexOf("renderCanvas.addEventListener('pointerdown'"), javascript.indexOf("$('#customizerButton')"));
+  // One press can only ever mean one gesture.
+  assert.match(pointer, /if \(isPanGesture\(event\)\) \{/);
+  assert.match(pointer, /\} else if \(event\.button === 0\) \{\n\s+orbitStart = \{/);
+  assert.match(pointer, /if \(panStart\) \{\n\s+panView\(panStart\.offset/);
+  // A drag that ends outside the canvas, or is cancelled, must not leave a gesture latched.
+  assert.match(pointer, /renderCanvas\.addEventListener\('pointerup', endViewportDrag\)/);
+  assert.match(pointer, /renderCanvas\.addEventListener\('pointercancel', endViewportDrag\)/);
+  assert.match(pointer, /renderCanvas\.setPointerCapture\(event\.pointerId\)/);
+  // A right drag is a pan, so the browser menu must not land on top of the model.
+  assert.match(pointer, /addEventListener\('contextmenu', \(event\) => event\.preventDefault\(\)\)/);
+  // Shift + wheel is the trackpad pan; a plain wheel is still the zoom every mouse expects.
+  const wheel = javascript.slice(javascript.indexOf("$('#viewport').addEventListener('wheel'"), javascript.indexOf('function isPanGesture'));
+  assert.match(wheel, /if \(event\.shiftKey\) \{\n\s+panView\(\[camera\[0\], camera\[1\], camera\[2\]\], -event\.deltaX, -event\.deltaY\);/);
+  assert.match(wheel, /camera\[6\] = Math\.max\(meshViewport\.radius \* 1\.15/);
+  // Discoverable, and the mode is visible while it is happening.
+  const viewHint = html.slice(html.indexOf('<div class="view-hint">'), html.indexOf('<div class="viewport-fab">'));
+  assert.match(viewHint, /<span>DRAG<\/span> orbit <span>SCROLL<\/span> zoom/);
+  assert.match(viewHint, /<span>MIDDLE \/ SHIFT\+DRAG<\/span> pan/);
+  // One line would run under the scale badge and the zoom cluster at the pane's width.
+  assert.match(css, /\.view-hint \{[^}]*display: grid;/);
+  assert.match(css, /\.render-canvas\.panning[^{]*\{ cursor: grabbing; \}/);
+  assert.match(javascript, /renderCanvas\.classList\.add\('panning'\)/);
+  assert.match(javascript, /renderCanvas\.classList\.remove\('panning'\)/);
+});
+
+test('anything that restores a known framing clears the pan', () => {
+  // The presets are literals of the camera tuple, so their zero pan offset is the reset.
+  const presets = javascript.slice(javascript.indexOf('const viewCameras = {'), javascript.indexOf("$('#zoomIn')"));
+  assert.match(presets, /reset: \[0, 0, 0,/);
+  assert.match(presets, /top: \[0, 0, 0,/);
+  assert.match(presets, /front: \[0, 0, 0,/);
+  assert.match(presets, /right: \[0, 0, 0,/);
+  assert.match(presets, /camera = \[\.\.\.viewCameras\[button\.dataset\.view\]\]/);
+  // Fit cannot honour "show me the model" while the view is aimed beside it.
+  assert.match(presets, /#fitView'\)\.addEventListener\('click', \(\) => \{\n\s+camera\[0\] = camera\[1\] = camera\[2\] = 0;/);
+  // A new mesh refits the distance, so the pan has to go with it.
+  const setMesh = javascript.slice(javascript.indexOf('  setMesh(encoded, objects = []) {'), javascript.indexOf('  multiply(a, b) {'));
+  assert.match(setMesh, /camera\[0\] = camera\[1\] = camera\[2\] = 0;/);
+  assert.ok(setMesh.indexOf('camera[0] = camera[1] = camera[2] = 0;') < setMesh.indexOf('this.draw();'));
+});
+
+test('panning does not disturb the grid step or the far plane', () => {
+  // Grid spacing is derived from the model and the visible frame only: no pan term, so
+  // dragging the view cannot make the divisions flicker between steps.
+  const span = javascript.slice(javascript.indexOf('  groundSpan() {'), javascript.indexOf('  groundExtents() {'));
+  assert.doesNotMatch(span, /camera\[0\]|this\.pivot\(\)/);
+  // The far plane does grow with the pan, or a far-panned grid corner would be clipped.
+  const projectionMatrix = javascript.slice(javascript.indexOf('  projectionMatrix(aspect) {'), javascript.indexOf('  scaleMatrix(scale) {'));
+  assert.match(projectionMatrix, /const panned = Math\.hypot\(camera\[0\], camera\[1\], camera\[2\]\);/);
+  assert.match(projectionMatrix, /const far = camera\[6\] \+ this\.radius \* 4 \+ panned \+ 100;/);
 });

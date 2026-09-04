@@ -4,8 +4,21 @@ Workspaces live in Cloud SQL for PostgreSQL. Rendered meshes and exports are
 never stored — they are recomputed on demand from the workspace source, so the
 database holds only documents, and there is no cache to invalidate.
 
-These commands were verified locally against Postgres in Docker, not against a
-real GCP project. Run them yourself.
+These commands have been run end to end against a real GCP project
+(`friendly-path-465518-r6`, `us-central1`). Where the first draft was wrong,
+the corrected form is below.
+
+Two environment prerequisites, both of which bite in a non-interactive shell:
+
+```sh
+# Domain mapping (§8) lives in the beta surface, which is not installed by
+# default. Without --quiet the installer prompts and aborts.
+gcloud components install beta --quiet
+
+# gcloud's OAuth token expires; every command below fails with
+# "Reauthentication failed" until you re-run this.
+gcloud auth login
+```
 
 ---
 
@@ -129,12 +142,18 @@ export RUNTIME_SA="$(gcloud projects describe "$PROJECT_ID" \
 
 gcloud secrets add-iam-policy-binding reopenscad-database-url \
   --member="serviceAccount:$RUNTIME_SA" \
-  --role=roles/secretmanager.secretAccessor
+  --role=roles/secretmanager.secretAccessor \
+  --condition=None
 
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member="serviceAccount:$RUNTIME_SA" \
-  --role=roles/cloudsql.client
+  --role=roles/cloudsql.client \
+  --condition=None
 ```
+
+`--condition=None` is not optional in a script. Without it `gcloud` prompts to
+choose a binding condition, and a non-interactive shell fails the command
+rather than defaulting to an unconditional binding.
 
 Storing the whole string rather than just the password keeps the password out
 of the service's environment entirely — `gcloud run services describe` shows

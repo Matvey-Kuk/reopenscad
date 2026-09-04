@@ -148,6 +148,8 @@ button { color: inherit; }
 .plate-field select:focus-visible { outline: 1px solid var(--blue); }
 .sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .render-canvas:active { cursor: grabbing; }
+/* A middle- or right-button drag never sets :active, so panning states its own cursor. */
+.render-canvas.panning, .render-canvas.panning:active { cursor: grabbing; }
 .empty-state { position: absolute; z-index: 2; left: 50%; top: 48%; transform: translate(-50%, -50%); text-align: center; color: var(--muted); animation: arrive .45s ease both; }
 .empty-state img { width: 58px; opacity: .28; filter: grayscale(1); }
 .empty-state h1 { margin: 12px 0 3px; color: #d3d8dd; font-size: 22px; letter-spacing: -.04em; }
@@ -156,8 +158,8 @@ kbd { font: 9px var(--mono); }
 .empty-state button { border: 1px solid #567b36; border-radius: 3px; background: #23311c; color: #9dd36c; padding: 8px 13px; cursor: pointer; }
 /* World axes are drawn as real geometry in the WebGL scene (MeshViewport.drawAxes),
    so they orbit and zoom with the model; no screen-space gizmo overlay here. */
-.view-hint { position: absolute; z-index: 3; left: 50%; bottom: 13px; transform: translateX(-50%); color: #4f5964; font: 8px var(--mono); text-transform: uppercase; letter-spacing: .08em; white-space: nowrap; }
-.view-hint span { color: #78838f; margin-left: 8px; }.view-hint span:first-child { margin-left: 0; }
+.view-hint { position: absolute; z-index: 3; left: 50%; bottom: 13px; transform: translateX(-50%); display: grid; gap: 3px; justify-items: center; color: #4f5964; font: 8px var(--mono); text-transform: uppercase; letter-spacing: .08em; white-space: nowrap; }
+.view-hint span { color: #78838f; margin-left: 8px; }.view-hint div span:first-child { margin-left: 0; }
 .viewport-fab { position: absolute; z-index: 3; right: 12px; bottom: 12px; display: grid; border: 1px solid #303842; border-radius: 4px; overflow: hidden; box-shadow: 0 4px 14px rgba(0,0,0,.3); }
 .viewport-fab button { width: 27px; height: 27px; border: 0; border-bottom: 1px solid #303842; background: #1d232a; color: #909aa5; cursor: pointer; font: 16px var(--mono); }
 .viewport-fab button:last-child { border: 0; }.viewport-fab button:hover { color: #fff; background: #2a323c; }.viewport-fab svg { width: 14px; }
@@ -299,6 +301,24 @@ kbd { font: 9px var(--mono); }
 .mcp-tool b { display: block; color: var(--yellow); font: 9.5px var(--mono); letter-spacing: -.01em; }
 .mcp-tool span { display: block; margin-top: 3px; color: #808a95; font-size: 9px; line-height: 1.5; }
 .mcp-tools-empty { grid-column: 1 / -1; border: 1px dashed #303842; border-radius: 3px; padding: 14px; text-align: center; color: var(--dim); font-size: 9px; }
+
+/* First-use disclaimer: the MCP dialog's shell at a reading width, one column,
+   with a footer row for the acknowledgement instead of a close button. */
+.disclaimer-modal { z-index: 60; }
+.disclaimer-dialog { grid-template-rows: auto minmax(0, 1fr) auto; width: min(520px, 100%); max-height: min(86vh, 640px); }
+.disclaimer-body { display: block; padding: 15px 17px 16px; }
+.disclaimer-body p { margin: 0 0 11px; color: #9aa4af; font-size: 11px; line-height: 1.6; }
+.disclaimer-body p:last-child { margin-bottom: 0; }
+.disclaimer-body b { color: var(--ink); font-weight: 600; }
+.disclaimer-affiliation { border-top: 1px solid #262d36; padding-top: 11px; color: #6f7883 !important; font-size: 10px !important; }
+.disclaimer-foot { display: flex; justify-content: flex-end; padding: 12px 17px; border-top: 1px solid #0d1014; box-shadow: 0 1px #262d36 inset; background: #161b21; }
+.disclaimer-accept { min-width: 128px; height: 29px; border: 1px solid #4a5a68; border-radius: 3px; background: #242b34; color: #b9d3e6; cursor: pointer; font: 9px var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+.disclaimer-accept:hover { border-color: #6c8296; background: #2c343e; color: #fff; }
+.disclaimer-accept:focus-visible { outline: 1px solid var(--blue); outline-offset: 2px; }
+
+.status-disclaimer { flex: none; margin-left: 10px; border: 0; background: transparent; color: var(--muted); padding: 0; font: inherit; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.status-disclaimer:hover { color: var(--ink); }
+.status-disclaimer:focus-visible { outline: 1px solid var(--blue); outline-offset: 2px; border-radius: 2px; }
 
 @media (max-width: 860px) {
   .mcp-modal { padding: 10px; }
