@@ -4,17 +4,32 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#15191f" />
+    <!-- A workspace URL is its own credential, so the shell is noindex by
+         default and the server strips this line for the one route that is
+         meant to be found — the landing page. Failing to strip it costs
+         discoverability; failing to add it would cost confidentiality, so it
+         lives here rather than being injected. `Referrer-Policy: no-referrer`
+         and `X-Robots-Tag` accompany it on every response. -->
+    <meta name="robots" content="noindex, nofollow, noarchive" />
     <title>ReOpenSCAD</title>
     <link rel="icon" type="image/svg+xml" href="/legacy-assets/icons/reopenscad.svg" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
+    <div class="mobile-gate" role="alert">
+      <img src="/legacy-assets/icons/reopenscad.svg" alt="" />
+      <h1>Works only on desktop, sorry!</h1>
+      <p>ReOpenSCAD needs a keyboard for writing OpenSCAD and a mouse or trackpad for orbiting, panning and zooming the model. Open it on a laptop or desktop.</p>
+      <span>Your workspace is safe — the link you used is its only key, so it will be here when you get back.</span>
+    </div>
     <div class="app-shell">
       <header class="app-header">
         <div class="brand" aria-label="ReOpenSCAD">
           <img src="/legacy-assets/icons/reopenscad.svg" alt="" />
           <span>ReOpenSCAD</span>
           <a class="brand-credit" href="https://github.com/openscad/openscad/" target="_blank" rel="noreferrer noopener">Inspired by OpenSCAD</a>
+          <a class="brand-credit" href="https://www.linkedin.com/in/motakuk/" target="_blank" rel="noreferrer noopener">Vibecoded by Matvey Kukuy</a>
+          <a class="brand-credit" href="https://github.com/Matvey-Kuk/reopenscad/issues" target="_blank" rel="noreferrer noopener">Report issues</a>
         </div>
         <div class="workspace-identity">
           <button id="copyWorkspaceLink" class="workspace-link" title="Copy this workspace's URL — it is the only key to your work">
@@ -248,7 +263,7 @@
         <div class="mcp-body disclaimer-body" id="disclaimerBody">
           <p>ReOpenSCAD is a hobby project, published for demonstration purposes. It is provided <b>as is</b>, with <b>no warranty</b> and <b>no liability</b> of any kind.</p>
           <p><b>Workspaces are not private.</b> There is no login — the URL is the only key, so anyone holding the link can read and change your work.</p>
-          <p><b>This is not storage you can rely on.</b> A workspace is deleted 14 days after its last change, and only the 512 most recent are kept. Keep your own copy of anything that matters.</p>
+          <p><b>This is not storage you can rely on.</b> Workspaces are deleted automatically — after two weeks without an edit, and sooner than that whenever the server is holding more than it keeps. Opening or rendering a workspace does not keep it alive; only editing does. Keep your own copy of anything that matters.</p>
           <p>Exported geometry is not checked for you. Verify it before you print or manufacture from it.</p>
           <p class="disclaimer-affiliation" id="disclaimerAffiliation"></p>
         </div>

@@ -5,13 +5,13 @@ never stored — they are recomputed on demand from the workspace source, so the
 database holds only documents, and there is no cache to invalidate.
 
 These commands have been run end to end against a real GCP project
-(`friendly-path-465518-r6`, `us-central1`). Where the first draft was wrong,
+in `us-central1`. Where the first draft was wrong,
 the corrected form is below.
 
 Two environment prerequisites, both of which bite in a non-interactive shell:
 
 ```sh
-# Domain mapping (§8) lives in the beta surface, which is not installed by
+# Domain mapping (§6) lives in the beta surface, which is not installed by
 # default. Without --quiet the installer prompts and aborts.
 gcloud components install beta --quiet
 
@@ -31,7 +31,7 @@ gcloud auth login
 | `DATABASE_URL` | **yes** | Presence of this selects the Postgres backend. Absent means per-instance local files, which on Cloud Run means silent data loss. |
 | `REOPENSCAD_PUBLIC_ORIGIN` | **yes** | The service's own origin, e.g. `https://reopenscad-abc123-uc.a.run.app`. See below — get this wrong and *every* request is answered 403. |
 | `REOPENSCAD_TRUSTED_PROXY_HOPS` | recommended | `1` behind the `run.app` URL, `2` behind an external HTTPS load balancer — and at `2`, ingress **must** be restricted (see §5). Without it, per-IP rate limiting collapses into a single global bucket. |
-| `REOPENSCAD_MAX_WORKSPACES` | recommended | Global retained-workspace ceiling, default 512. Raise it — see §6, this one can cost users their work. |
+| `REOPENSCAD_MAX_WORKSPACES` | recommended | Global retained-workspace ceiling, default 512. Raise it — see §7, this one can cost users their work. |
 | `REOPENSCAD_SHUTDOWN_GRACE_MS` | optional | Drain window after SIGTERM, default 9000. |
 | `REOPENSCAD_WEB_ROOT` | set in the image | Where the browser shell and icons live. |
 | `REOPENSCAD_DATA_DIR` | unused with Postgres | Only consulted by the filesystem backend. |
@@ -87,13 +87,14 @@ sweep over small text documents.
 
 ```sh
 # Generate a password locally; keep it out of shell history and out of env vars
-# on the service. Restricted to characters that need no quoting in a libpq
-# connection string.
-DB_PASSWORD="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 40)"
+# on the service. Hex is alphanumeric, so it needs no quoting in a libpq
+# connection string, and 20 bytes is 160 bits of entropy.
+DB_PASSWORD="$(openssl rand -hex 20)"
 
 gcloud sql instances create "$SQL_INSTANCE" \
   --database-version=POSTGRES_16 \
   --tier=db-f1-micro \
+  --edition=enterprise \
   --region="$REGION" \
   --storage-size=10GB \
   --storage-auto-increase \
@@ -109,6 +110,18 @@ export INSTANCE_CONNECTION_NAME="$(gcloud sql instances describe "$SQL_INSTANCE"
   --format='value(connectionName)')"
 echo "$INSTANCE_CONNECTION_NAME"        # PROJECT:REGION:INSTANCE
 ```
+
+`instances create` returns before the instance is usable. It sits in
+`PENDING_CREATE` for roughly ten minutes, and `databases create` fails until it
+reaches `RUNNABLE`, so wait for it rather than running straight on:
+
+```sh
+until [ "$(gcloud sql instances describe "$SQL_INSTANCE" \
+            --format='value(state)')" = RUNNABLE ]; do sleep 15; done
+```
+
+`db-f1-micro` is a shared-core Enterprise-edition machine type; it is rejected
+under `--edition=enterprise-plus`, which is why the edition is pinned above.
 
 The instance keeps its default public IP but with **no authorized networks**,
 so nothing on the internet can open a socket to it. Cloud Run reaches it
@@ -166,6 +179,30 @@ secret *references*, not values.
 Cloud Run runs x86-64 only; Cloud Build already does, which is why it is the
 path below. Building on an Apple Silicon laptop means emulation and is far
 slower.
+
+### `gcloud builds submit` ignores `.dockerignore`
+
+It reads **`.gcloudignore`**, and when there is neither that file nor a git
+repository to derive one from, it uploads the entire build context. Here that
+meant `backend/target/` went along for the ride: a 94,000-file, 8.2 GiB tarball
+for an image whose real input is 1.2 MiB. `web/.gcloudignore` now exists and
+mirrors `.dockerignore`; keep the two in sync, because Docker never gets the
+chance to apply `.dockerignore` to files gcloud already refused to upload.
+
+The builder also needs to read back the source tarball it just wrote. On a
+project whose Cloud Storage bucket carries only the legacy project-role
+bindings, the runtime service account is not a project editor and the build
+fails with `storage.objects.get denied`:
+
+```sh
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$RUNTIME_SA" \
+  --role=roles/cloudbuild.builds.builder --condition=None
+
+gcloud storage buckets add-iam-policy-binding "gs://${PROJECT_ID}_cloudbuild" \
+  --member="serviceAccount:$RUNTIME_SA" \
+  --role=roles/storage.objectAdmin
+```
 
 ```sh
 IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/$SERVICE:$(date +%Y%m%d-%H%M%S)"
@@ -309,7 +346,90 @@ source was saved before it started.
 
 ---
 
-## 6. Operations
+## 6. A custom domain
+
+Cloud Run domain mappings are available in `us-central1`. The mapping serves
+through the same Google front end as the `run.app` URL, so it adds **no**
+extra `X-Forwarded-For` hop: `REOPENSCAD_TRUSTED_PROXY_HOPS` stays `1`.
+
+### Ownership must be verified first
+
+`domain-mappings create` fails unless the domain is already verified to the
+calling account. Check, and verify through Search Console if it is missing:
+
+```sh
+gcloud domains list-user-verified
+```
+
+Search Console offers to do this by granting Google OAuth access to the whole
+DNS account at the registrar. Prefer the manual route — pick **"Any DNS
+provider"** in the *Instructions for* dropdown, which yields a single
+`google-site-verification=…` TXT record on `@` to add by hand. It grants Google
+nothing beyond proof of ownership.
+
+### Create the mapping, then add the records it prints
+
+```sh
+gcloud beta run domain-mappings create \
+  --service="$SERVICE" --domain=example.com --region="$REGION"
+```
+
+For a regional service this is always the same eight records on `@` — four A
+and four AAAA:
+
+```
+A     216.239.32.21   216.239.34.21   216.239.36.21   216.239.38.21
+AAAA  2001:4860:4802:32::15  2001:4860:4802:34::15
+      2001:4860:4802:36::15  2001:4860:4802:38::15
+```
+
+At a registrar whose apex already carries a parking or site-builder A record,
+that record must be replaced, not merely supplemented, or traffic keeps landing
+on the old host half the time.
+
+Then point the origin at the custom domain. **`REOPENSCAD_PUBLIC_ORIGIN` holds
+exactly one origin**, so this is a switch, not an addition — the `run.app` URL
+starts answering 403 the moment it takes effect:
+
+```sh
+gcloud run services update "$SERVICE" --region="$REGION" \
+  --update-env-vars=REOPENSCAD_PUBLIC_ORIGIN=https://example.com
+```
+
+Certificate issuance begins only once the records resolve and takes anywhere
+from a few minutes to about an hour. Watch it with:
+
+```sh
+gcloud beta run domain-mappings describe --domain=example.com \
+  --region="$REGION" --format=json \
+  | python3 -c "import sys,json;[print(c['type'],c['status'],c.get('message','')) \
+      for c in json.load(sys.stdin)['status']['conditions']]"
+```
+
+`DomainRoutable: True` means the DNS is right; `Ready: True` means the
+certificate is live and the domain is actually serving.
+
+### `www` does not come for free
+
+The single-origin rule means a `www` mapping would answer 403 on every request,
+which is worse than not existing. Serving both needs a redirect in front —
+registrar-level forwarding of `www` to the apex is the cheap option — not a
+second domain mapping.
+
+### Ingress must stay `all` for a domain mapping
+
+`--ingress=internal-and-cloud-load-balancing` admits only Google-internal
+traffic and *customer* HTTP(S) load balancers. A Cloud Run domain mapping is
+neither, so restricting ingress silently breaks the custom domain. It is also
+unnecessary at one hop: §5 explains that the forgeable-bucket hole exists only
+at hops `2`, behind a balancer that a caller can bypass by going straight to
+`run.app`. At hops `1` the rightmost `X-Forwarded-For` entry is always the one
+Google's front end appended, and nothing a caller sends can get to the right of
+it — so `--ingress=all` is both required and safe here.
+
+---
+
+## 7. Operations
 
 ```sh
 # Logs
@@ -359,7 +479,7 @@ relying on it — given the eviction hazard above, it is the actual safety net.
 
 ---
 
-## 7. Teardown
+## 8. Teardown
 
 ```sh
 gcloud run services delete "$SERVICE" --region="$REGION"

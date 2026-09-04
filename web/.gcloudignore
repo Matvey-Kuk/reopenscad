@@ -1,0 +1,36 @@
+# `gcloud builds submit` does NOT read .dockerignore — it reads this file. With
+# no .gcloudignore and no git repository to fall back on, gcloud uploads the
+# entire directory: `backend/target/` alone made that an 8.2 GiB, 94k-file
+# tarball, which the build then rejected on size/latency grounds long before
+# Docker ever applied .dockerignore.
+#
+# Keep this in sync with .dockerignore.
+
+# Build artefacts: gigabytes, and the builder stage compiles from scratch.
+backend/target/
+target/
+
+# Local workspace documents — somebody's models, not application code.
+.reopenscad-workspaces/
+
+# Test corpora and fixtures are not part of the served application.
+backend/tests/
+tests/
+
+node_modules/
+**/node_modules/
+
+# Scratch, editor and OS noise.
+.git/
+.gitignore
+*.log
+*.tmp
+.DS_Store
+.idea/
+.vscode/
+scratchpad/
+
+# Compose brings its own configuration; the image must not inherit a local one.
+docker-compose.yml
+.env
+.env.*

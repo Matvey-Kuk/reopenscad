@@ -986,6 +986,66 @@ fn current_client_key() -> ClientKey {
     CLIENT_KEY.with(std::cell::Cell::get)
 }
 
+// ---------------------------------------------------------------------------
+// Search-engine visibility.
+//
+// A workspace URL *is* the credential: there is no login, so anything that
+// republishes the URL — a search result, a cached copy, an archive snapshot —
+// hands out read/write access. Indexing is therefore deny-by-default and one
+// route opts back in.
+//
+// Same thread-local shape as `CLIENT_KEY`, and for the same reason: every
+// response in this server funnels through `respond_text`, which has no route
+// context of its own. Defaulting to "not indexable" means a route added later
+// is hidden until someone deliberately says otherwise, and a response written
+// before `serve_request` has parsed the path (a malformed-request rejection)
+// is hidden too.
+// ---------------------------------------------------------------------------
+const ROBOTS_TAG: &str = "noindex, nofollow, noarchive";
+
+thread_local! {
+    static INDEXABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn set_indexable(indexable: bool) {
+    INDEXABLE.with(|current| current.set(indexable));
+}
+
+fn is_indexable() -> bool {
+    INDEXABLE.with(std::cell::Cell::get)
+}
+
+/// Crawl policy. `Disallow` stops a compliant crawler from ever fetching a
+/// workspace, its source, or its exports; `X-Robots-Tag` and the shell's
+/// `<meta name="robots">` catch the ones that fetch anyway.
+///
+/// The landing page is left crawlable on purpose — it is the front door, it
+/// names no workspace, and blanket-blocking the origin would make the project
+/// unfindable to buy nothing.
+const ROBOTS_TXT: &str = "\
+# A workspace URL is its own credential: there is no login, so anyone holding\n\
+# the link can read and change the work behind it. Workspace pages, the API\n\
+# that serves their source, and the export routes must never be crawled,\n\
+# cached or indexed. The landing page below is deliberately left open.\n\
+User-agent: *\n\
+Disallow: /workspaces/\n\
+Disallow: /api/\n\
+Disallow: /mcp\n\
+";
+
+/// The landing page is the front door and should be findable. Everything else
+/// — the workspace shell, the JSON API, the STL/3MF/OBJ exports, `/mcp` — must
+/// not be.
+///
+/// `?workspace=<id>` is the legacy way of naming a workspace, so `/` carrying
+/// one is a workspace page wearing the landing page's path and is excluded
+/// here as well.
+fn route_is_indexable(request: &Request) -> bool {
+    request.method == "GET"
+        && matches!(request.path.as_str(), "/" | "/index.html")
+        && !query_parameters(&request.query).contains_key("workspace")
+}
+
 /// Why a request could not be given a compute slot.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum QueueError {
@@ -2012,7 +2072,10 @@ fn shed_connection(mut stream: TcpStream) {
     let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
     let _ = write!(
         stream,
-        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nRetry-After: 2\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        // The only response in the server that does not go through
+        // `respond_text`, so it repeats that function's standing headers
+        // rather than being the one route that quietly drops them.
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nRetry-After: 2\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nX-Robots-Tag: noindex, nofollow, noarchive\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
         BODY.len()
     );
     let _ = stream.write_all(BODY);
@@ -2198,6 +2261,9 @@ fn serve_request(
     state: &AppState,
     peer: &mut Option<IpAddr>,
 ) -> io::Result<()> {
+    // Connection threads are reused, so clear the previous request's verdict
+    // before this one can be answered — including when parsing fails below.
+    set_indexable(false);
     let request = match read_request(stream) {
         Ok(request) => request,
         Err(error) => {
@@ -2209,6 +2275,7 @@ fn serve_request(
             return Ok(());
         }
     };
+    set_indexable(route_is_indexable(&request));
     if !request_is_allowed(&request, state) {
         return respond_json(
             stream,
@@ -2269,6 +2336,17 @@ fn serve_request(
         ("POST", "/api/export") => handle_export(stream, state, &request.body),
         ("POST", "/api/cancel") => handle_cancel(stream, state, &request.body),
         ("GET", "/api/queue") => handle_queue_status(stream, state, &request.query),
+        // Served by the binary rather than from the web root: the deployed
+        // image copies only the shell files, and a robots policy that ships
+        // separately from the server that needs it is a robots policy that
+        // eventually goes missing.
+        ("GET", "/robots.txt") => respond_text(
+            stream,
+            200,
+            "text/plain; charset=utf-8",
+            ROBOTS_TXT.as_bytes(),
+            &[],
+        ),
         ("GET", path) => handle_static(stream, state, path),
         _ => respond_text(stream, 404, "text/plain; charset=utf-8", b"Not found", &[]),
     }
@@ -4832,7 +4910,28 @@ fn handle_static(stream: &mut TcpStream, state: &AppState, route: &str) -> io::R
         Ok(target) if target.starts_with(&root) && target.is_file() => target,
         _ => return respond_text(stream, 404, "text/plain", b"Not found", &[]),
     };
-    respond_text(stream, 200, mime_type(&target), &fs::read(target)?, &[])
+    let mime = mime_type(&target);
+    let body = fs::read(target)?;
+    respond_text(stream, 200, mime, &shell_body(mime, body), &[])
+}
+
+/// `index.html` is one file serving two audiences: the landing page, which
+/// should be findable, and the workspace shell, which must not be.
+///
+/// The tag therefore lives in the file unconditionally and the single
+/// indexable route takes it back out. That ordering is the safe one: if this
+/// ever stops matching, the failure is a landing page nobody can find, not a
+/// workspace anybody can.
+const ROBOTS_META: &str = "<meta name=\"robots\" content=\"noindex, nofollow, noarchive\" />";
+
+fn shell_body(mime: &str, body: Vec<u8>) -> Vec<u8> {
+    if !is_indexable() || !mime.starts_with("text/html") {
+        return body;
+    }
+    match String::from_utf8(body) {
+        Ok(text) => text.replacen(ROBOTS_META, "", 1).into_bytes(),
+        Err(error) => error.into_bytes(),
+    }
 }
 
 fn workspace_shell_id(route: &str) -> Option<&str> {
@@ -4897,11 +4996,24 @@ fn respond_text(
     // Single write path for the whole server; tally bytes here so the per-IP
     // byte budget sees exactly what was served.
     note_response_bytes(body.len() as u64);
+    // `Referrer-Policy: no-referrer` is the header that matters most here. The
+    // path of a workspace page is its password, and the default policy would
+    // put that path in the `Referer` of every request the page makes off-site.
+    // The links in the shell already carry `rel="noreferrer"`, but that is a
+    // per-element opt-in that the next link added would have to remember; this
+    // is the whole-origin rule that does not depend on remembering. Nothing in
+    // this server reads `Referer` (same-origin enforcement uses `Origin` and
+    // `Host`), so suppressing it costs nothing.
     write!(
         stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n",
         body.len()
     )?;
+    // Covers what a `<meta>` tag cannot: JSON API replies and STL/3MF/OBJ
+    // exports are not HTML, and their URLs contain the workspace id too.
+    if !is_indexable() {
+        write!(stream, "X-Robots-Tag: {ROBOTS_TAG}\r\n")?;
+    }
     for (name, value) in extra_headers {
         write!(stream, "{name}: {value}\r\n")?;
     }
@@ -6623,5 +6735,166 @@ mod tests {
     fn an_unparseable_forwarded_entry_falls_back() {
         assert_eq!(client_ip_from_chain(&forwarded(&["unknown"]), 1), None);
         assert_eq!(client_ip_from_chain(&[], 1), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Workspace URL confidentiality.
+    //
+    // The URL is the credential, so the headers that stop it being republished
+    // are load-bearing security controls, not hygiene. They are also exactly
+    // the kind of thing that disappears in a refactor without any test going
+    // red, so these drive a real socket through `serve_request`.
+    // -----------------------------------------------------------------------
+
+    /// The repository's `web/` directory: the document root the deployed
+    /// binary is pointed at, so the shell under test is the shipped one.
+    fn web_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("backend/ has a parent")
+            .to_path_buf()
+    }
+
+    /// Runs one raw request through the real request pipeline and returns the
+    /// whole response, headers included.
+    fn serve_over_socket(raw: &str) -> String {
+        let (mut state, root) = temporary_state(None);
+        state.web_root = web_root();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let raw = raw.to_string();
+        let client = thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            stream.write_all(raw.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            let mut response = Vec::new();
+            let _ = stream.read_to_end(&mut response);
+            String::from_utf8_lossy(&response).into_owned()
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        serve_request(&mut stream, &state, &mut None).unwrap();
+        drop(stream);
+        let response = client.join().unwrap();
+        let _ = fs::remove_dir_all(root);
+        response
+    }
+
+    fn get(path: &str) -> String {
+        serve_over_socket(&format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:5173\r\n\r\n"))
+    }
+
+    /// Header block only. The shell's own text talks about these headers, so a
+    /// whole-response substring search would find them in the body.
+    fn get_headers(path: &str) -> String {
+        let response = get(path);
+        response
+            .split_once("\r\n\r\n")
+            .map(|(headers, _)| headers.to_string())
+            .unwrap_or(response)
+    }
+
+    /// The header that stops a workspace path travelling to a third party in
+    /// `Referer`. It has to be on *every* response, because the shell's own
+    /// subresources and any future outbound link inherit it from the document.
+    #[test]
+    fn every_response_suppresses_the_referrer() {
+        for path in ["/", "/app.js", "/api/health", "/robots.txt", "/nope"] {
+            assert!(
+                get_headers(path).contains("\r\nReferrer-Policy: no-referrer"),
+                "{path} did not suppress the referrer"
+            );
+        }
+    }
+
+    /// Deny-by-default: a route has to be named indexable to lose the tag, so
+    /// a route added later is hidden rather than exposed.
+    #[test]
+    fn only_the_landing_page_is_indexable() {
+        let tag = format!("\r\nX-Robots-Tag: {ROBOTS_TAG}");
+        for path in [
+            "/workspaces/wobbly-wombat-ec5e6bd2b1eaa013ccba04c67f88",
+            "/api/health",
+            "/?workspace=wobbly-wombat-ec5e6bd2b1eaa013ccba04c67f88",
+            "/app.js",
+            "/nope",
+        ] {
+            assert!(get_headers(path).contains(&tag), "{path} was left indexable");
+        }
+        assert!(!get_headers("/").contains("X-Robots-Tag"));
+        assert!(!get_headers("/index.html").contains("X-Robots-Tag"));
+    }
+
+    /// Both halves of the same predicate: the shell carries `noindex` on the
+    /// workspace route and only the landing page has it removed.
+    #[test]
+    fn the_shell_hides_workspaces_and_shows_the_front_door() {
+        assert!(
+            get("/workspaces/wobbly-wombat-ec5e6bd2b1eaa013ccba04c67f88").contains(ROBOTS_META)
+        );
+        assert!(get("/?workspace=wobbly-wombat-ec5e6bd2b1eaa013ccba04c67f88").contains(ROBOTS_META));
+        let landing = get("/");
+        assert!(landing.contains("<title>ReOpenSCAD</title>"));
+        assert!(!landing.contains("name=\"robots\""));
+    }
+
+    /// A shell served by anything other than this binary — a static host, a
+    /// mirror, a copy of the file — must still hide workspaces.
+    #[test]
+    fn the_shell_file_on_disk_is_noindex() {
+        let shell = fs::read_to_string(web_root().join("index.html")).unwrap();
+        assert!(shell.contains(ROBOTS_META));
+    }
+
+    /// The workspace routes, the API that serves workspace source and the MCP
+    /// endpoint are closed; the landing page stays open so the project is
+    /// findable at all.
+    #[test]
+    fn robots_txt_closes_workspaces_and_leaves_the_landing_page_open() {
+        let response = get("/robots.txt");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Type: text/plain; charset=utf-8"));
+        for rule in [
+            "User-agent: *",
+            "Disallow: /workspaces/",
+            "Disallow: /api/",
+            "Disallow: /mcp",
+        ] {
+            assert!(response.contains(rule), "robots.txt is missing {rule:?}");
+        }
+        assert!(!response.contains("Disallow: /\r\n"));
+        assert!(!response.contains("Disallow: /\n"));
+    }
+
+    /// A shared cache holding a workspace response would hand one visitor's
+    /// work to the next.
+    #[test]
+    fn nothing_may_be_cached() {
+        for path in [
+            "/",
+            "/workspaces/wobbly-wombat-ec5e6bd2b1eaa013ccba04c67f88",
+            "/api/health",
+        ] {
+            assert!(
+                get_headers(path).contains("\r\nCache-Control: no-store"),
+                "{path} was cacheable"
+            );
+        }
+    }
+
+    /// Connection threads are pooled, so the landing page must not leave the
+    /// next request on that thread indexable.
+    #[test]
+    fn indexability_does_not_leak_between_requests_on_a_thread() {
+        // Stand in for "the previous request on this thread was the landing
+        // page"; the reset inside `serve_request` is what has to undo it.
+        set_indexable(true);
+        let response = get("/workspaces/wobbly-wombat-ec5e6bd2b1eaa013ccba04c67f88");
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(headers.contains("X-Robots-Tag"));
+        assert!(body.contains(ROBOTS_META));
+        set_indexable(false);
     }
 }

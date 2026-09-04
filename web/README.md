@@ -114,5 +114,7 @@ OpenSCAD itself is a separate project, licensed GPL-2.0-or-later and copyright
 its authors. It lives at <https://openscad.org> and
 <https://github.com/openscad/openscad>.
 
-This project's own code is MIT-licensed; see `LICENSE` at the repository root.
+This project's own code is licensed under the **GNU General Public License,
+version 3 or later**; see `LICENSE` at the repository root, and `NOTICE` for
+provenance and third-party attribution.
 Because none of it derives from OpenSCAD, GPL copyleft does not reach it.

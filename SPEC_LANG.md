@@ -6,8 +6,11 @@ an earlier release are marked with the release that introduced them (e.g.
 **[2019.05]**). Deprecated constructs are collected in §19 and must still be
 accepted (with a warning) for compatibility.
 
-Sources: openscad.org cheat sheet (v2021.01), OpenSCAD User Manual (wikibooks),
-OpenSCAD source semantics.
+References consulted (no text reproduced): the openscad.org cheat sheet
+(v2021.01, CC BY, by Peter Uithoven), the OpenSCAD User Manual on Wikibooks
+(CC BY-SA 3.0), and observed OpenSCAD behaviour. This document is an
+independent description of factual language behaviour; it contains no prose,
+tables, or examples copied from those works.
 
 ---
 

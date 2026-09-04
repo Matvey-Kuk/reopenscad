@@ -3,7 +3,7 @@ name = "reopenscad-server"
 version = "0.1.0"
 edition = "2021"
 description = "Native Rust SCAD evaluator and web server for ReOpenSCAD"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [features]
 default = []

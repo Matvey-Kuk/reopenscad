@@ -730,10 +730,18 @@ test('the first-use disclaimer states the terms it exists to state', () => {
   assert.match(dialog, /<b>no liability<\/b>/);
   assert.match(dialog, /<b>Workspaces are not private\.<\/b>/);
   assert.match(dialog, /the URL is the only key/);
-  // The retention claims must be the server's real numbers, not a guess:
-  // WORKSPACE_TTL_MS = 14 days and MAX_WORKSPACES = 512 in backend/src/main.rs.
-  assert.match(dialog, /deleted 14 days after its last change/);
-  assert.match(dialog, /only the 512 most recent are kept/);
+  // Retention must not promise a window the server cannot keep. The 14-day TTL
+  // and the workspace cap are conjunctive: above roughly MAX_WORKSPACES/14
+  // creations per day the cap always evicts first, so quoting "14 days" as a
+  // guarantee is false. The cap is also configurable per deployment
+  // (REOPENSCAD_MAX_WORKSPACES), so a hardcoded count in the HTML is wrong the
+  // moment it is raised. State the mechanism, not a number.
+  assert.match(dialog, /deleted automatically/);
+  assert.match(dialog, /sooner than that/);
+  assert.doesNotMatch(dialog, /only the \d+ most recent are kept/);
+  // Using a workspace does not preserve it: only an edit refreshes updated_at,
+  // which is the single most surprising thing about the retention policy.
+  assert.match(dialog, /does not keep it alive; only editing does/);
   assert.match(dialog, /Verify it before you print or manufacture/);
 });
 
@@ -834,7 +842,9 @@ function cameraModule() {
     view.center = [4, -6, 3];
     view.radius = 50;
     view.draw = () => {};
-    view.canvas = { width: 800, height: 600, clientWidth: 800, clientHeight: 600 };
+    // Deliberately a 2x device pixel ratio: with device px equal to CSS px, dividing by
+    // canvas.height instead of clientHeight would pass the 1:1 check below unnoticed.
+    view.canvas = { width: 1600, height: 1200, clientWidth: 800, clientHeight: 600 };
     const meshViewport = view;
     ${panning}
     return { view, panView };
@@ -863,7 +873,9 @@ function projectThrough(view, camera, point) {
 test('a pan drag moves the world 1:1 under the cursor, in both projections', () => {
   const make = cameraModule();
   for (const projection of ['perspective', 'orthographic']) {
-    for (const angles of [[58, 28, 140], [-23, 137, 88], [0, -90, 300]]) {
+    // 89.9 is the top preset and +-89.5 the orbit clamp: the angles where lookAt's
+    // cross(up, z) is weakest and a basis derived any other way would come apart.
+    for (const angles of [[58, 28, 140], [-23, 137, 88], [0, -90, 300], [89.9, 0, 140], [89.5, 61, 120], [-89.5, -175, 90]]) {
       const camera = [0, 0, 0, angles[0], 0, angles[1], angles[2]];
       const { view, panView } = make(camera, projection);
       // Witnesses in the plane through the pivot perpendicular to the view axis: that is
@@ -873,16 +885,18 @@ test('a pan drag moves the world 1:1 under the cursor, in both projections', () 
       const witnesses = [[0, 0], [21, 0], [0, -17], [-33, 12]]
         .map(([a, b]) => [0, 1, 2].map((i) => pivot[i] + right[i] * a + up[i] * b));
       const before = witnesses.map((point) => projectThrough(view, camera, point));
+      // The drag is in CSS pixels; projectThrough answers in device pixels.
       const dx = 62;
       const dy = -41;
+      const ratio = view.canvas.width / view.canvas.clientWidth;
       panView([camera[0], camera[1], camera[2]], dx, dy);
       const after = witnesses.map((point) => projectThrough(view, camera, point));
       const label = `${projection} ${angles.join('/')}`;
       // Tolerance is float32 noise from the Float32Array matrices, not slop in the mapping:
       // a thousandth of a pixel is three orders of magnitude tighter than "feels 1:1".
       after.forEach((q, index) => {
-        assert.ok(Math.abs(q.x - before[index].x - dx) < 1e-3, `${label}: x moved ${q.x - before[index].x}, wanted ${dx}`);
-        assert.ok(Math.abs(q.y - before[index].y - dy) < 1e-3, `${label}: y moved ${q.y - before[index].y}, wanted ${dy}`);
+        assert.ok(Math.abs(q.x - before[index].x - dx * ratio) < 1e-3, `${label}: x moved ${q.x - before[index].x}, wanted ${dx * ratio}`);
+        assert.ok(Math.abs(q.y - before[index].y - dy * ratio) < 1e-3, `${label}: y moved ${q.y - before[index].y}, wanted ${dy * ratio}`);
       });
     }
   }
@@ -960,20 +974,28 @@ test('the whole view frames on the panned target, not the model centre', () => {
 
 test('pan uses the bindings CAD users already have, and orbit keeps the plain drag', () => {
   assert.match(javascript, /function isPanGesture\(event\) \{[\s\S]*?event\.button === 1 \|\| event\.button === 2 \|\| \(event\.button === 0 && event\.shiftKey\)/);
-  const pointer = javascript.slice(javascript.indexOf("renderCanvas.addEventListener('pointerdown'"), javascript.indexOf("$('#customizerButton')"));
-  // One press can only ever mean one gesture.
-  assert.match(pointer, /if \(isPanGesture\(event\)\) \{/);
-  assert.match(pointer, /\} else if \(event\.button === 0\) \{\n\s+orbitStart = \{/);
+  const pointer = javascript.slice(javascript.indexOf("renderCanvas.addEventListener('pointerdown'"), javascript.indexOf("$('#customizerButton').addEventListener"));
+  // One press can only ever mean one gesture, and a second pointer cannot hijack a live one.
+  assert.match(pointer, /if \(orbitStart \|\| panStart\) return;/);
+  assert.match(pointer, /const pan = isPanGesture\(event\);\n\s+if \(!pan && event\.button !== 0\) return;/);
+  // Capture is taken before any state is set: a throw there must not latch the gesture.
+  assert.ok(pointer.indexOf('setPointerCapture') < pointer.indexOf('panStart = {'));
+  assert.match(pointer, /\} catch \{ return; \}/);
   assert.match(pointer, /if \(panStart\) \{\n\s+panView\(panStart\.offset/);
   // A drag that ends outside the canvas, or is cancelled, must not leave a gesture latched.
   assert.match(pointer, /renderCanvas\.addEventListener\('pointerup', endViewportDrag\)/);
   assert.match(pointer, /renderCanvas\.addEventListener\('pointercancel', endViewportDrag\)/);
+  assert.match(pointer, /renderCanvas\.addEventListener\('lostpointercapture', endViewportDrag\)/);
+  // A button let go where no pointerup reaches us must not leave the view latched.
+  assert.match(pointer, /if \(\(panStart \|\| orbitStart\) && event\.buttons === 0\) \{ endViewportDrag\(\); return; \}/);
   assert.match(pointer, /renderCanvas\.setPointerCapture\(event\.pointerId\)/);
   // A right drag is a pan, so the browser menu must not land on top of the model.
   assert.match(pointer, /addEventListener\('contextmenu', \(event\) => event\.preventDefault\(\)\)/);
   // Shift + wheel is the trackpad pan; a plain wheel is still the zoom every mouse expects.
   const wheel = javascript.slice(javascript.indexOf("$('#viewport').addEventListener('wheel'"), javascript.indexOf('function isPanGesture'));
-  assert.match(wheel, /if \(event\.shiftKey\) \{\n\s+panView\(\[camera\[0\], camera\[1\], camera\[2\]\], -event\.deltaX, -event\.deltaY\);/);
+  assert.match(wheel, /panView\(\[camera\[0\], camera\[1\], camera\[2\]\], -event\.deltaX \* unit, -event\.deltaY \* unit\);/);
+  // Firefox reports wheel deltas in lines, and panView is defined in pixels.
+  assert.match(wheel, /event\.deltaMode === 1 \? 16 : event\.deltaMode === 2 \? renderCanvas\.clientHeight : 1/);
   assert.match(wheel, /camera\[6\] = Math\.max\(meshViewport\.radius \* 1\.15/);
   // Discoverable, and the mode is visible while it is happening.
   const viewHint = html.slice(html.indexOf('<div class="view-hint">'), html.indexOf('<div class="viewport-fab">'));
@@ -1011,4 +1033,72 @@ test('panning does not disturb the grid step or the far plane', () => {
   const projectionMatrix = javascript.slice(javascript.indexOf('  projectionMatrix(aspect) {'), javascript.indexOf('  scaleMatrix(scale) {'));
   assert.match(projectionMatrix, /const panned = Math\.hypot\(camera\[0\], camera\[1\], camera\[2\]\);/);
   assert.match(projectionMatrix, /const far = camera\[6\] \+ this\.radius \* 4 \+ panned \+ 100;/);
+  // And so must the near one: a pan stored in world space becomes depth once you orbit,
+  // which can bring the model to within camera[6] - panned of the eye.
+  assert.match(projectionMatrix, /const near = Math\.max\(far \/ 4000, camera\[6\] - panned - this\.radius \* 2\.2\);/);
+  // No fixed 0.01 floor: a far pan drives the wanted near plane to zero, and a constant
+  // there would put the entire depth buffer in the first millimetre in front of the eye.
+  assert.doesNotMatch(projectionMatrix, /Math\.max\(0\.01,/);
+});
+
+test('a pan that an orbit turns into depth is not sliced by the near plane', () => {
+  const make = cameraModule();
+  // Yaw 180 points the stored pan offset straight down the view axis, which is the worst
+  // case: the model ends up (distance - pan) from the eye instead of (distance).
+  for (const pan of [0, 25, 60, 110, 400]) {
+    const camera = [pan, 0, 0, 20, 0, 180, 200];
+    const { view } = make(camera, 'perspective');
+    const pitch = camera[3] * Math.PI / 180;
+    const yaw = camera[5] * Math.PI / 180;
+    const pivot = view.pivot();
+    const eye = [
+      pivot[0] + camera[6] * Math.cos(pitch) * Math.cos(yaw),
+      pivot[1] + camera[6] * Math.cos(pitch) * Math.sin(yaw),
+      pivot[2] + camera[6] * Math.sin(pitch),
+    ];
+    const centreDistance = Math.hypot(...view.center.map((value, axis) => value - eye[axis]));
+    const m = view.projectionMatrix(4 / 3);
+    // Recover the planes from the matrix itself, so the test cannot drift from the formula.
+    const near = m[14] / (m[10] - 1);
+    const far = m[14] / (m[10] + 1);
+    assert.ok(near > 0 && near < far, `pan ${pan}: near ${near}, far ${far}`);
+    assert.ok(near < centreDistance - view.radius, `pan ${pan}: near plane ${near} slices a model whose nearest point is ${centreDistance - view.radius}`);
+    assert.ok(far > centreDistance + view.radius, `pan ${pan}: far plane ${far} cuts a model reaching ${centreDistance + view.radius}`);
+    // Depth precision: the buffer must not be spent on the first millimetre in front of
+    // the eye just because the pan drove the wanted near plane negative.
+    assert.ok(far / near < 5000, `pan ${pan}: far/near ratio ${far / near} will z-fight`);
+  }
+});
+
+// --- Workspace URL confidentiality ----------------------------------------
+// The workspace URL is the only credential there is, so anything that could
+// republish it — a `Referer` header, a search index, an archive — is a
+// disclosure of the workspace itself.
+
+test('the shell is noindex, so a workspace URL cannot become a search result', () => {
+  assert.match(html, /<meta name="robots" content="noindex, nofollow, noarchive" \/>/);
+  // Exactly one, because the server strips this literal once to open the
+  // landing page; a second copy would survive and quietly deindex it.
+  assert.equal(html.match(/<meta name="robots"/g).length, 1);
+});
+
+test('no outbound link may carry the workspace URL in its Referer', () => {
+  // Every anchor with an absolute http(s) target, wherever it is authored.
+  const external = [...html.matchAll(/<a\s[^>]*>/g), ...javascript.matchAll(/<a\s[^>]*>/g)]
+    .map((match) => match[0])
+    .filter((tag) => /href=["'`$]*\{?\s*h?t?t?p?s?[^"']*:\/\//.test(tag) || /href="https?:\/\//.test(tag) || /href="\$\{/.test(tag));
+  assert.ok(external.length >= 4, `expected the known outbound links, found ${external.length}`);
+  const leaking = external.filter((tag) => !/rel="[^"]*noreferrer/.test(tag));
+  assert.deepEqual(leaking, []);
+});
+
+test('the disclaimer and the copy affordance both say the link is the key', () => {
+  assert.match(html, /<b>Workspaces are not private\.<\/b>/);
+  assert.match(html, /the URL is the only key/);
+  assert.match(html, /id="copyWorkspaceLink"[^>]*title="[^"]*only key/);
+});
+
+test('nothing writes a workspace id to the console', () => {
+  // console.* survives into shared screens, extensions and crash reporters.
+  assert.doesNotMatch(javascript, /console\.(log|info|warn|error|debug)\s*\(/);
 });

@@ -496,11 +496,17 @@ class MeshViewport {
   }
 
   projectionMatrix(aspect) {
-    // Panning slides the model sideways without changing its distance, but it does push the
-    // far corners of the grid further away, so the pan offset extends the far plane.
+    // A pan is perpendicular to the view axis only at the instant of the drag: the offset is
+    // stored in world space, so a later orbit turns it into depth. Both planes therefore
+    // widen by the pan distance — the far one because the origin-centred grid recedes as the
+    // eye moves off it, the near one because an orbited pan can bring the model to within
+    // camera[6] - panned of the eye and would otherwise slice its front off.
     const panned = Math.hypot(camera[0], camera[1], camera[2]);
-    const near = Math.max(0.01, camera[6] - this.radius * 2.2);
     const far = camera[6] + this.radius * 4 + panned + 100;
+    // The floor is a fraction of the far plane rather than a fixed 0.01: once a pan pushes
+    // the wanted near plane to zero, a hard 0.01 would spend the whole depth buffer on the
+    // first millimetre in front of the eye and z-fight the model.
+    const near = Math.max(far / 4000, camera[6] - panned - this.radius * 2.2);
     if (projection === 'orthographic') {
       const height = this.orthoHalfHeight();
       const width = height * aspect;
@@ -587,7 +593,12 @@ class MeshViewport {
   }
 
   // How much of the XY plane the surface has to cover: the part's own footprint (wherever
-  // it sits relative to the origin) and the visible frame, so the grid never stops short.
+  // it sits relative to the origin) and the visible frame, so the grid never stops short of
+  // the part. Deliberately no pan term. The surface, its origin lines and any bed outline
+  // are all anchored to the world origin, so following a pan would mean sliding the grid
+  // while those stay put; and feeding the pan into the span would re-pick the 1-2-5 step
+  // mid-drag, flickering the divisions. A far pan therefore runs off the edge of a finite
+  // grid, exactly as it does in a slicer, and Fit brings it back.
   groundSpan() {
     if (this.plate) return Math.max(this.plate.size[0], this.plate.size[1]) * 1.15;
     const footprint = this.bounds
@@ -1809,6 +1820,10 @@ async function exportModel(format, scope = 'visible') {
   }
 }
 
+// Set once the user opens the panel by hand, so an auto-hide never yanks it
+// back shut underneath them. Cleared when they close it again.
+let customizerPinned = false;
+
 function updateCustomizer() {
   const fields = [];
   const pattern = /^\s*([A-Za-z_$][\w$]*)\s*=\s*(-?\d+(?:\.\d+)?)\s*;\s*\/\/\s*\[\s*(-?\d+(?:\.\d+)?)\s*:\s*(-?\d+(?:\.\d+)?)\s*:\s*(-?\d+(?:\.\d+)?)\s*\]/gm;
@@ -1816,10 +1831,19 @@ function updateCustomizer() {
     fields.push({ name: match[1], value: Number(match[2]), min: Number(match[3]), step: Number(match[4]), max: Number(match[5]) });
   }
   const body = $('#customizerBody');
-  if (!fields.length) {
+  // Nothing in the source is customizable, so the panel and its toggle have
+  // nothing to show or do — hide both rather than parking an empty column.
+  // The panel hides itself when the model has nothing to customize, but the
+  // toggle always stays available: opening it deliberately must still work,
+  // and the empty state is where the feature is explained.
+  const hasFields = fields.length > 0;
+  $('#customizer').hidden = !hasFields && !customizerPinned;
+  if (!hasFields) {
     body.innerHTML = '<div class="customizer-empty"><span>{ }</span><p>Add a range comment like<br><code>// [1:1:20]</code> after a variable.</p></div>';
+    if (!customizerPinned) $('#customizer').classList.add('closed');
     return;
   }
+  $('#customizer').classList.remove('closed');
   body.innerHTML = fields.map((field) => `<div class="custom-field" data-variable="${field.name}"><label><span>${field.name}</span><input type="number" min="${field.min}" max="${field.max}" step="${field.step}" value="${field.value}"></label><input type="range" min="${field.min}" max="${field.max}" step="${field.step}" value="${field.value}"></div>`).join('');
   $$('.custom-field', body).forEach((container) => {
     const range = $('input[type="range"]', container);
@@ -2074,7 +2098,10 @@ $('#viewport').addEventListener('wheel', (event) => {
   // scroll deliberately stays on zoom — the browser reports it as an ordinary wheel event,
   // so claiming it for pan would take scroll-zoom away from every mouse user to no gain.
   if (event.shiftKey) {
-    panView([camera[0], camera[1], camera[2]], -event.deltaX, -event.deltaY);
+    // Firefox reports wheel deltas in lines, and a page-scroll wheel in pages; panView is
+    // defined in pixels, so a raw deltaY would pan ~16x too slowly there.
+    const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? renderCanvas.clientHeight : 1;
+    panView([camera[0], camera[1], camera[2]], -event.deltaX * unit, -event.deltaY * unit);
     return;
   }
   camera[6] = Math.max(meshViewport.radius * 1.15, Math.min(meshViewport.radius * 30, camera[6] * (event.deltaY > 0 ? 1.1 : .9)));
@@ -2093,17 +2120,27 @@ renderCanvas.addEventListener('pointerdown', (event) => {
   // A second pointer (or a second button) must not hijack a gesture already in progress:
   // the drag that owns the capture is the one that gets to finish.
   if (orbitStart || panStart) return;
-  if (isPanGesture(event)) {
+  const pan = isPanGesture(event);
+  if (!pan && event.button !== 0) return;
+  // Capture first. If the pointer is already gone this throws, and a gesture started
+  // anyway would latch: no capture means no pointerup here, and the guard above would
+  // then refuse every later drag for the life of the page.
+  try {
+    renderCanvas.setPointerCapture(event.pointerId);
+  } catch { return; }
+  if (pan) {
     // Stops the middle-click autoscroll widget from stealing the drag on Windows.
     event.preventDefault();
     panStart = { x: event.clientX, y: event.clientY, offset: [camera[0], camera[1], camera[2]] };
     renderCanvas.classList.add('panning');
-  } else if (event.button === 0) {
+  } else {
     orbitStart = { x: event.clientX, y: event.clientY, rx: camera[3], rz: camera[5] };
-  } else return;
-  renderCanvas.setPointerCapture(event.pointerId);
+  }
 });
 renderCanvas.addEventListener('pointermove', (event) => {
+  // A button released where no pointerup reaches us (a native drag, a devtools pause)
+  // would otherwise leave the view following a button-less mouse around the canvas.
+  if ((panStart || orbitStart) && event.buttons === 0) { endViewportDrag(); return; }
   if (panStart) {
     panView(panStart.offset, event.clientX - panStart.x, event.clientY - panStart.y);
     return;
@@ -2122,12 +2159,24 @@ function endViewportDrag() {
 }
 renderCanvas.addEventListener('pointerup', endViewportDrag);
 renderCanvas.addEventListener('pointercancel', endViewportDrag);
+// Capture can be taken away without a pointerup ever arriving; the gesture ends with it.
+renderCanvas.addEventListener('lostpointercapture', endViewportDrag);
 // A right-button drag is a pan here, as it is in every slicer, so the canvas must not
 // raise the browser menu on top of the model mid-gesture.
 renderCanvas.addEventListener('contextmenu', (event) => event.preventDefault());
 
-$('#customizerButton').addEventListener('click', () => $('#customizer').classList.toggle('closed'));
-$('#closeCustomizer').addEventListener('click', () => $('#customizer').classList.add('closed'));
+$('#customizerButton').addEventListener('click', () => {
+  const panel = $('#customizer');
+  const opening = panel.hidden || panel.classList.contains('closed');
+  customizerPinned = opening;
+  panel.hidden = false;
+  panel.classList.toggle('closed', !opening);
+});
+$('#closeCustomizer').addEventListener('click', () => {
+  customizerPinned = false;
+  $('#customizer').classList.add('closed');
+  updateCustomizer();
+});
 $('#clearConsole').addEventListener('click', () => { consoleOutput.innerHTML = ''; });
 $('#collapseConsole').addEventListener('click', () => $('#consolePane').classList.toggle('collapsed'));
 
@@ -2605,7 +2654,33 @@ function closeMcpPanel() {
   $('#mcpButton').focus();
 }
 
-$('#mcpButton').addEventListener('click', openMcpPanel);
+// The MCP surface is the least discoverable thing in the app, so the button
+// asks for attention until it has been opened once — then never again.
+const AGENT_BUTTON_SEEN_KEY = 'reopenscad.mcpButtonSeen';
+
+function markAgentButtonSeen() {
+  $('#mcpButton').classList.remove('unseen');
+  try {
+    localStorage.setItem(AGENT_BUTTON_SEEN_KEY, '1');
+  } catch {
+    // Blocked storage only costs the user a repeat nudge next session.
+  }
+}
+
+function restoreAgentButtonNudge() {
+  let seen = false;
+  try {
+    seen = localStorage.getItem(AGENT_BUTTON_SEEN_KEY) === '1';
+  } catch {
+    seen = false;
+  }
+  $('#mcpButton').classList.toggle('unseen', !seen);
+}
+
+$('#mcpButton').addEventListener('click', () => {
+  markAgentButtonSeen();
+  openMcpPanel();
+});
 $('#closeMcp').addEventListener('click', closeMcpPanel);
 $('#mcpScrim').addEventListener('click', closeMcpPanel);
 $('#mcpTest').addEventListener('click', probeMcp);
@@ -2804,6 +2879,7 @@ async function bootstrap() {
   renderKickstart();
   populatePlateSelect();
   restoreTolerance();
+  restoreAgentButtonNudge();
   // Before the workspace loads, so the locally preferred bed is already on screen and is
   // what createWorkspace seeds a new workspace with.
   restorePlatePreference();

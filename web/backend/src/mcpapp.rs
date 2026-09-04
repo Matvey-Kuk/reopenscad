@@ -235,6 +235,12 @@ const VIEWER_TEMPLATE: &str = r##"<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<!-- This page carries absolute workspace URLs (the exports, the editor link),
+     and it renders on the host's origin, where this server's own
+     `Referrer-Policy` header does not reach. The one policy the page can set
+     for itself goes here. -->
+<meta name="referrer" content="no-referrer" />
+<meta name="robots" content="noindex, nofollow, noarchive" />
 <title>__TITLE__ — ReOpenSCAD</title>
 <style>
   :root { color-scheme: dark; }
@@ -619,6 +625,13 @@ mod tests {
         // No external subresources: the frame cannot reach this server.
         assert!(!html.contains("src=\"http"));
         assert!(!html.contains("<link"));
+        // The workspace URL is a credential, and the host's origin — not this
+        // server's headers — governs the frame, so the page states its own
+        // policy: never send it as a referrer, never let it be indexed.
+        assert!(html.contains("<meta name=\"referrer\" content=\"no-referrer\" />"));
+        assert!(html.contains("<meta name=\"robots\" content=\"noindex, nofollow, noarchive\" />"));
+        // The only outbound link leaves without one either way.
+        assert!(html.contains("href=\"http://host/workspaces/silly-otter-1\" target=\"_blank\" rel=\"noreferrer\""));
         // The hostile name must not be able to close the script or the markup.
         assert!(!html.contains("</script><img"));
         assert!(!html.contains("<img src=x>"));

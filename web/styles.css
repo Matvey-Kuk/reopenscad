@@ -25,6 +25,11 @@ body { background: var(--void); color: var(--ink); font-family: var(--sans); fon
 button, select, textarea { font: inherit; }
 button { color: inherit; }
 
+/* Touch devices only: a coarse pointer AND a small viewport. Width alone would
+   lock out a narrowed desktop window, and pointer alone would lock out a
+   touchscreen laptop that works fine. Pure CSS so it lands before app.js runs
+   and still holds if the script fails. */
+.mobile-gate { display: none; }
 .app-shell { display: grid; grid-template-rows: 42px 50px 1fr 25px; height: 100vh; background: var(--base); }
 .app-header { display: flex; align-items: center; border-bottom: 1px solid #090b0e; background: #12161b; padding: 0 12px; user-select: none; }
 .brand { display: flex; align-items: center; gap: 8px; min-width: 264px; font-weight: 700; letter-spacing: -.2px; }
@@ -71,6 +76,7 @@ button { color: inherit; }
 .viewer-pane { grid-column: 4; grid-row: 1; }
 .customizer { grid-column: 5; grid-row: 1 / 3; width: 254px; border-left: 1px solid #0b0d11; transition: width .18s ease, opacity .18s ease; }
 .customizer.closed { width: 0; opacity: 0; overflow: hidden; }
+.customizer[hidden], .pane-action[hidden] { display: none; }
 .splitter.vertical { grid-column: 3; grid-row: 1; background: #0d1014; border-left: 1px solid #313944; cursor: col-resize; z-index: 4; }
 .splitter.vertical:hover, .splitter.dragging { background: var(--blue); }
 .console-pane { grid-column: 2 / 5; grid-row: 2; border-top: 1px solid #080a0d; }
@@ -224,6 +230,14 @@ kbd { font: 9px var(--mono); }
 .agent-button { height: 32px; display: flex; align-items: center; gap: 8px; margin-right: 6px; border: 1px solid #4a4634; border-radius: 4px; background: linear-gradient(#242a32, #1c2129); color: #ddd2a6; padding: 0 8px 0 10px; font-weight: 700; cursor: pointer; }
 .agent-button:hover { border-color: #7a6d3c; background: linear-gradient(#2b323b, #21262e); color: #f4e6b6; }
 .agent-button:active { transform: translateY(1px); }
+/* Until the user has opened the MCP panel once, the button advertises itself:
+   a bounce carries the eye, a glow pulse carries it in peripheral vision. Both
+   stop permanently on the first click (see markAgentButtonSeen). */
+.agent-button.unseen { animation: agentBounce 1.9s ease-in-out infinite, agentGlow 1.9s ease-in-out infinite; }
+.agent-button.unseen:hover { animation: none; }
+@keyframes agentBounce { 0%, 62%, 100% { transform: translateY(0); } 72% { transform: translateY(-5px); } 82% { transform: translateY(-2px); } 90% { transform: translateY(0); } }
+@keyframes agentGlow { 0%, 55%, 100% { border-color: #4a4634; box-shadow: 0 0 0 0 rgba(241,196,76,0); } 72% { border-color: #b99a3d; box-shadow: 0 0 0 4px rgba(241,196,76,.16); } }
+@media (prefers-reduced-motion: reduce) { .agent-button.unseen { animation: agentGlow 2.6s ease-in-out infinite; } }
 .agent-button svg { width: 15px; height: 15px; color: var(--yellow); }
 .agent-button kbd { border-left: 1px solid #4a4634; padding-left: 8px; color: #9a8f65; font: 9px var(--mono); }
 
@@ -352,4 +366,13 @@ kbd { font: 9px var(--mono); }
 
 @media (max-width: 720px) {
   :root { --objects-width: 0px; }.objects-pane { display: none; }.workspace-identity { margin-left: 8px; }.brand { min-width: 0; }.brand-credit { display: none; }.kickstart { padding: 12px; }.kickstart-intro h2 { font-size: 15px; }
+}
+
+@media (pointer: coarse) and (max-width: 1024px) {
+  .mobile-gate { position: fixed; inset: 0; z-index: 100; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; background: var(--void); padding: 32px 26px; text-align: center; }
+  .mobile-gate img { width: 46px; height: 46px; opacity: .9; }
+  .mobile-gate h1 { margin: 0; color: var(--ink); font-size: 19px; letter-spacing: -.02em; }
+  .mobile-gate p { margin: 0; max-width: 34ch; color: var(--muted); font-size: 12px; line-height: 1.6; }
+  .mobile-gate span { max-width: 34ch; color: var(--dim); font: 9px/1.6 var(--mono); }
+  .app-shell { display: none; }
 }

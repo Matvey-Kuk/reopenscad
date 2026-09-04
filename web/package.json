@@ -1,7 +1,7 @@
 {
   "name": "reopenscad-web",
   "private": true,
-  "license": "MIT",
+  "license": "GPL-3.0-or-later",
   "scripts": {
     "check": "node --check app.js",
     "test": "node --test tests/*.test.mjs"
