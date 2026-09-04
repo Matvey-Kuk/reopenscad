@@ -1,0 +1,73 @@
+# ---------------------------------------------------------------------------
+# Rust
+# ---------------------------------------------------------------------------
+target/
+**/*.rs.bk
+*.pdb
+
+# ---------------------------------------------------------------------------
+# Node
+# ---------------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm/
+
+# ---------------------------------------------------------------------------
+# Workspace data
+# ---------------------------------------------------------------------------
+# The filesystem storage backend's documents: real user models, written at
+# runtime. Never committed. (`REOPENSCAD_DATA_DIR` can move this elsewhere.)
+web/.reopenscad-workspaces/
+.reopenscad-workspaces/
+# Atomic-write temporaries, in case a crash leaves one behind.
+.*.tmp
+
+# ---------------------------------------------------------------------------
+# Local configuration and secrets
+# ---------------------------------------------------------------------------
+# DATABASE_URL and database passwords live here when testing locally. The
+# deployed service reads its password from Secret Manager instead.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+service-account*.json
+gcloud-key*.json
+
+# ---------------------------------------------------------------------------
+# Upstream OpenSCAD checkout
+# ---------------------------------------------------------------------------
+# `openscad/` is a separate clone kept alongside for reference only; this
+# project is an independent reimplementation and never builds or links it.
+# It carries its own .git, so it must not be committed into this repository.
+openscad/
+
+# ---------------------------------------------------------------------------
+# Tooling scratch
+# ---------------------------------------------------------------------------
+.playwright-mcp/
+playwright-report/
+test-results/
+scratchpad/
+*.log
+
+# ---------------------------------------------------------------------------
+# Editors and operating systems
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---------------------------------------------------------------------------
+# AI tooling / prompt files
+# ---------------------------------------------------------------------------
+# Session instructions for the coding agent, not project documentation.
+CLAUDE.md
+.claude/

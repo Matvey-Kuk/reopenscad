@@ -1,0 +1,61 @@
+# Local rehearsal of the Cloud Run topology: Postgres plus *two* application
+# containers behind the same database.
+#
+# Two is deliberate. One container proves persistence; two proves the thing
+# that actually breaks when the filesystem store is deployed to Cloud Run —
+# that the optimistic-concurrency check still holds when the writers are in
+# different processes.
+#
+#   docker compose -f web/docker-compose.yml up --build
+#   open http://127.0.0.1:8080     # instance A
+#   open http://127.0.0.1:8081     # instance B, same workspaces
+#
+# REOPENSCAD_PUBLIC_ORIGIN differs per instance because it is checked against
+# the request's Host header; each container is reached on its own port here.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: reopenscad
+      POSTGRES_PASSWORD: devpassword
+      POSTGRES_DB: reopenscad
+    ports:
+      - "55432:5432"
+    volumes:
+      - reopenscad-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reopenscad -d reopenscad"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  app-a: &app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Plain TCP with no TLS: this connection never leaves the compose
+      # network. A public-IP Postgres would need the `postgres-tls` feature.
+      DATABASE_URL: postgres://reopenscad:devpassword@db:5432/reopenscad
+      PORT: "8080"
+      HOST: "0.0.0.0"
+      REOPENSCAD_PUBLIC_ORIGIN: http://127.0.0.1:8080
+    ports:
+      - "8080:8080"
+
+  app-b:
+    <<: *app
+    environment:
+      DATABASE_URL: postgres://reopenscad:devpassword@db:5432/reopenscad
+      PORT: "8080"
+      HOST: "0.0.0.0"
+      REOPENSCAD_PUBLIC_ORIGIN: http://127.0.0.1:8081
+    ports:
+      - "8081:8080"
+
+volumes:
+  reopenscad-pgdata:

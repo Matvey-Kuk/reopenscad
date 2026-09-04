@@ -1,0 +1,29 @@
+# Build artefacts: gigabytes, and the builder stage compiles from scratch.
+backend/target/
+target/
+
+# Local workspace documents. These are the filesystem backend's data; shipping
+# them would bake somebody's models into a published image.
+.reopenscad-workspaces/
+
+# Test corpora and fixtures are not part of the served application.
+backend/tests/
+tests/
+
+node_modules/
+**/node_modules/
+
+# Scratch, editor and OS noise.
+.git/
+.gitignore
+*.log
+*.tmp
+.DS_Store
+.idea/
+.vscode/
+scratchpad/
+
+# Compose brings its own configuration; the image must not inherit a local one.
+docker-compose.yml
+.env
+.env.*

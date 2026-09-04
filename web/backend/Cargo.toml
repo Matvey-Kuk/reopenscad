@@ -1,0 +1,31 @@
+[package]
+name = "reopenscad-server"
+version = "0.1.0"
+edition = "2021"
+description = "Native Rust SCAD evaluator and web server for ReOpenSCAD"
+license = "MIT"
+
+[features]
+default = []
+# Postgres-backed workspace storage. Off by default so the local development
+# build, the test suite, and the geometry engine keep exactly the dependency
+# set they had; only a multi-instance deployment needs it.
+postgres = ["dep:postgres"]
+# TLS for a Postgres reached over TCP. Not needed for the recommended Cloud Run
+# topology, where the connection is a unix socket to the in-sandbox Cloud SQL
+# connector, nor for a sidecar/compose Postgres on a private network.
+postgres-tls = ["postgres", "dep:postgres-native-tls", "dep:native-tls"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Synchronous driver, chosen to match this server's blocking thread-per-
+# connection model: `sqlx`/`tokio-postgres` would pull an async runtime into a
+# codebase that has none.
+postgres = { version = "0.19", features = ["with-serde_json-1"], optional = true }
+postgres-native-tls = { version = "0.5", optional = true }
+native-tls = { version = "0.2", optional = true }
+
+[profile.release]
+lto = "thin"
+strip = true

@@ -1,0 +1,9 @@
+# case_id\tsource\tdefinitions\treference
+fast-printing\topenappa-fast-printing.scad\t\topenappa-fast-printing.stl
+full-body\topenappa.scad\tpart="solid"\topenappa-full-body.stl
+primary\topenappa.scad\tpart="primary"\topenappa-multi-color-part-1.stl
+secondary\topenappa.scad\tpart="secondary"\topenappa-multi-color-part-2.stl
+multipart-body\topenappa-multipart.scad\tpart="body"\topenappa-multipart-body.stl
+multipart-body-back\topenappa-multipart.scad\tpart="body_back";print_orientation=true\topenappa-multipart-body-back.stl
+multipart-body-front\topenappa-multipart.scad\tpart="body_front";print_orientation=true\topenappa-multipart-body-front.stl
+multipart-secondary\topenappa-multipart.scad\tpart="secondary";print_orientation=true\topenappa-multipart-gray.stl

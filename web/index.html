@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#15191f" />
+    <title>ReOpenSCAD</title>
+    <link rel="icon" type="image/svg+xml" href="/legacy-assets/icons/reopenscad.svg" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="app-header">
+        <div class="brand" aria-label="ReOpenSCAD">
+          <img src="/legacy-assets/icons/reopenscad.svg" alt="" />
+          <span>ReOpenSCAD</span>
+          <a class="brand-credit" href="https://github.com/openscad/openscad/" target="_blank" rel="noreferrer noopener">Inspired by OpenSCAD</a>
+        </div>
+        <div class="workspace-identity">
+          <button id="copyWorkspaceLink" class="workspace-link" title="Copy this workspace's URL — it is the only key to your work">
+            <span id="workspaceName">starting-up</span>
+            <i aria-hidden="true"></i>
+          </button>
+          <span class="sync-state" id="syncState" data-state="local">Local</span>
+        </div>
+        <div class="engine-pill" id="enginePill" hidden><span></span><b></b></div>
+      </header>
+
+      <div class="toolbar" role="toolbar" aria-label="Model tools">
+        <div class="tool-group">
+          <button class="tool-button" id="newButton" title="New workspace (⌘N)" aria-label="New workspace" data-icon="new"></button>
+          <button class="tool-button" id="openButton" title="Open (⌘O)" aria-label="Open file" data-icon="open"></button>
+          <button class="tool-button" id="saveButton" title="Save SCAD (⌘S)" aria-label="Save file" data-icon="save"></button>
+          <input id="fileInput" type="file" accept=".scad,text/plain" hidden />
+        </div>
+        <div class="tool-divider"></div>
+        <div class="tool-group">
+          <button class="tool-button primary" id="previewButton" title="Preview (F5)" aria-label="Preview model" data-icon="preview"></button>
+          <button class="tool-button render" id="renderButton" title="Render (F6)" aria-label="Render model" data-icon="render"></button>
+          <button class="tool-button" id="stopButton" title="Cancel render" aria-label="Cancel render" data-icon="stop" disabled></button>
+        </div>
+        <div class="tool-divider"></div>
+        <div class="tool-group view-presets" aria-label="View presets">
+          <button class="tool-button" data-view="top" title="Top view" aria-label="Top view" data-icon="top"></button>
+          <button class="tool-button" data-view="front" title="Front view" aria-label="Front view" data-icon="front"></button>
+          <button class="tool-button" data-view="right" title="Right view" aria-label="Right view" data-icon="right"></button>
+          <button class="tool-button" data-view="reset" title="Reset view" aria-label="Reset view" data-icon="reset"></button>
+        </div>
+        <div class="toolbar-spacer"></div>
+        <button class="agent-button" id="mcpButton" data-icon="agent" title="Connect an AI agent over MCP" aria-haspopup="dialog"><span>Connect AI</span><kbd>MCP</kbd></button>
+        <button class="export-button" id="exportButton" data-icon="export"><span>Export</span><kbd>STL</kbd></button>
+      </div>
+
+      <main class="workspace" id="workspace">
+        <aside class="objects-pane" aria-label="Objects and inspection">
+          <div class="objects-title">
+            <div><span class="eyebrow">Scene</span><h2>Objects</h2></div>
+            <span class="object-count" id="objectCount">0</span>
+          </div>
+          <div class="object-list" id="objectList" role="listbox" aria-label="Model objects">
+            <div class="objects-empty"><i></i><span>Objects appear after preview.</span></div>
+          </div>
+          <section class="intersection-tool" aria-labelledby="intersectionTitle">
+            <div class="inspection-heading">
+              <span class="eyebrow">Inspection</span>
+              <span class="inspection-state" id="inspectionState">Not checked</span>
+            </div>
+            <h3 id="intersectionTitle">Part intersections</h3>
+            <p>Check visible parts with a fabrication clearance.</p>
+            <label class="tolerance-field">
+              <span>Tolerance</span>
+              <span class="number-input"><input id="toleranceInput" type="number" min="0" max="1000" step="0.01" value="0.2" inputmode="decimal" /><b>mm</b></span>
+            </label>
+            <button class="check-intersections" id="checkIntersections"><span></span>Check intersections</button>
+            <div class="intersection-results" id="intersectionResults" aria-live="polite">
+              <div class="inspection-empty">No inspection run yet.</div>
+            </div>
+          </section>
+        </aside>
+
+        <section class="editor-pane" aria-label="OpenSCAD editor">
+          <div class="editor-wrap">
+            <div class="editor-overlay">
+              <i id="dirtyIndicator" title="Unsaved changes"></i>
+              <div class="ai-revision-badge" id="aiRevisionBadge" hidden><i></i><span>AI revised source</span><button id="dismissAiHighlight" aria-label="Dismiss AI change highlight">×</button></div>
+            </div>
+            <div class="line-numbers" id="lineNumbers" aria-hidden="true"></div>
+            <pre class="highlight" id="highlight" aria-hidden="true"></pre>
+            <textarea id="codeEditor" aria-label="OpenSCAD source code" spellcheck="false" autocomplete="off"></textarea>
+            <div class="kickstart" id="kickstart" hidden>
+              <div class="kickstart-intro">
+                <span class="eyebrow">Empty workspace</span>
+                <h2>Start with a shape.</h2>
+                <p>Pick a kick-start model to drop into the editor, or start from nothing.</p>
+                <button type="button" class="kickstart-blank" id="kickstartBlank">Start with a blank editor</button>
+              </div>
+              <div class="kickstart-grid" id="kickstartGrid" role="list"></div>
+            </div>
+          </div>
+        </section>
+
+        <div class="splitter vertical" id="mainSplitter" aria-hidden="true"></div>
+
+        <section class="viewer-pane" aria-label="3D viewport">
+          <div class="pane-header viewport-header">
+            <div class="view-mode">
+              <button class="active" data-projection="perspective">Perspective</button>
+              <button data-projection="orthographic">Orthographic</button>
+            </div>
+            <div class="viewport-options">
+              <label class="plate-field" title="Show the model on a 3D printer build plate">
+                <span class="sr-only">Build plate</span>
+                <select id="plateSelect" aria-label="Build plate"></select>
+              </label>
+              <label><input id="edgesToggle" type="checkbox" /><span>Edges</span></label>
+              <label><input id="axesToggle" type="checkbox" checked /><span>Axes</span></label>
+              <label><input id="groundToggle" type="checkbox" checked /><span>Ground</span></label>
+              <button class="pane-action" id="customizerButton" title="Toggle customizer" aria-label="Toggle customizer" data-icon="sliders"></button>
+            </div>
+          </div>
+          <div class="viewport" id="viewport">
+            <div class="empty-state" id="emptyState">
+              <img src="/legacy-assets/icons/reopenscad.svg" alt="" />
+              <h1>Shape the idea.</h1>
+              <p>Press <kbd>F5</kbd> to preview your OpenSCAD model.</p>
+              <button id="firstPreview">Preview model</button>
+            </div>
+            <canvas id="renderCanvas" class="render-canvas" aria-label="Rendered OpenSCAD model"></canvas>
+            <canvas id="groundLabels" class="ground-labels" aria-hidden="true"></canvas>
+            <div class="grid-scale" id="gridScale"><span>Grid</span><b>10 mm</b></div>
+            <div class="plate-badge" id="plateBadge" hidden aria-live="polite"><b id="plateBadgeName"></b><span id="plateBadgeFit"></span></div>
+            <!-- The compiler reports nothing until it is finished, so this overlay counts
+                 real elapsed time instead of animating a percentage nobody can compute. A
+                 ticking clock is what separates "working" from "hung", and the cancel
+                 button means a wait the user regrets is always one click from over. -->
+            <div class="render-overlay" id="renderOverlay" hidden>
+              <div class="spinner"><i></i><i></i><i></i></div>
+              <b id="renderLabel">Compiling geometry</b>
+              <span id="renderElapsed" aria-live="off">0.0 s elapsed</span>
+              <p class="render-note" id="renderNote" hidden>Still compiling. Exact boolean geometry on a large model can take a minute.</p>
+              <button type="button" class="overlay-cancel" id="overlayCancel">Cancel render</button>
+            </div>
+            <div class="view-hint"><span>DRAG</span> orbit <span>SCROLL</span> zoom</div>
+            <div class="viewport-fab">
+              <button id="zoomIn" aria-label="Zoom in">+</button>
+              <button id="zoomOut" aria-label="Zoom out">−</button>
+              <button id="fitView" aria-label="Fit model" data-icon="fit"></button>
+            </div>
+          </div>
+        </section>
+
+        <aside class="customizer" id="customizer" aria-label="Customizer">
+          <div class="pane-header"><b>Customizer</b><button id="closeCustomizer" aria-label="Close customizer">×</button></div>
+          <div class="customizer-body" id="customizerBody">
+            <div class="customizer-empty"><span>{ }</span><p>Named variables from your model appear here.</p></div>
+          </div>
+        </aside>
+
+        <section class="console-pane" id="consolePane" aria-label="Console">
+          <div class="pane-header console-header">
+            <div class="console-tabs"><button class="active">Console</button><button>Problems <span id="problemCount">0</span></button></div>
+            <div class="console-actions"><button id="clearConsole">Clear</button><button id="collapseConsole" aria-label="Collapse console">⌄</button></div>
+          </div>
+          <div class="console-output" id="consoleOutput"><span class="timestamp">00:00:00</span><span class="info">ReOpenSCAD ready. Waiting for first preview.</span></div>
+        </section>
+      </main>
+
+      <footer class="status-bar">
+        <div><span class="status-ready" id="statusDot"></span><span id="statusText">Ready</span></div>
+        <div class="status-attribution"><span>Independent reimplementation — not affiliated with or endorsed by the <a href="https://openscad.org" target="_blank" rel="noreferrer noopener">OpenSCAD project</a>.<span class="attribution-more"> Implements the OpenSCAD language; contains no OpenSCAD source code.</span></span></div>
+        <div class="status-right"><span id="cursorPosition">Ln 1, Col 1</span><span>Spaces: 2</span><span>UTF-8</span><span id="renderTime">No render yet</span></div>
+      </footer>
+    </div>
+
+    <div class="export-popover" id="exportPopover" hidden>
+      <b>Export model</b>
+      <button data-format="stl"><span>STL</span><small>Mesh for fabrication</small></button>
+      <button data-format="stl" data-scope="selected"><span>STL · 1</span><small>Selected object only</small></button>
+      <button data-format="off"><span>OFF</span><small>Geometry exchange</small></button>
+      <button data-format="obj"><span>OBJ</span><small>Indexed mesh exchange</small></button>
+      <button data-format="3mf"><span>3MF</span><small>Slicer package with units</small></button>
+      <button id="exportPng"><span>PNG</span><small>Current viewport image</small></button>
+    </div>
+
+    <div class="mcp-modal" id="mcpModal" hidden>
+      <div class="mcp-scrim" id="mcpScrim"></div>
+      <div class="mcp-dialog" role="dialog" aria-modal="true" aria-labelledby="mcpTitle">
+        <header class="mcp-head">
+          <div class="mcp-head-text">
+            <span class="eyebrow">AI ready · Model Context Protocol</span>
+            <h2 id="mcpTitle">Wire an agent into this workspace</h2>
+          </div>
+          <button class="mcp-close" id="closeMcp" aria-label="Close">×</button>
+        </header>
+        <div class="mcp-body">
+          <div class="mcp-rail">
+            <section class="mcp-card">
+              <span class="mcp-label">Server endpoint</span>
+              <div class="mcp-endpoint"><b>POST</b><code id="mcpEndpoint">…</code></div>
+              <button class="mcp-copy" data-copy="mcpEndpoint"><i></i><span>Copy endpoint</span></button>
+              <p class="mcp-note">JSON-RPC 2.0 over HTTP — the <em>streamable-http</em> transport. No stdio, no auth, no SSE stream.</p>
+            </section>
+            <section class="mcp-card">
+              <span class="mcp-label">Connection check</span>
+              <button class="mcp-test" id="mcpTest"><i></i><span>Test connection</span></button>
+              <div class="mcp-status" id="mcpStatus" data-state="idle" aria-live="polite"><i></i><span>Not tested yet.</span></div>
+              <dl class="mcp-facts" id="mcpFacts" hidden></dl>
+            </section>
+            <section class="mcp-card">
+              <span class="mcp-label">This workspace</span>
+              <code class="mcp-id" id="mcpWorkspaceId">…</code>
+              <button class="mcp-copy" data-copy="mcpWorkspaceId"><i></i><span>Copy workspace id</span></button>
+              <p class="mcp-note">Every tool but <em>create_workspace</em> and <em>get_supported_scad</em> is scoped by this id — paste it into your first message so the agent edits <em>this</em> file.</p>
+            </section>
+          </div>
+          <div class="mcp-main">
+            <div class="mcp-tabs" id="mcpTabs" role="tablist" aria-label="MCP clients"></div>
+            <div class="mcp-client" id="mcpClient"></div>
+          </div>
+          <section class="mcp-tools">
+            <div class="mcp-tools-head">
+              <span class="mcp-label">What the agent gets</span>
+              <span class="mcp-tools-count" id="mcpToolCount">read live from tools/list</span>
+            </div>
+            <div class="mcp-tool-grid" id="mcpToolGrid"><div class="mcp-tools-empty">Run the connection check to list the tools this server actually advertises.</div></div>
+          </section>
+        </div>
+      </div>
+    </div>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>
