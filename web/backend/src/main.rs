@@ -2277,11 +2277,23 @@ fn serve_request(
     };
     set_indexable(route_is_indexable(&request));
     if !request_is_allowed(&request, state) {
-        return respond_json(
-            stream,
-            403,
-            r#"{"ok":false,"error":"Only same-origin localhost requests are allowed."}"#,
-        );
+        // Name the origin the deployment actually accepts. Saying "localhost"
+        // when REOPENSCAD_PUBLIC_ORIGIN is set sends an operator hunting for a
+        // networking fault instead of reading one env var.
+        let body = match state.public_origin.as_deref() {
+            // serde builds the string so an origin containing a quote cannot
+            // break out of the JSON body.
+            Some(origin) => json!({
+                "ok": false,
+                "error": format!(
+                    "This server only accepts requests for {origin}. Check the Host header, \
+                     or REOPENSCAD_PUBLIC_ORIGIN if this origin is wrong."
+                ),
+            })
+            .to_string(),
+            None => r#"{"ok":false,"error":"Only same-origin localhost requests are allowed. Set REOPENSCAD_PUBLIC_ORIGIN to serve a public origin."}"#.to_string(),
+        };
+        return respond_json(stream, 403, &body);
     }
     if matches!(request.method.as_str(), "POST" | "PATCH" | "PUT")
         && !request.body.is_empty()
@@ -6758,7 +6770,12 @@ mod tests {
     /// Runs one raw request through the real request pipeline and returns the
     /// whole response, headers included.
     fn serve_over_socket(raw: &str) -> String {
-        let (mut state, root) = temporary_state(None);
+        serve_over_socket_with_origin(None, raw)
+    }
+
+    /// The same pipeline with `REOPENSCAD_PUBLIC_ORIGIN` set to `public_origin`.
+    fn serve_over_socket_with_origin(public_origin: Option<&str>, raw: &str) -> String {
+        let (mut state, root) = temporary_state(public_origin);
         state.web_root = web_root();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -6896,5 +6913,108 @@ mod tests {
         assert!(headers.contains("X-Robots-Tag"));
         assert!(body.contains(ROBOTS_META));
         set_indexable(false);
+    }
+
+    // -----------------------------------------------------------------------
+    // What the 403 tells the operator.
+    //
+    // `request_is_allowed` accepts exactly one authority, which is the whole
+    // point of it -- that stays. The body used to be a fixed literal naming
+    // localhost, so a deployment with `REOPENSCAD_PUBLIC_ORIGIN` set answered
+    // every Host mismatch with advice about a machine that is not involved.
+    // The wording is the only thing under test here, and it is only reachable
+    // through the real response path, so these drive a socket too.
+    // -----------------------------------------------------------------------
+
+    fn body_of(response: &str) -> &str {
+        response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or_default()
+    }
+
+    /// Parses the response as the JSON error envelope every client expects,
+    /// asserting the status line and `ok: false` on the way through.
+    fn forbidden_error(response: &str) -> String {
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "expected a 403, got {response}"
+        );
+        assert!(
+            response.contains("Content-Type: application/json; charset=utf-8"),
+            "403 was not sent as JSON: {response}"
+        );
+        let body: Value =
+            serde_json::from_str(body_of(response)).expect("the 403 body is valid JSON");
+        assert_eq!(body["ok"], json!(false));
+        body["error"]
+            .as_str()
+            .expect("the 403 body carries an error string")
+            .to_string()
+    }
+
+    /// A public deployment rejecting a Host mismatch has to name the origin it
+    /// does accept -- and must not send the operator to localhost.
+    #[test]
+    fn the_public_origin_rejection_names_the_configured_origin() {
+        let error = forbidden_error(&serve_over_socket_with_origin(
+            Some("https://reopenscad.com"),
+            "GET /api/health HTTP/1.1\r\nHost: reopenscad-354887056155.us-central1.run.app\r\n\r\n",
+        ));
+        assert!(error.contains("https://reopenscad.com"), "{error}");
+        assert!(error.contains("REOPENSCAD_PUBLIC_ORIGIN"), "{error}");
+        assert!(
+            !error.to_ascii_lowercase().contains("localhost"),
+            "a configured deployment still blamed localhost: {error}"
+        );
+    }
+
+    /// The other half of the same predicate: the configured origin is served,
+    /// so the message above is diagnosing a real Host mismatch and nothing else.
+    #[test]
+    fn the_public_origin_serves_its_own_host() {
+        let response = serve_over_socket_with_origin(
+            Some("https://reopenscad.com"),
+            "GET /api/health HTTP/1.1\r\nHost: reopenscad.com\r\n\r\n",
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "the configured origin was refused: {response}"
+        );
+    }
+
+    /// With no public origin configured the localhost wording is the correct
+    /// diagnosis, so it stays -- now pointing at the env var that changes it.
+    #[test]
+    fn the_unconfigured_rejection_still_points_at_localhost() {
+        let error = forbidden_error(&serve_over_socket(
+            "GET /api/health HTTP/1.1\r\nHost: attacker.example\r\n\r\n",
+        ));
+        assert!(error.contains("localhost"), "{error}");
+        assert!(error.contains("REOPENSCAD_PUBLIC_ORIGIN"), "{error}");
+    }
+
+    /// The origin is reflected into the body, so it has to be serialized rather
+    /// than pasted: a quote in the configured value must escape, not close the
+    /// string and add fields of its own.
+    #[test]
+    fn a_quoted_origin_cannot_forge_the_403_body() {
+        let response = serve_over_socket_with_origin(
+            Some("https://evil\",\"ok\":true,\"injected\":\"a.example"),
+            "GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:5173\r\n\r\n",
+        );
+        let error = forbidden_error(&response);
+        assert!(
+            error.contains("\",\"ok\":true"),
+            "the origin was mangled: {error}"
+        );
+        let body: Value = serde_json::from_str(body_of(&response)).unwrap();
+        let fields = body.as_object().expect("a JSON object");
+        assert_eq!(
+            fields.len(),
+            2,
+            "the origin smuggled a field in: {fields:?}"
+        );
+        assert!(!fields.contains_key("injected"), "{fields:?}");
     }
 }

@@ -447,6 +447,38 @@ Retention runs itself: every ten minutes a sweeper thread deletes workspaces
 idle for more than 14 days and trims the table to the newest
 `REOPENSCAD_MAX_WORKSPACES`, with two set-based `DELETE`s.
 
+### Request logs contain workspace credentials
+
+A workspace URL is the only key to that workspace, and Cloud Run's request log
+records the full request path — so `/workspaces/<id>` and
+`/api/workspaces/<id>` land in Cloud Logging on every hit, readable by anyone
+holding `roles/logging.viewer` on the project for the whole retention window
+(30 days by default). The server itself never logs a path, an id or any source
+code; this is the platform's log, not the application's.
+
+Treat project log access as workspace access, and shorten the exposure:
+
+```sh
+# Drop Cloud Run request logs for this service; the app's own stdout/stderr
+# (startup banner, storage errors) is unaffected and stays queryable.
+gcloud logging sinks update _Default --log-filter='
+  NOT (logName:"run.googleapis.com%2Frequests"
+       AND resource.labels.service_name="'"$SERVICE"'")
+'
+
+# Or keep them and let them expire sooner.
+gcloud logging buckets update _Default --location=global --retention-days=7
+```
+
+`gcloud logging sinks describe _Default` first — the update **replaces** the
+filter rather than appending to it.
+
+One application log line can carry an id: `describe()` in `pgstore.rs` prints
+the raw Postgres error, and a constraint violation renders its `DETAIL` with
+the offending key. That needs a genuine primary-key collision on a 112-bit id
+to happen, so it is left in place — the operator value of the real driver error
+outweighs it. Redact it if project log access ever widens.
+
 ### Set `REOPENSCAD_MAX_WORKSPACES` before you take real traffic
 
 The 512 default is inherited from the filesystem store, where it capped one
