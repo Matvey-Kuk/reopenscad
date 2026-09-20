@@ -15,7 +15,8 @@
 //! epsilon would collapse detail on small features of a large model.
 //!
 //! * [`EPSILON`] (1e-9) classifies a point against a plane in [`bsp`].
-//! * [`WELD_EPSILON`] (1e-9) merges coincident vertices when indexing a mesh.
+//! * [`WELD_EPSILON`] (3e-5) merges coincident vertices when indexing a mesh;
+//!   see its own note for why it is looser than the rest.
 //! * [`PLANE_ANGLE_EPSILON`] decides whether two faces are coplanar during the
 //!   face-merging pass.
 //!
@@ -102,7 +103,34 @@ pub type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 pub const EPSILON: f64 = 1.0e-9;
 
 /// Absolute tolerance used when welding coincident vertices.
-pub const WELD_EPSILON: f64 = 1.0e-9;
+///
+/// Deliberately looser than [`EPSILON`], because it answers a different
+/// question. [`EPSILON`] asks where a point lies relative to a plane, which is
+/// a well-conditioned test. This one asks whether two points the kernel
+/// *computed separately* are the same point, and that computation is not
+/// always well conditioned: a vertex where two nearly parallel faces meet
+/// comes out of an ill-conditioned plane intersection, so the same corner
+/// reached along two different faces can differ by far more than the
+/// arithmetic's own noise. Measured on a louvred basket whose blades cross at
+/// a shallow angle, corners that are geometrically identical landed 1e-6 apart
+/// — a thousand times [`EPSILON`]. At 1e-9 they stayed separate vertices, and
+/// the mesh came out of the boolean cracked: 2011 boundary edges, 450
+/// non-manifold edges, and zero-area facets spanning the gaps.
+///
+/// How far out an ill-conditioned intersection lands scales with the size of
+/// the model, not with [`EPSILON`], and the worst spread on that basket — a
+/// 200 mm part — is 2.5e-5 mm, or about one part in 1e7 of its own extent.
+/// Anything tighter leaves those corners as a cluster of three vertices, which
+/// is a hole in the surface and a non-manifold edge at export.
+///
+/// 3e-5 mm is 30 nanometres: still more than two orders of magnitude below the
+/// 0.01 mm feature size at the bottom of the authoring range above, and thirty
+/// times finer than the 1e-3 mm grid OpenSCAD itself rounds to, so it cannot
+/// merge detail anyone modelled on purpose. It is not a free parameter to
+/// widen at will — it is an upper bound on how wrong an intersection is
+/// allowed to be, and widening it past a real feature size would weld that
+/// feature away.
+pub const WELD_EPSILON: f64 = 3.0e-5;
 
 /// Tolerance on the dot product of two unit normals for "same plane".
 pub const PLANE_ANGLE_EPSILON: f64 = 1.0e-8;
@@ -719,5 +747,59 @@ impl VertexWelder {
         self.vertices.push(point);
         self.lattice.insert(key, index);
         index
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The welder has to merge the two answers an ill-conditioned plane
+    /// intersection gives for one corner. At [`EPSILON`] it did not, and a
+    /// boolean between shallow-crossing faces came out of the kernel cracked.
+    ///
+    /// The distances here bracket the real measurement: 2.5e-5 is the widest
+    /// spread seen on a louvred basket's blade crossings and must weld, while
+    /// a separation of 1e-3 — OpenSCAD's own coarse grid — is real geometry
+    /// that must survive.
+    #[test]
+    fn the_welder_merges_a_corner_two_ill_conditioned_intersections_disagree_on() {
+        let mut welder = VertexWelder::default();
+        let corner = Vec3::new(41.100_09, -2.759_142, 1.426_439);
+        let first = welder.insert(corner);
+
+        for drift in [1.0e-9, 1.0e-7, 2.5e-5] {
+            let nudged = Vec3::new(corner.x, corner.y - drift, corner.z);
+            assert_eq!(
+                welder.insert(nudged),
+                first,
+                "a corner {drift} away is the same corner, not a new vertex"
+            );
+        }
+
+        let apart = Vec3::new(corner.x, corner.y - 1.0e-3, corner.z);
+        assert_ne!(
+            welder.insert(apart),
+            first,
+            "1e-3 mm is modelled detail and must not be welded away"
+        );
+    }
+
+    /// Welding is what closes a seam, so it has to survive the lattice: two
+    /// points inside the tolerance of each other can still land in different
+    /// cells, which is why `insert` probes the neighbours.
+    #[test]
+    fn welding_is_not_defeated_by_a_lattice_boundary() {
+        let mut welder = VertexWelder::default();
+        // Straddling a cell edge of the welder's own lattice, whatever the
+        // tolerance is set to, so the pair is split between two cells.
+        let boundary = (0.5 / WELD_EPSILON).round() * WELD_EPSILON;
+        let on_boundary = Vec3::new(boundary, boundary, boundary);
+        let across = Vec3::new(
+            boundary - WELD_EPSILON / 4.0,
+            boundary - WELD_EPSILON / 4.0,
+            boundary - WELD_EPSILON / 4.0,
+        );
+        assert_eq!(welder.insert(on_boundary), welder.insert(across));
     }
 }

@@ -595,6 +595,21 @@ pub fn openappa_cases() -> Vec<ParityCase> {
     parse_cases(&manifest).unwrap()
 }
 
+/// Directory holding the hard-geometry regression sources and their goldens.
+///
+/// Deliberately separate from [`fixture_root`]. OpenAPPA is the corpus the
+/// kernel already passes; this is the corpus it does not, and conflating the
+/// two would mean a green run could not tell you which.
+pub fn hard_geometry_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hard-geometry")
+}
+
+/// The hard-geometry cases, read from their committed manifest.
+pub fn hard_geometry_cases() -> Vec<ParityCase> {
+    let manifest = fs::read_to_string(hard_geometry_root().join("cases.tsv")).unwrap();
+    parse_cases(&manifest).unwrap()
+}
+
 pub fn source_with_definitions(source: &str, definitions: &str) -> String {
     if definitions.trim().is_empty() {
         source.to_owned()

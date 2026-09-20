@@ -28,6 +28,26 @@
 //!
 //! The tree is built and traversed with explicit work stacks rather than
 //! recursion so that deep trees from large models cannot overflow the stack.
+//!
+//! # Termination
+//!
+//! [`Bsp::build`] subdivides until it runs out of polygons, and it only gets
+//! there because each step files at least one polygon at the node it is
+//! working on: the splitting plane belongs to a polygon of that very set, so
+//! that polygon is coplanar with it by construction. The premise is not free.
+//! A split fragment inherits its parent's plane, and a near-degenerate one can
+//! end up further than [`EPSILON`] from it, at which point its plane no longer
+//! selects it and the step can consume nothing at all. `build` detects that
+//! case and stops subdividing rather than descending into a child that would
+//! repeat it forever; see the comment on the guard.
+//!
+//! That guard is specific to a divergence that was diagnosed. Behind it sits a
+//! node budget that is not: a split cascade which grows faster than it files
+//! is not an infinite loop, but an exponential allocation on a shared server
+//! ends the same way, with the instance killed and every concurrent request
+//! dropped. [`node_limit`] bounds what any such failure can cost, and a build
+//! that reaches it aborts rather than returning the partial tree — half a
+//! partition is wrong geometry, quietly.
 
 use super::mesh::{Plane, Polygon, Vec3, EPSILON};
 use super::prof;
@@ -39,6 +59,99 @@ const SPANNING: u8 = 3;
 
 /// Number of candidate planes sampled when choosing a node split.
 const SPLIT_CANDIDATES: usize = 12;
+
+/// Marks the panic [`Bsp::build`] raises when it runs out of node budget, so
+/// the engine can turn that one panic into a real error message and leave
+/// every other panic reported as the internal fault it is.
+pub const BUDGET_PANIC_PREFIX: &str = "reopenscad-csg-budget: ";
+
+/// Nodes a single [`Bsp::build`] call may add per polygon handed to it.
+///
+/// Measured against real work rather than guessed: the OpenAPPA corpus and the
+/// workspace models build 1.00–1.07 nodes per input polygon, because a healthy
+/// subdivision files polygons at roughly the rate it creates places to put
+/// them. Sixty-four is a factor of sixty over the worst of those, so a model
+/// has to be diverging, not merely awkward, to reach it.
+const NODES_PER_POLYGON: usize = 64;
+
+/// Floor under the per-call allowance, so a boolean between two tiny operands
+/// still gets room for an ordinary tree. The divergence this guards against
+/// allocates millions of nodes from two polygons, so a floor this size costs
+/// nothing in detection and removes any chance of refusing small real work.
+const MIN_NODE_ALLOWANCE: usize = 65_536;
+
+/// Bytes of node storage one tree may occupy before the build is abandoned.
+///
+/// The per-polygon allowance above scales with the operand, which is what
+/// catches a runaway on a small input; this is the ceiling that stops a large
+/// input from authorising a large runaway. 256 MiB is sized against the
+/// deployment in `web/DEPLOY.md`: a 2 GiB instance admitting
+/// `MAX_CONCURRENT_JOBS = 2` renders, each of which also holds meshes and a
+/// response buffer. Running out is not graceful — Cloud Run kills the instance
+/// and every concurrent request with it — so the kernel stops well short.
+const NODE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+/// Environment override for [`NODE_BUDGET_BYTES`], in mebibytes.
+///
+/// The ceiling is a judgement about a machine, not a property of the geometry,
+/// so an operator who meets a legitimate model that needs more room can raise
+/// it without a rebuild — and one running a smaller instance can lower it.
+const NODE_BUDGET_ENV: &str = "REOPENSCAD_MAX_BSP_MIB";
+
+/// Nodes the tree may reach before a build is abandoned.
+///
+/// The per-polygon allowance is what catches a runaway on a small operand; the
+/// ceiling is what stops a large operand from authorising a large runaway. A
+/// build that is handed an already-standing tree gets its allowance on top of
+/// what is there, because `union` builds into the tree it just made.
+fn node_limit(polygons: usize, existing: usize, ceiling: usize) -> usize {
+    polygons
+        .saturating_mul(NODES_PER_POLYGON)
+        .max(MIN_NODE_ALLOWANCE)
+        .saturating_add(existing)
+        .min(ceiling)
+}
+
+/// Hard ceiling on nodes in one tree, from [`NODE_BUDGET_BYTES`] and the
+/// measured size of a node rather than a round number chosen to look safe.
+fn node_ceiling() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CEILING: AtomicUsize = AtomicUsize::new(0);
+    let cached = CEILING.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let bytes = std::env::var(NODE_BUDGET_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|mib| *mib > 0)
+        .map_or(NODE_BUDGET_BYTES, |mib| mib.saturating_mul(1024 * 1024));
+    let ceiling = (bytes / std::mem::size_of::<BspNode>()).max(1);
+    CEILING.store(ceiling, Ordering::Relaxed);
+    ceiling
+}
+
+/// Abandons a build that is not converging.
+///
+/// A panic rather than an error return because every boolean operation between
+/// here and the engine — `Solid::union`, `union_all`, the parallel fold — is
+/// infallible by signature, and threading a `Result` through all of them to
+/// report a condition that must never happen would be a worse trade than
+/// unwinding. `engine::compile_parts` catches this and turns it back into an
+/// `EngineError`, so the caller still sees an ordinary failed render.
+///
+/// Failing here is deliberately *not* a silent degradation: stopping the
+/// subdivision early and keeping the partial tree would answer with geometry
+/// that is quietly wrong, which is worse than answering with nothing.
+#[cold]
+#[inline(never)]
+fn budget_exhausted(limit: usize) -> ! {
+    panic!(
+        "{BUDGET_PANIC_PREFIX}This model is too complex for the exact kernel: a boolean \
+         operation's BSP build passed its budget of {limit} nodes without converging. \
+         Reduce $fn, or split the model into fewer overlapping parts."
+    );
+}
 
 #[derive(Clone, Debug, Default)]
 struct BspNode {
@@ -81,6 +194,23 @@ impl Bsp {
 
     /// Adds polygons to the tree, creating nodes as needed.
     pub fn build(&mut self, polygons: Vec<Polygon>) {
+        // The guard inside rules out the one non-progressing step this build
+        // is known to take, but "known" is the operative word: a split cascade
+        // that merely grows faster than it files is not an infinite loop, and
+        // on a shared instance an exponential allocation is as fatal as an
+        // endless one. The budget bounds what any failure of this kind can
+        // cost, whether or not it is a failure anybody has seen.
+        let limit = node_limit(polygons.len(), self.nodes.len(), node_ceiling());
+        self.build_within(polygons, limit);
+    }
+
+    /// [`Self::build`] against an explicit node ceiling.
+    ///
+    /// Separate so the budget can be exercised by a test at a size a test can
+    /// afford: reaching the real floor of [`MIN_NODE_ALLOWANCE`] nodes needs an
+    /// input far too large to build in a unit test, and an environment
+    /// variable would leak across the suite's threads.
+    fn build_within(&mut self, polygons: Vec<Polygon>, limit: usize) {
         if polygons.is_empty() {
             return;
         }
@@ -95,14 +225,23 @@ impl Bsp {
             if polygons.is_empty() {
                 continue;
             }
-            if self.nodes[index].plane.is_none() {
+            if self.nodes.len() > limit {
+                budget_exhausted(limit);
+            }
+            // Whether this set is what the node's plane was chosen from. A node
+            // reached a second time -- `union` calls `build` again on a tree
+            // that is already standing -- keeps the plane it got the first
+            // time, and then a set that misses it entirely is unremarkable.
+            let own_plane = self.nodes[index].plane.is_none();
+            if own_plane {
                 self.nodes[index].plane = Some(choose_plane(&polygons));
             }
             let plane = self.nodes[index].plane.expect("plane was just assigned");
             let mut front = Vec::new();
             let mut back = Vec::new();
+            let mut split_any = false;
             for polygon in polygons {
-                split_polygon_owned(
+                let kind = split_polygon_owned(
                     plane,
                     polygon,
                     &mut coplanar_front,
@@ -110,9 +249,79 @@ impl Bsp {
                     &mut front,
                     &mut back,
                 );
+                split_any |= kind == SPANNING;
             }
+            let filed = coplanar_front.len() + coplanar_back.len();
             self.nodes[index].polygons.extend(coplanar_front.drain(..));
             self.nodes[index].polygons.extend(coplanar_back.drain(..));
+            // The subdivision terminates only because every step consumes at
+            // least one polygon: the plane comes from a polygon of this very
+            // set, so that polygon classifies as coplanar and stays here.
+            //
+            // A near-degenerate fragment breaks the premise. `push_fragment`
+            // gives a split fragment the *parent's* plane, and for a sliver a
+            // few nanometres across the lerped vertices need not sit within
+            // EPSILON of it. `choose_plane` then hands back a plane that its
+            // own donor classifies as FRONT or BACK, nothing is filed here,
+            // the whole set moves to a freshly allocated child, that child
+            // picks the same plane from the same polygons — and the loop
+            // allocates a node per iteration until the process dies. That is
+            // not hypothetical: two 1.2e-9 mm^2 needles out of a hinge union
+            // did exactly this, and on a server it is an OOM, not an error.
+            //
+            // The divergent step is exactly: the plane came from this set,
+            // nothing was filed here, nothing was split, every polygon went
+            // whole to one side, and the child on that side has no plane yet.
+            // Then the child's polygon list is this one, element for element
+            // and in the same order, so `choose_plane` returns the same plane
+            // and the step repeats forever. Anything else makes progress -- a
+            // split shrinks the fragments, a populated pair of sides shrinks
+            // both subsets, and either child or node holding a plane picked
+            // from some other set classifies against a different plane.
+            //
+            // The fix is to restore the premise, not to stop subdividing:
+            // file *one* polygon here, and let the rest descend as they would
+            // have. That is enough for termination, because the step now
+            // consumes one either way, and it is all that may be done.
+            //
+            // Filing the whole set instead — and so never allocating the
+            // child — looks equivalent and is not. A node's payload really
+            // does take no part in classification, so *where* a polygon is
+            // stored is free; `clip_polygons` reads only planes and children,
+            // and `clip_to` clips a node's payload against the other tree
+            // wherever it sits. But the absent child is not free. A front
+            // half-space with no front child means "outside" and a back
+            // half-space with no back child means "inside", so collapsing the
+            // subtree silently reclassifies that whole region instead of
+            // letting the polygons that fall in it subdivide it. On the
+            // coffee-bin model that turned 545 stalls into an open surface:
+            // 1669 boundary edges, 400 non-manifold edges, and facets welded
+            // between the wall and the floor.
+            if own_plane && filed == 0 && !split_any {
+                let to_front = match (front.is_empty(), back.is_empty()) {
+                    (false, true) => Some(true),
+                    (true, false) => Some(false),
+                    // Both sides populated: each child gets a strictly smaller
+                    // subset. Both empty: every polygon was dropped.
+                    _ => None,
+                };
+                if let Some(to_front) = to_front {
+                    let child = if to_front {
+                        self.nodes[index].front
+                    } else {
+                        self.nodes[index].back
+                    };
+                    let would_repeat =
+                        child.is_none_or(|child| self.nodes[child].plane.is_none());
+                    if would_repeat {
+                        let stalled = if to_front { &mut front } else { &mut back };
+                        // Order is load-bearing: the child's set has to differ
+                        // from this one, and taking the front keeps what is
+                        // left in the order `choose_plane` will see it.
+                        self.nodes[index].polygons.push(stalled.remove(0));
+                    }
+                }
+            }
             if !front.is_empty() {
                 let child = match self.nodes[index].front {
                     Some(child) => child,
@@ -350,6 +559,10 @@ fn classify_polygon(plane: Plane, polygon: &Polygon) -> u8 {
 /// Coplanar polygons go to `coplanar_front` or `coplanar_back` depending on
 /// whether their own normal agrees with the plane; that is what makes touching
 /// faces resolve deterministically.
+///
+/// Returns how the polygon classified: `COPLANAR`, `FRONT`, `BACK` or
+/// `SPANNING`. `build` needs it to tell a step that split something from one
+/// that merely moved the whole set down one level.
 pub fn split_polygon(
     plane: Plane,
     polygon: &Polygon,
@@ -357,7 +570,7 @@ pub fn split_polygon(
     coplanar_back: &mut Vec<Polygon>,
     front: &mut Vec<Polygon>,
     back: &mut Vec<Polygon>,
-) {
+) -> u8 {
     split_polygon_owned(
         plane,
         polygon.clone(),
@@ -365,7 +578,7 @@ pub fn split_polygon(
         coplanar_back,
         front,
         back,
-    );
+    )
 }
 
 /// [`split_polygon`] taking ownership.
@@ -375,6 +588,8 @@ pub fn split_polygon(
 /// vector. The tree build and every clip pass hit this path millions of times
 /// on a large model, and the clones were the kernel's single largest source of
 /// allocator traffic.
+///
+/// Returns the polygon's classification, as [`split_polygon`] does.
 pub fn split_polygon_owned(
     plane: Plane,
     polygon: Polygon,
@@ -382,7 +597,7 @@ pub fn split_polygon_owned(
     coplanar_back: &mut Vec<Polygon>,
     front: &mut Vec<Polygon>,
     back: &mut Vec<Polygon>,
-) {
+) -> u8 {
     let count = polygon.vertices.len();
     // Classification is per-vertex scratch that dies with the call; almost
     // every polygon here is a triangle or a quad, so it lives on the stack.
@@ -448,6 +663,7 @@ pub fn split_polygon_owned(
             push_fragment(back_vertices, polygon.plane, back);
         }
     }
+    polygon_kind
 }
 
 fn push_fragment(vertices: Vec<Vec3>, plane: Plane, output: &mut Vec<Polygon>) {
@@ -660,5 +876,112 @@ mod tests {
             )));
         let result = difference(a.polygons, b.polygons);
         assert!((volume_of(&result) - 1000.0).abs() < 1e-9);
+    }
+
+    /// The two polygons a hinge union produced that used to hang `build`
+    /// forever. Both are needles of about 1.2e-9 mm^2, and the first one's
+    /// stored plane -- inherited from the polygon it was split out of -- misses
+    /// one of its own vertices by 1.0e-7, a hundred times [`EPSILON`]. So
+    /// `choose_plane` returns that plane, its own donor classifies as BACK
+    /// rather than COPLANAR, nothing stays at the node, and the pair descends
+    /// into a fresh child that repeats the step. Before the progress guard in
+    /// `build` this allocated a node per iteration until the process was
+    /// killed; on the server that was an OOM, not a render error.
+    ///
+    /// Run on a worker so a regression fails the test in ten seconds instead of
+    /// hanging the suite until the machine runs out of memory.
+    #[test]
+    fn a_sliver_whose_plane_misses_its_own_vertices_cannot_spin_the_build() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let needle = Polygon::with_plane(
+                vec![
+                    Vec3::new(34.586_764_699_586_055, 52.140_000_000_000_01, 1.199_999_999_999_995_7),
+                    Vec3::new(34.586_764_699_494_175, 52.539_999_860_859_96, 1.600_000_155_347_984),
+                    Vec3::new(34.586_764_703_783_61, 52.539_999_848_703_92, 1.600_000_143_191_938),
+                ],
+                Plane::new(
+                    Vec3::new(0.0, 0.707_107_171_626_174_1, -0.707_106_390_746_705_6),
+                    36.020_040_363_809_98,
+                ),
+            );
+            let wedge = Polygon::with_plane(
+                vec![
+                    Vec3::new(34.586_764_704_855_966, 52.539_999_850_267_86, 1.600_000_144_755_880_7),
+                    Vec3::new(34.586_764_702_803_13, 52.140_000_045_638_48, 1.200_000_045_638_503_6),
+                    Vec3::new(34.586_764_699_586_055, 52.140_000_000_000_01, 1.199_999_999_999_995_7),
+                    Vec3::new(34.586_764_703_783_61, 52.539_999_860_859_96, 1.600_000_155_347_984),
+                ],
+                Plane::new(
+                    Vec3::new(0.000_000_772_746_007, 0.707_106_520_892_892_8, -0.707_107_041_479_684_2),
+                    36.020_032_276_364_14,
+                ),
+            );
+            let tree = Bsp::from_polygons(vec![needle, wedge]);
+            let _ = sender.send((tree.nodes.len(), tree.polygon_count()));
+        });
+
+        let (nodes, polygons) = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("building a BSP over near-degenerate slivers must terminate");
+        assert!(
+            nodes <= 8,
+            "the build subdivided {nodes} nodes for two polygons: the progress guard is gone"
+        );
+        // Stalling files the polygons at the node; it must not discard them.
+        assert_eq!(polygons, 2);
+    }
+
+    /// A build that will not converge has to stop, and it has to stop loudly:
+    /// keeping the half-built tree would answer with geometry that is quietly
+    /// wrong, which is worse than answering with nothing. The message carries
+    /// the prefix `engine::compile_parts` keys on to turn this back into a
+    /// render error rather than a dropped connection.
+    #[test]
+    fn a_build_that_passes_its_node_budget_aborts_instead_of_allocating() {
+        // Forty overlapping cubes: a perfectly ordinary subdivision, run
+        // against a ceiling far below the nodes it legitimately needs.
+        let mut polygons = Vec::new();
+        for step in 0..40 {
+            let offset = step as f64 * 3.7;
+            let cube = primitives::cube(Vec3::new(10.0, 10.0, 10.0), false).transformed(
+                super::super::mesh::Matrix4::translation(Vec3::new(offset, offset, 0.0)),
+            );
+            polygons.extend(cube.polygons);
+        }
+        let panic = std::panic::catch_unwind(|| {
+            let mut tree = Bsp::new();
+            tree.build_within(polygons, 4);
+            tree.nodes.len()
+        })
+        .expect_err("a build past its budget must not return a partial tree");
+        let message = panic
+            .downcast_ref::<String>()
+            .expect("the budget abort panics with a formatted message");
+        assert!(
+            message.starts_with(BUDGET_PANIC_PREFIX),
+            "the engine keys on this prefix to report the abort: {message}"
+        );
+    }
+
+    /// The budget has to be loose enough that real work never meets it. These
+    /// are the numbers behind that claim, so a later edit to the constants has
+    /// to restate them rather than quietly narrowing the margin.
+    #[test]
+    fn the_node_budget_leaves_real_models_a_wide_margin() {
+        let ceiling = usize::MAX;
+        // Measured peak on the OpenAPPA corpus and the workspace models is
+        // 1.07 nodes per input polygon; the allowance is sixty times that.
+        assert_eq!(node_limit(10_000, 0, ceiling), 640_000);
+        // Small operands get the floor, not a proportionally tiny allowance.
+        assert_eq!(node_limit(2, 0, ceiling), MIN_NODE_ALLOWANCE);
+        // `union` builds into a standing tree, so the allowance is on top of it.
+        assert_eq!(node_limit(2, 500, ceiling), MIN_NODE_ALLOWANCE + 500);
+        // The ceiling wins over any allowance a large operand would earn.
+        assert_eq!(node_limit(10_000_000, 0, 4_096), 4_096);
+        // Neither term may wrap on absurd input.
+        assert_eq!(node_limit(usize::MAX, usize::MAX, ceiling), usize::MAX);
+        // The real ceiling is a memory budget, so it has to be sane in nodes.
+        assert!((100_000..100_000_000).contains(&node_ceiling()));
     }
 }

@@ -182,6 +182,24 @@ kbd { font: 9px var(--mono); }
 .overlay-cancel:hover { border-color: var(--red); color: var(--red); }
 .overlay-cancel:focus-visible { outline: 2px solid var(--yellow); outline-offset: 2px; }
 
+/* Failure panel. It sits under the render overlay in the stack (z 5 vs 6) so a
+   retry's spinner covers it, and it is only as wide as the message needs — the
+   viewport behind it stays orbitable while the user decides what to do. */
+.render-failure { position: absolute; z-index: 5; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(360px, calc(100% - 28px)); display: flex; flex-direction: column; align-items: center; gap: 9px; padding: 18px 20px 15px; border: 1px solid #6d2f2a; border-radius: 5px; background: rgba(26,20,20,.96); box-shadow: 0 12px 34px rgba(0,0,0,.45); text-align: center; animation: arrive .25s ease both; }
+.render-failure[hidden] { display: none; }
+.render-failure i { width: 22px; height: 22px; display: grid; place-items: center; border-radius: 50%; background: #3a201d; color: #e8756a; font: 12px var(--mono); font-style: normal; }
+.render-failure b { color: #f0d8d5; font-size: 13px; letter-spacing: -.02em; }
+.render-failure p { margin: 0; max-width: 100%; max-height: 92px; overflow: auto; color: #c2a9a6; font: 9px/1.6 var(--mono); overflow-wrap: anywhere; }
+.render-failure small { color: var(--dim); font: 8px/1.5 var(--mono); }
+.render-failure-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 7px; margin-top: 2px; }
+.render-failure-actions button { padding: 6px 12px; border-radius: 3px; font: 9px var(--mono); text-transform: uppercase; letter-spacing: .1em; cursor: pointer; }
+.failure-report { border: 1px solid #7c3a33; background: #35211e; color: #f0b3ac; }
+.failure-report:hover { border-color: var(--red); color: #fff; }
+.failure-ghost { border: 1px solid #3a434e; background: #1d232b; color: #c6cdd5; }
+.failure-ghost:hover { border-color: #566270; color: #fff; }
+.render-failure-actions button:focus-visible { outline: 2px solid var(--yellow); outline-offset: 2px; }
+.render-failure-actions button.copied { border-color: #567b36; color: #9dd36c; }
+
 .spinner { display: flex; gap: 4px; }.spinner i { width: 5px; height: 21px; background: var(--green); animation: pulse .8s ease-in-out infinite; }.spinner i:nth-child(2) { animation-delay: .12s; }.spinner i:nth-child(3) { animation-delay: .24s; }
 
 .customizer .pane-header { padding-left: 12px; color: #b9c0c8; font-size: 10px; }.customizer .pane-header button { margin-left: auto; border: 0; background: transparent; color: var(--dim); font-size: 18px; cursor: pointer; padding: 7px 11px; }

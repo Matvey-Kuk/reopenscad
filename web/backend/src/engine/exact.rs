@@ -138,14 +138,39 @@ where
     }
     let results: std::sync::Mutex<Vec<Option<T>>> =
         std::sync::Mutex::new((0..count).map(|_| None).collect());
+    // The first panic raised by any worker, kept so it can be re-raised on
+    // this thread with its payload intact.
+    //
+    // `thread::scope` does propagate a worker's panic, but not the panic: it
+    // reports one with a fresh `"a scoped thread panicked"` and drops the
+    // original payload on the floor. The kernel's node-budget abort says which
+    // model it gave up on and why, and `engine::compile_parts` recognises it
+    // by a marker in that payload — both of which are lost if the work ran on
+    // a worker rather than inline, which is to say lost on exactly the large
+    // models that can provoke it.
+    let panic: std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>> =
+        std::sync::Mutex::new(None);
     let next = AtomicUsize::new(0);
     let run = || loop {
         let index = next.fetch_add(1, Ordering::AcqRel);
         if index >= count {
             return;
         }
-        let value = task(index);
-        results.lock().expect("task slots are never poisoned")[index] = Some(value);
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(index))) {
+            Ok(value) => {
+                results.lock().expect("task slots are never poisoned")[index] = Some(value)
+            }
+            Err(payload) => {
+                // Claim every remaining index so the other workers stop
+                // starting tasks whose results are about to be discarded.
+                next.fetch_add(count, Ordering::AcqRel);
+                let mut first = panic.lock().expect("the panic slot is never poisoned");
+                if first.is_none() {
+                    *first = Some(payload);
+                }
+                return;
+            }
+        }
     };
     std::thread::scope(|scope| {
         for _ in 0..claim.count {
@@ -155,6 +180,12 @@ where
         // thread still gives two-way parallelism.
         run();
     });
+    if let Some(payload) = panic
+        .into_inner()
+        .expect("the panic slot is never poisoned")
+    {
+        std::panic::resume_unwind(payload);
+    }
     results
         .into_inner()
         .expect("task slots are never poisoned")
@@ -215,6 +246,32 @@ pub(super) fn shapes_to_solids(
 }
 
 
+/// Compiles `source` to a kernel solid, stopping short of triangulation.
+///
+/// The export path in [`compile_exact`] cannot be taken apart from outside
+/// this crate, so a developer tool that needs to measure the *solid* — where a
+/// seam actually opens — has nowhere to look. This is that seam: same
+/// evaluation, same kernel, minus [`solid_to_mesh`].
+pub fn compile_exact_solid(
+    source: &str,
+    cancellation: Option<&AtomicBool>,
+) -> Result<csg::Solid, EngineError> {
+    let tokens = Lexer::new(source).tokenize()?;
+    let statements = Parser::new(tokens).parse_program()?;
+    let mut evaluator = Evaluator {
+        cancellation,
+        preview: false,
+        exact: true,
+        ..Evaluator::default()
+    };
+    let shape = evaluator.evaluate(&statements)?;
+    if shape.dimension() != ShapeDimension::Solid {
+        return Err(EngineError::new("The model contains no 3D geometry."));
+    }
+    check_cancelled(cancellation)?;
+    shape_to_solid(&shape, cancellation)
+}
+
 /// Compiles `source` with the exact polyhedral kernel.
 pub fn compile_exact(
     source: &str,
@@ -251,8 +308,13 @@ pub fn compile_exact(
 }
 
 /// Converts a kernel solid into the engine's export mesh.
+///
+/// This is where the kernel's face-merging pass runs, and the only place it
+/// runs: the booleans hand back raw BSP fragments, on purpose, because merged
+/// geometry is not safe to feed back into a boolean. See the module docs in
+/// [`crate::csg::solid`].
 pub fn solid_to_mesh(solid: &csg::Solid) -> Mesh {
-    let indexed = solid.to_indexed_mesh();
+    let indexed = solid.sealed().to_indexed_mesh();
     let mut triangles = Vec::with_capacity(indexed.triangles.len());
     for index in 0..indexed.triangles.len() {
         let [a, b, c] = indexed.triangle_points(index);

@@ -155,11 +155,26 @@
               <p class="render-note" id="renderNote" hidden>Still compiling. Exact boolean geometry on a large model can take a minute.</p>
               <button type="button" class="overlay-cancel" id="overlayCancel">Cancel render</button>
             </div>
+            <!-- A failed render is a dead end: the message names what broke, but the
+                 person who can fix it is not in this tab. The report button turns the
+                 failure into a filed issue carrying the exact source that produced it.
+                 The workspace URL is a credential, so it is never part of that report. -->
+            <div class="render-failure" id="renderFailure" hidden role="alert">
+              <i aria-hidden="true">!</i>
+              <b>Rendering failed</b>
+              <p id="renderFailureMessage"></p>
+              <div class="render-failure-actions">
+                <button type="button" class="failure-report" id="reportRenderFailure"><span>Report on GitHub</span></button>
+                <button type="button" class="failure-ghost" id="copyRenderFailure"><span>Copy report</span></button>
+                <button type="button" class="failure-ghost" id="dismissRenderFailure"><span>Dismiss</span></button>
+              </div>
+              <small>Opens a prefilled issue with your OpenSCAD source and the error. Your workspace link is never included.</small>
+            </div>
             <!-- Two lines, because one would run under the scale badge on the left and the
                  zoom cluster on the right at the pane's usual width. -->
             <div class="view-hint">
-              <div><span>DRAG</span> orbit <span>SCROLL</span> zoom</div>
-              <div><span>MIDDLE / SHIFT+DRAG</span> pan</div>
+              <div><span>DRAG / SHIFT+MIDDLE</span> orbit <span>SWIPE ←→</span> turn</div>
+              <div><span>MIDDLE / RIGHT / SHIFT+SCROLL</span> pan <span>SCROLL</span> zoom</div>
             </div>
             <div class="viewport-fab">
               <button id="zoomIn" aria-label="Zoom in">+</button>

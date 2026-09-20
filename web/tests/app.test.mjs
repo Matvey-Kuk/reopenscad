@@ -973,11 +973,17 @@ test('the whole view frames on the panned target, not the model centre', () => {
 });
 
 test('pan uses the bindings CAD users already have, and orbit keeps the plain drag', () => {
-  assert.match(javascript, /function isPanGesture\(event\) \{[\s\S]*?event\.button === 1 \|\| event\.button === 2 \|\| \(event\.button === 0 && event\.shiftKey\)/);
+  // Middle or right drag pans; Shift + middle orbits. Shift + left is deliberately
+  // absent — it orbits in Fusion, and binding it to pan here would make one chord
+  // mean two things depending on which package the user came from.
+  assert.match(javascript, /function isPanGesture\(event\) \{[\s\S]*?\(event\.button === 1 && !event\.shiftKey\) \|\| event\.button === 2/);
+  assert.doesNotMatch(javascript, /function isPanGesture\(event\) \{[\s\S]*?event\.button === 0 && event\.shiftKey/);
   const pointer = javascript.slice(javascript.indexOf("renderCanvas.addEventListener('pointerdown'"), javascript.indexOf("$('#customizerButton').addEventListener"));
   // One press can only ever mean one gesture, and a second pointer cannot hijack a live one.
   assert.match(pointer, /if \(orbitStart \|\| panStart\) return;/);
-  assert.match(pointer, /const pan = isPanGesture\(event\);\n\s+if \(!pan && event\.button !== 0\) return;/);
+  // The middle button is admitted even when it is not a pan, because Shift + middle
+  // is the orbit chord; without it that press falls through as neither and does nothing.
+  assert.match(pointer, /const pan = isPanGesture\(event\);[\s\S]*?if \(!pan && event\.button !== 0 && event\.button !== 1\) return;/);
   // Capture is taken before any state is set: a throw there must not latch the gesture.
   assert.ok(pointer.indexOf('setPointerCapture') < pointer.indexOf('panStart = {'));
   assert.match(pointer, /\} catch \{ return; \}/);
@@ -999,8 +1005,9 @@ test('pan uses the bindings CAD users already have, and orbit keeps the plain dr
   assert.match(wheel, /camera\[6\] = Math\.max\(meshViewport\.radius \* 1\.15/);
   // Discoverable, and the mode is visible while it is happening.
   const viewHint = html.slice(html.indexOf('<div class="view-hint">'), html.indexOf('<div class="viewport-fab">'));
-  assert.match(viewHint, /<span>DRAG<\/span> orbit <span>SCROLL<\/span> zoom/);
-  assert.match(viewHint, /<span>MIDDLE \/ SHIFT\+DRAG<\/span> pan/);
+  // The hint names every binding the handlers actually accept, and no others.
+  assert.match(viewHint, /<span>DRAG \/ SHIFT\+MIDDLE<\/span> orbit/);
+  assert.match(viewHint, /<span>MIDDLE \/ RIGHT \/ SHIFT\+SCROLL<\/span> pan <span>SCROLL<\/span> zoom/);
   // One line would run under the scale badge and the zoom cluster at the pane's width.
   assert.match(css, /\.view-hint \{[^}]*display: grid;/);
   assert.match(css, /\.render-canvas\.panning[^{]*\{ cursor: grabbing; \}/);

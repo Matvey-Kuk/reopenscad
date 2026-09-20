@@ -157,7 +157,7 @@ const MCP_UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 const MCP_STATIC_CACHE_TTL_MS: u64 = 3_600_000;
 /// Shared by legacy `initialize` and modern `server/discover` so the two eras
 /// describe the server identically.
-const MCP_INSTRUCTIONS: &str = "Create and edit persistent single-file SCAD workspaces, then render or export them. Workspace URLs are access capabilities. Read ui://reopenscad/workspace/{workspaceId} for an embedded 3D preview app with STL and 3MF downloads.";
+const MCP_INSTRUCTIONS: &str = "Create and edit single-file SCAD workspaces, then render or export them. Workspaces are TEMPORARY scratch space, not storage: they are deleted after a period without edits, and sooner when the server is at capacity. Reading or rendering a workspace does NOT keep it alive - only editing does. Always keep the authoritative copy of the source in a local .scad file and treat the workspace as a preview surface you can recreate at any time. Workspace URLs are access capabilities: anyone holding the link has full read/write, so do not post them anywhere public. Read ui://reopenscad/workspace/{workspaceId} for an embedded 3D preview app with STL and 3MF downloads.";
 
 #[derive(Clone)]
 struct AppState {
@@ -4186,7 +4186,14 @@ fn mcp_tool_definitions() -> Vec<Value> {
     vec![
         mcp_tool(
             "create_workspace",
-            "Create a persistent single-file SCAD workspace and return its browser URL.",
+            "Create a single-file SCAD workspace and return its browser URL. \
+             IMPORTANT - the workspace is TEMPORARY, not storage. It is deleted after a period \
+             without edits, and sooner when the server is at capacity; opening or rendering it does \
+             not extend its life, only editing does. Save the SCAD source to a local .scad file (for \
+             example alongside the user's project) and treat that file as the source of truth - if \
+             the workspace disappears, recreate it from the local file. The returned URL is an \
+             access capability: anyone with the link can read and change the work, so share it \
+             deliberately and never post it publicly.",
             json!({
                 "type": "object",
                 "properties": {

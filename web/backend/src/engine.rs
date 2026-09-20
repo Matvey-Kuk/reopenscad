@@ -551,7 +551,59 @@ fn mesh_shape_exact_first(
     })
 }
 
+/// Runs a compile, converting a panic in the geometry kernel into an error.
+///
+/// The kernel is pure computation over owned values, so a panic inside it
+/// leaves nothing shared half-written — which is what makes the
+/// [`AssertUnwindSafe`](std::panic::AssertUnwindSafe) below honest rather than
+/// merely convenient. The two mutable things it can touch on the way out are
+/// both unwind-clean: the compile caches are guarded by mutexes this module
+/// only ever reads through `if let Ok(..)`, so poisoning degrades to a cache
+/// miss, and the parallel map's worker budget is returned by a `Drop` impl
+/// that unwinding runs.
+///
+/// Without this, a panic anywhere under `compile` propagates out through the
+/// connection thread and the caller sees the socket close with no status at
+/// all. One caught panic is a failed render; the alternative is a request that
+/// simply vanishes.
+fn catch_geometry_panic<T>(
+    body: impl FnOnce() -> Result<T, EngineError>,
+) -> Result<T, EngineError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(result) => result,
+        Err(payload) => Err(EngineError::new(describe_geometry_panic(&*payload))),
+    }
+}
+
+/// Turns a caught panic payload into something worth showing a caller.
+///
+/// The kernel's node-budget abort is a real, explainable answer about the
+/// model, so it is passed through as written. Anything else is a bug in this
+/// crate, and saying so plainly beats leaking an assertion message that
+/// describes an invariant the caller has no way to act on. The panic hook has
+/// already written the full text to stderr either way, so nothing is lost to
+/// whoever is actually able to fix it.
+fn describe_geometry_panic(payload: &(dyn std::any::Any + Send)) -> String {
+    let text = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied())
+        .unwrap_or_default();
+    match text.strip_prefix(crate::csg::bsp::BUDGET_PANIC_PREFIX) {
+        Some(explanation) => explanation.to_string(),
+        None => "Internal error: the geometry kernel failed on this model.".to_string(),
+    }
+}
+
 pub fn compile(
+    source: &str,
+    quality: Quality,
+    cancellation: Option<&AtomicBool>,
+) -> Result<CompileOutput, EngineError> {
+    catch_geometry_panic(|| compile_unguarded(source, quality, cancellation))
+}
+
+fn compile_unguarded(
     source: &str,
     quality: Quality,
     cancellation: Option<&AtomicBool>,
@@ -878,6 +930,14 @@ pub fn compile_shared(
 /// the exact behavior of [`compile`]: it is meshed from the implicit union, not
 /// formed by concatenating potentially overlapping part meshes.
 pub fn compile_parts(
+    source: &str,
+    quality: Quality,
+    cancellation: Option<&AtomicBool>,
+) -> Result<MultipartCompileOutput, EngineError> {
+    catch_geometry_panic(|| compile_parts_unguarded(source, quality, cancellation))
+}
+
+fn compile_parts_unguarded(
     source: &str,
     quality: Quality,
     cancellation: Option<&AtomicBool>,
@@ -7446,6 +7506,55 @@ fn add_triangle(mut vertices: [Vec3; 3], gradient: Vec3, output: &mut Vec<Triang
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kernel's node-budget abort is a statement about the model, so it
+    /// reaches the caller intact rather than being flattened into "internal
+    /// error" — that is the whole point of giving it a prefix.
+    #[test]
+    fn a_kernel_budget_abort_becomes_the_error_it_describes() {
+        let caught: Result<(), EngineError> = catch_geometry_panic(|| {
+            panic!("{}Too complex: budget of 7 nodes.", crate::csg::bsp::BUDGET_PANIC_PREFIX)
+        });
+        let message = caught.expect_err("the panic must not escape").to_string();
+        assert_eq!(message, "Too complex: budget of 7 nodes.");
+    }
+
+    /// Every other panic is a bug in this crate. The caller gets a plain
+    /// statement of that rather than an assertion message about an invariant
+    /// they cannot act on, and — crucially — gets a *response*, where before
+    /// the connection simply closed.
+    #[test]
+    fn any_other_kernel_panic_becomes_an_internal_error_not_a_dropped_request() {
+        for panicking in [
+            (|| panic!("index out of bounds: the len is 3")) as fn() -> (),
+            || panic!("{}", String::from("formatted failure")),
+            || std::panic::panic_any(7usize),
+        ] {
+            let caught: Result<(), EngineError> = catch_geometry_panic(|| {
+                panicking();
+                Ok(())
+            });
+            let message = caught.expect_err("the panic must not escape").to_string();
+            assert_eq!(
+                message, "Internal error: the geometry kernel failed on this model.",
+                "an internal panic must not leak its message to the caller"
+            );
+        }
+    }
+
+    /// The guard has to be transparent to everything that does not panic:
+    /// ordinary successes and ordinary errors pass through unchanged.
+    #[test]
+    fn the_panic_guard_does_not_disturb_an_ordinary_compile() {
+        let ok: Result<u32, EngineError> = catch_geometry_panic(|| Ok(42));
+        assert_eq!(ok.expect("a success passes through"), 42);
+        let failed: Result<u32, EngineError> =
+            catch_geometry_panic(|| Err(EngineError::new("The model contains no 3D geometry.")));
+        assert_eq!(
+            failed.expect_err("an error passes through").to_string(),
+            "The model contains no 3D geometry."
+        );
+    }
 
     fn evaluate_source(source: &str) -> Result<Shape, EngineError> {
         let statements = parse_resolved_program(source)?;

@@ -1609,6 +1609,98 @@ function armRenderBackstop(request, mode) {
 // not a reason to lose their click. It is bounded — QUEUE_RETRY_LIMIT attempts
 // on the server's own Retry-After — and every wait is announced rather than
 // hidden behind a spinner that looks like progress.
+// A render response is not always JSON. A proxy in front of the backend, or a
+// backend that is restarting, answers `503 Service Unavailable` as plain text —
+// and parsing that blindly reported "Unexpected token 'S'", a message about our
+// parser rather than about the server that went away. Read the body once, parse
+// it if it is JSON, and otherwise synthesise the failure the caller expects.
+async function readRenderResponse(response) {
+  const text = await response.text();
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === 'object') return parsed;
+  } catch {
+    // Falls through to the synthesised failure below.
+  }
+  const status = `${response.status}${response.statusText ? ` ${response.statusText}` : ''}`.trim();
+  let snippet = text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+  // A bare proxy page usually just repeats its own status line; printing it twice
+  // reads like two separate failures.
+  if (snippet && status.toLowerCase().includes(snippet.toLowerCase())) snippet = '';
+  return {
+    ok: false,
+    error: response.ok
+      ? `The server answered with something other than a render result${snippet ? `: ${snippet}` : '.'}`
+      : `The render server responded ${status}${snippet ? ` — ${snippet}` : ''}. It may be restarting or overloaded; try again in a moment.`,
+  };
+}
+
+// Where a failed render lands.
+//
+// The console line is for the user; this panel is for the project. A render that
+// fails on someone else's model is unreproducible unless the source travels with
+// the report, so the button hands GitHub a prefilled issue carrying the exact
+// code that broke. What it never carries is the workspace URL: that link is the
+// only credential this app has, and a public issue is the last place for it.
+const ISSUE_NEW_URL = 'https://github.com/Matvey-Kuk/reopenscad/issues/new';
+// GitHub and browsers both cap a prefilled URL well before the model does, so an
+// oversized source is trimmed to fit and the untrimmed report stays one click
+// away on the clipboard.
+const ISSUE_URL_LIMIT = 7000;
+let lastRenderFailure = null;
+
+function issueReportBody(failure, code, truncated) {
+  return [
+    'Rendering failed in the ReOpenSCAD web app.',
+    '',
+    `- **Error:** ${failure.summary}`,
+    `- **Mode:** ${failure.mode}`,
+    `- **When:** ${failure.at}`,
+    `- **Browser:** ${navigator.userAgent}`,
+    '',
+    '### OpenSCAD source',
+    truncated ? '_Trimmed to fit the issue link — the full source is on the reporter\'s clipboard._' : null,
+    '```openscad',
+    code,
+    '```',
+  ].filter((line) => line !== null).join('\n');
+}
+
+// The first sentence is the diagnosis; anything after it is advice to the user,
+// which belongs in the body rather than in a title cut off mid-word.
+function issueReportTitle(summary) {
+  const sentence = summary.split('. ')[0].trim() || summary;
+  const short = sentence.length > 80 ? `${sentence.slice(0, 79).trimEnd()}…` : sentence;
+  return `fix: render failed — ${short}`;
+}
+
+function issueReportUrl(failure) {
+  const title = issueReportTitle(failure.summary);
+  let code = failure.code;
+  let truncated = false;
+  for (;;) {
+    const url = `${ISSUE_NEW_URL}?title=${encodeURIComponent(title)}&body=${encodeURIComponent(issueReportBody(failure, code, truncated))}`;
+    if (url.length <= ISSUE_URL_LIMIT || code.length <= 200) return { url, truncated };
+    code = code.slice(0, Math.floor(code.length * 0.7)).trimEnd();
+    truncated = true;
+  }
+}
+
+function showRenderFailure(summary, mode) {
+  lastRenderFailure = {
+    summary: String(summary || 'Render failed').trim() || 'Render failed',
+    mode,
+    code: editor.value,
+    at: new Date().toISOString(),
+  };
+  $('#renderFailureMessage').textContent = lastRenderFailure.summary;
+  $('#renderFailure').hidden = false;
+}
+
+function hideRenderFailure() {
+  $('#renderFailure').hidden = true;
+}
+
 async function sendRender(url, body, request, mode) {
   for (let attempt = 0; ; attempt += 1) {
     armRenderBackstop(request, mode);
@@ -1618,7 +1710,7 @@ async function sendRender(url, body, request, mode) {
       signal: request.controller.signal,
       body: JSON.stringify(body),
     });
-    const data = await response.json();
+    const data = await readRenderResponse(response);
     const busy = response.status === 429 && data && data.retryable;
     if (!busy || attempt >= QUEUE_RETRY_LIMIT) return { status: response.status, data };
     const wait = Math.min(Number(response.headers.get('Retry-After')) || data.retryAfterSeconds || 5, 30);
@@ -1656,6 +1748,7 @@ async function render(mode = 'preview') {
   };
   activeRender = request;
   armRenderBackstop(request, mode);
+  hideRenderFailure();
   renderOverlay.hidden = false;
   $('#renderLabel').textContent = mode === 'render' ? 'Rendering final geometry' : 'Compiling preview';
   startRenderElapsed(request, mode);
@@ -1710,7 +1803,10 @@ async function render(mode = 'preview') {
     if (error.name === 'AbortError' && request.timedOut) {
       log(`Render timed out after ${(RENDER_TIMEOUT_MS[mode] ?? RENDER_TIMEOUT_MS.preview) / 1000} s with no response from the server. Simplify the model, reduce $fn, or render fewer objects at once.`, 'error');
       $('#problemCount').textContent = '1';
-      if (activeRender === request) setStatus('Render timed out', 'error');
+      if (activeRender === request) {
+        setStatus('Render timed out', 'error');
+        showRenderFailure(`Timed out after ${(RENDER_TIMEOUT_MS[mode] ?? RENDER_TIMEOUT_MS.preview) / 1000} s with no response from the server.`, mode);
+      }
     } else if (error.name === 'AbortError') {
       // Naming the time it saved is the point of the button: it turns "I gave up" into a
       // measurable win and makes cancelling feel like a tool rather than a retreat.
@@ -1720,7 +1816,10 @@ async function render(mode = 'preview') {
       log(error.message, 'error');
       if (error.console) log(error.console, 'error');
       $('#problemCount').textContent = '1';
-      if (activeRender === request) setStatus('Render failed', 'error');
+      if (activeRender === request) {
+        setStatus('Render failed', 'error');
+        showRenderFailure(error.message, mode);
+      }
     }
     return false;
   } finally {
@@ -1922,6 +2021,38 @@ $('#stopButton').addEventListener('click', () => cancelRender());
 // The same abort as the toolbar's stop icon, but where the user is actually looking during
 // a long render: on the overlay that is covering the viewport.
 $('#overlayCancel').addEventListener('click', () => cancelRender());
+$('#dismissRenderFailure').addEventListener('click', hideRenderFailure);
+$('#reportRenderFailure').addEventListener('click', async () => {
+  if (!lastRenderFailure) return;
+  const { url, truncated } = issueReportUrl(lastRenderFailure);
+  window.open(url, '_blank', 'noopener,noreferrer');
+  // The trimmed body promises the full source is on the clipboard, so put it
+  // there rather than leaving the reporter to notice the second button.
+  if (!truncated) return;
+  try {
+    await navigator.clipboard.writeText(issueReportBody(lastRenderFailure, lastRenderFailure.code, false));
+    log('Source too long for an issue link — the full report was copied to your clipboard. Paste it over the trimmed source in the issue.', 'warning');
+  } catch {
+    log('Source too long for an issue link, so the issue carries a trimmed copy. Use "Copy report" to get the whole thing.', 'warning');
+  }
+});
+$('#copyRenderFailure').addEventListener('click', async (event) => {
+  if (!lastRenderFailure) return;
+  const button = event.currentTarget;
+  const label = $('span', button);
+  try {
+    await navigator.clipboard.writeText(issueReportBody(lastRenderFailure, lastRenderFailure.code, false));
+    label.textContent = 'Copied';
+    button.classList.add('copied');
+    clearTimeout(Number(button.dataset.copyTimer));
+    button.dataset.copyTimer = String(setTimeout(() => {
+      label.textContent = 'Copy report';
+      button.classList.remove('copied');
+    }, 1200));
+  } catch {
+    log('Could not copy the report to the clipboard.', 'warning');
+  }
+});
 $('#saveButton').addEventListener('click', saveScad);
 $('#openButton').addEventListener('click', () => $('#fileInput').click());
 $('#newButton').addEventListener('click', async () => {
@@ -2091,29 +2222,43 @@ function panView(from, dxPixels, dyPixels) {
   meshViewport.draw();
 }
 
+// How far a horizontal swipe turns the model. A trackpad reports a swipe as many
+// small deltas, so this is tuned against the drag sensitivity (.45 deg/px) rather
+// than against a wheel notch.
+const SWIPE_ORBIT_DEGREES_PER_PIXEL = .25;
+
 $('#viewport').addEventListener('wheel', (event) => {
   if (!hasMesh) return;
   event.preventDefault();
-  // Shift + wheel pans: the trackpad answer to a middle mouse button. A plain two-finger
-  // scroll deliberately stays on zoom — the browser reports it as an ordinary wheel event,
-  // so claiming it for pan would take scroll-zoom away from every mouse user to no gain.
+  // Firefox reports wheel deltas in lines, and a page-scroll wheel in pages; panView and
+  // the orbit below are defined in pixels, so a raw delta would move ~16x too slowly there.
+  const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? renderCanvas.clientHeight : 1;
+  // Shift + wheel pans: the trackpad answer to a middle mouse button.
   if (event.shiftKey) {
-    // Firefox reports wheel deltas in lines, and a page-scroll wheel in pages; panView is
-    // defined in pixels, so a raw deltaY would pan ~16x too slowly there.
-    const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? renderCanvas.clientHeight : 1;
     panView([camera[0], camera[1], camera[2]], -event.deltaX * unit, -event.deltaY * unit);
     return;
   }
+  // A horizontal two-finger swipe orbits, and turns the model with the fingers — the same
+  // motion as a sideways drag, so both share one sign. Before any of this, a horizontal
+  // swipe reached the zoom line below with deltaY at 0, which reads as "not greater than
+  // zero" — so a sideways gesture silently zoomed in instead of turning anything.
+  if (Math.abs(event.deltaX) > Math.abs(event.deltaY)) {
+    camera[5] += event.deltaX * unit * SWIPE_ORBIT_DEGREES_PER_PIXEL;
+    meshViewport.draw();
+    return;
+  }
+  if (!event.deltaY) return;
   camera[6] = Math.max(meshViewport.radius * 1.15, Math.min(meshViewport.radius * 30, camera[6] * (event.deltaY > 0 ? 1.1 : .9)));
   meshViewport.draw();
 }, { passive: false });
 
-// Pan uses the bindings CAD users already have in their fingers: the middle mouse button
-// (Fusion 360 and every slicer), a right-button drag (PrusaSlicer, Cura, Bambu Studio) and
-// Shift + left drag for laptops and trackpads with no third button. Orbit keeps the plain
-// left drag, so no single press can ever mean both gestures.
+// Fusion 360's bindings, which is what CAD users already have in their fingers: the middle
+// mouse button pans, Shift + middle orbits. A right-button drag also pans, as it does in
+// PrusaSlicer, Cura and Bambu Studio. Shift + left drag is deliberately not a pan — in
+// Fusion that chord orbits, and a trackpad with no third button pans with Shift + wheel.
+// Orbit keeps the plain left drag, so no single press can ever mean both gestures.
 function isPanGesture(event) {
-  return event.button === 1 || event.button === 2 || (event.button === 0 && event.shiftKey);
+  return (event.button === 1 && !event.shiftKey) || event.button === 2;
 }
 
 renderCanvas.addEventListener('pointerdown', (event) => {
@@ -2121,16 +2266,19 @@ renderCanvas.addEventListener('pointerdown', (event) => {
   // the drag that owns the capture is the one that gets to finish.
   if (orbitStart || panStart) return;
   const pan = isPanGesture(event);
-  if (!pan && event.button !== 0) return;
+  // Middle-button orbit (Shift + middle) is a gesture too; without this the button
+  // would fall through as "not a pan and not the left button" and do nothing.
+  if (!pan && event.button !== 0 && event.button !== 1) return;
   // Capture first. If the pointer is already gone this throws, and a gesture started
   // anyway would latch: no capture means no pointerup here, and the guard above would
   // then refuse every later drag for the life of the page.
   try {
     renderCanvas.setPointerCapture(event.pointerId);
   } catch { return; }
+  // Stops the middle-click autoscroll widget from stealing the drag on Windows, whichever
+  // gesture that button was pressed for.
+  if (pan || event.button === 1) event.preventDefault();
   if (pan) {
-    // Stops the middle-click autoscroll widget from stealing the drag on Windows.
-    event.preventDefault();
     panStart = { x: event.clientX, y: event.clientY, offset: [camera[0], camera[1], camera[2]] };
     renderCanvas.classList.add('panning');
   } else {
@@ -2148,8 +2296,13 @@ renderCanvas.addEventListener('pointermove', (event) => {
   if (!orbitStart) return;
   const dx = event.clientX - orbitStart.x;
   const dy = event.clientY - orbitStart.y;
+  // Both axes turn the model with the hand, as if the cursor had hold of the surface
+  // facing it: drag right and that surface goes right, drag down and it goes down,
+  // rolling the top into view. Azimuth needs the minus because it turns the camera
+  // around the model rather than the model itself — without it the two axes obeyed
+  // opposite conventions and a sideways drag pushed the model away from the cursor.
   camera[3] = Math.max(-89.5, Math.min(89.5, orbitStart.rx + dy * .45));
-  camera[5] = orbitStart.rz + dx * .45;
+  camera[5] = orbitStart.rz - dx * .45;
   meshViewport.draw();
 });
 function endViewportDrag() {

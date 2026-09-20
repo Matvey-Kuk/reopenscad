@@ -1,0 +1,7 @@
+# case_id\tsource\tdefinitions\treference
+coffee-bin-basket\tcoffee-bin.scad\tpart="basket"\tcoffee-bin-basket.stl
+coffee-bin-tray\tcoffee-bin.scad\tpart="tray"\tcoffee-bin-tray.stl
+coffee-bin-lid\tcoffee-bin.scad\tpart="lid"\tcoffee-bin-lid.stl
+louvre-pair\tlouvre-pair.scad\t\tlouvre-pair.stl
+hinge-box-narrow\thinge-box-narrow.scad\t\thinge-box-narrow.stl
+hinge-box-wide\thinge-box-wide.scad\t\thinge-box-wide.stl

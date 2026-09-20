@@ -40,6 +40,32 @@ comparable. Its whole-corpus gates are `#[ignore]`d for cost as well:
 cargo test --manifest-path web/backend/Cargo.toml --test exact_kernel_parity -- --ignored --nocapture
 ```
 
+## `hard_geometry_parity.rs` — the corpus that used to break the kernel
+
+OpenAPPA is a corpus the kernel *passes*, to nine significant figures. That is
+what makes it a poor net: it has no non-planar polygons and no near-tangent
+unions, so "goldens unchanged" stayed green through three separate kernel
+defects that broke real user models.
+
+`hard_geometry_parity.rs` measures the models that did break, against goldens
+the OpenSCAD binary produced from the same sources
+(`tests/fixtures/hard-geometry/`). It was written red and is green; it runs in
+the ordinary suite, unignored and cheap (a few seconds), so a regression is
+noticed rather than looked up:
+
+```sh
+cargo test --manifest-path web/backend/Cargo.toml --release \
+    --test hard_geometry_parity -- --nocapture
+```
+
+Unlike the OpenAPPA strict gate, this one does **not** assert facet identity.
+OpenSCAD's triangulation is not ours and demanding it is what left that gate
+permanently red and therefore switched off. These assertions are on what is
+intrinsic to the solid and survives a different triangulation: watertightness,
+volume, area, component count, and Euler characteristic where the golden is
+itself a manifold surface. `tests/fixtures/hard-geometry/README.md` records
+what each fixture caught and why the numbers are what they are.
+
 `oracle.sh check` is the only test utility that invokes the original OpenSCAD
 binary. It is manual, never called by Cargo or production code, and renders to
 a temporary directory. Fixture replacement additionally requires the explicit

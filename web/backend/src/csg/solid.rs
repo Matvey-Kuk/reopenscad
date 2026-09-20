@@ -1,12 +1,12 @@
 //! `Solid`: a closed polygon soup, and the operations OpenSCAD performs on it.
 //!
-//! # Why faces are merged
+//! # Why faces are merged, and why only once
 //!
 //! A BSP boolean splits polygons by *infinite* planes, so a single flat wall of
 //! the result can come back as dozens of coplanar fragments. Reference exports
 //! from a Nef-polyhedron kernel contain the minimal facet set instead. To get
 //! comparable facet counts (and a comparable Euler characteristic) the kernel
-//! runs a face-merging pass after every boolean:
+//! runs a face-merging pass — [`Solid::sealed`]:
 //!
 //! 1. weld vertices onto a lattice so coincident corners share one index,
 //! 2. group polygons by their oriented plane,
@@ -14,17 +14,38 @@
 //!    group — those are interior edges between two fragments,
 //! 4. chain the surviving directed edges into boundary loops, keeping the
 //!    interior on the left at every branch,
-//! 5. classify loops into outlines and holes by signed area and containment,
+//! 5. drop vertices that are collinear in every face at once, and add back the
+//!    vertices needed where a face's corner lands mid-edge on a face in
+//!    another plane,
+//! 6. classify loops into outlines and holes by signed area and containment,
 //!    and re-triangulate only when a face actually has holes.
 //!
 //! Step 3 is the whole trick: it is exact integer bookkeeping on welded vertex
 //! indices, so it neither invents nor loses geometry.
+//!
+//! The pass runs **once, on the way out**, and deliberately not after every
+//! boolean. Merging is not free of consequence for what comes next: it welds
+//! at a tolerance, it drops collinear vertices, and step 6 re-triangulates.
+//! Each of those can leave the surface a fraction of a micron from closed —
+//! harmless in an export, fatal as *input*, because a BSP decides "inside" by
+//! ray-classification against the other solid's faces and a solid with a
+//! pinhole in it has no reliable inside. Feeding merged solids back in was
+//! measured doing exactly that: a union of two knuckles that touch face to
+//! face returned less volume than either operand alone, and the tablet-box
+//! fixture lost 0.84% of its material and came out with 87 boundary edges.
+//! With the same booleans run on unmerged soup and the pass moved to the
+//! export path, every hard-geometry fixture matches OpenSCAD's volume to seven
+//! significant figures. See `tests/fixtures/hard-geometry/README.md`.
+//!
+//! The polygon count between booleans is higher as a result. That costs less
+//! than the pass it replaces: merging was about a quarter of kernel runtime,
+//! and the OpenAPPA corpus compiles no slower than it did.
 
 
 use super::bsp;
 use super::mesh::{
     dedup_ring, Bounds, FastMap, IndexedMesh, Matrix4, Plane, Polygon, Vec3, VertexWelder, EPSILON,
-    PLANE_ANGLE_EPSILON, PLANE_OFFSET_EPSILON,
+    PLANE_ANGLE_EPSILON, PLANE_OFFSET_EPSILON, WELD_EPSILON,
 };
 use super::poly2d::{triangulate_with_holes, Point2};
 use super::prof;
@@ -145,7 +166,6 @@ impl Solid {
         Self {
             polygons: prof::scope("bool:union", || bsp::union(self.polygons, other.polygons)),
         }
-        .simplified()
     }
 
     /// [`Self::difference`] for operands that are about to be dropped.
@@ -163,7 +183,6 @@ impl Solid {
                 bsp::difference(self.polygons, other.polygons)
             }),
         }
-        .simplified()
     }
 
     /// [`Self::intersection`] for operands that are about to be dropped.
@@ -181,11 +200,10 @@ impl Solid {
                 bsp::intersection(self.polygons, other.polygons)
             }),
         }
-        .simplified()
     }
 
     /// Fan triangulation of every face; correct for convex and star-shaped
-    /// faces, which is what the kernel produces after [`Self::simplified`].
+    /// faces, which is what the kernel produces after [`Self::sealed`].
     pub fn to_indexed_mesh(&self) -> IndexedMesh {
         let mut welder = VertexWelder::default();
         let mut triangles = Vec::new();
@@ -201,10 +219,6 @@ impl Solid {
             // Faces reaching here are convex (the merging pass triangulates
             // anything that is not), so a fan is a valid triangulation — as
             // long as it starts at a vertex where the boundary actually turns.
-            // Seam vertices inserted by the T-junction repair are collinear,
-            // and fanning from one of those would emit a zero-area triangle
-            // whose edges are then dropped, re-opening the seam it just
-            // closed.
             //
             // Which diagonal a fan picks for a quad is visible in the exported
             // facet set, and reference exports use a different one for roughly
@@ -216,16 +230,40 @@ impl Solid {
             // volume, and manifoldness are identical either way.
             let origin = corner_index(&polygon.vertices);
             let count = indices.len();
-            let spans: Vec<[u32; 3]> = (1..count - 1)
+            let spans: Vec<[usize; 3]> = (1..count - 1)
                 .map(|index| {
                     [
-                        indices[origin],
-                        indices[(origin + index) % count],
-                        indices[(origin + index + 1) % count],
+                        origin,
+                        (origin + index) % count,
+                        (origin + index + 1) % count,
                     ]
                 })
                 .collect();
-            for triangle in spans {
+            // A fan is only a triangulation if none of its spans is flat,
+            // and starting at a turning vertex is not enough to guarantee
+            // that: a run of collinear vertices *beginning* at the origin
+            // leaves the first spans flat however the origin was chosen, and
+            // a face can have such a run at each end. Those vertices are the
+            // seams the T-junction repair just added, so a flat span is the
+            // one carrying the two short edges along a seam. `drop_zero_area_
+            // triangles` deletes it a few lines below — by the same test, on
+            // purpose — and that hands the exporter one long edge where the
+            // neighbouring face has two short ones, which is a hole.
+            //
+            // Ear clipping is conforming where the fan is not: it can only
+            // clip at a turning corner, so a flat vertex survives to the end.
+            // It is the fallback rather than the rule because it is O(n^2) and
+            // the overwhelming majority of faces have no flat vertex at all.
+            let flat = spans.iter().any(|span| {
+                let [a, b, c] = span.map(|index| polygon.vertices[index]);
+                b.sub(a).cross(c.sub(a)).length() <= 0.0
+            });
+            if flat {
+                triangles.extend(triangulate_ring(&polygon.vertices, polygon.plane, &indices));
+                continue;
+            }
+            for span in spans {
+                let triangle = span.map(|index| indices[index]);
                 if triangle[0] == triangle[1]
                     || triangle[1] == triangle[2]
                     || triangle[0] == triangle[2]
@@ -243,9 +281,14 @@ impl Solid {
         mesh
     }
 
-    /// Merges coplanar fragments back into whole faces. See the module docs.
+    /// Merges coplanar fragments back into whole faces, *without* the
+    /// cross-plane T-junction repair. See the module docs.
     ///
-    /// Used between booleans, where the next BSP re-splits everything anyway.
+    /// Only correct where the operand is known convex and the repair therefore
+    /// has nothing to do — `hull()`, which is assembled by clipping a box and
+    /// needs its clip fragments folded back together. Everything else wants
+    /// [`Self::sealed`]; a merge that skips the repair can leave a seam open,
+    /// and that is not a difference an exporter or a later boolean forgives.
     pub fn simplified(&self) -> Self {
         self.merge_faces(false)
     }
@@ -253,15 +296,10 @@ impl Solid {
     /// [`Self::simplified`] plus the cross-plane T-junction repair.
     ///
     /// Closes seams that survive the merge because a vertex is a genuine
-    /// corner of one face and sits mid-edge on a neighbouring one.
-    ///
-    /// This is **not** on the export path yet. Measured against the OpenSCAD
-    /// goldens it is a wash: it removes real boundary edges (551 -> 182 on the
-    /// hardest case) but the extra collinear vertices push faces that were
-    /// convex into the ear-clipping path, where they cost more than they save.
-    /// It is kept, and tested, because the seam repair itself is correct; what
-    /// it needs before it can be switched on is a triangulator that tolerates
-    /// collinear boundary vertices.
+    /// corner of one face and sits mid-edge on a neighbouring one. This is the
+    /// export path: [`crate::engine::exact::solid_to_mesh`] calls it, and the
+    /// booleans no longer merge at all, so it is the only place a solid is
+    /// merged.
     pub fn sealed(&self) -> Self {
         self.merge_faces(true)
     }
@@ -447,6 +485,44 @@ pub fn intersection_all(solids: Vec<Solid>) -> Solid {
         level = next;
     }
     level.pop().unwrap_or_default()
+}
+
+/// Triangulates one face's ring, keeping every vertex it was given.
+///
+/// Used where a fan would be flat. Projects onto the face plane, ear-clips,
+/// and maps each corner back to the welded index it came from — by projected
+/// coordinate, which is exact because the clipper only ever re-emits points it
+/// was handed.
+fn triangulate_ring(points: &[Vec3], plane: Plane, indices: &[u32]) -> Vec<[u32; 3]> {
+    let (basis_u, basis_v) = plane_basis(plane);
+    let projected: Vec<Point2> = points
+        .iter()
+        .map(|point| [point.dot(basis_u), point.dot(basis_v)])
+        .collect();
+    let mut lookup: FastMap<[u64; 2], u32> = FastMap::default();
+    for (point, index) in projected.iter().zip(indices.iter()) {
+        lookup.insert([point[0].to_bits(), point[1].to_bits()], *index);
+    }
+    let mut output = Vec::new();
+    for triangle in triangulate_with_holes(&projected, &[]) {
+        let mut resolved = [0u32; 3];
+        let mut complete = true;
+        for (slot, corner) in resolved.iter_mut().zip(triangle.iter()) {
+            match lookup.get(&[corner[0].to_bits(), corner[1].to_bits()]) {
+                Some(index) => *slot = *index,
+                None => complete = false,
+            }
+        }
+        if !complete
+            || resolved[0] == resolved[1]
+            || resolved[1] == resolved[2]
+            || resolved[0] == resolved[2]
+        {
+            continue;
+        }
+        output.push(resolved);
+    }
+    output
 }
 
 /// The first vertex at which the ring genuinely turns, falling back to 0.
@@ -933,7 +1009,16 @@ fn insert_t_junction_vertices(vertices: &[Vec3], groups: &mut [(Plane, Vec<Vec<u
     };
     let size = bounds.size();
     let scale = size.x.max(size.y).max(size.z).max(1.0);
-    let tolerance = scale * 1.0e-10;
+    // At least the welder's tolerance. The welder has already declared that
+    // two points this close are one point, so a corner this close to an edge
+    // is *on* that edge — refusing to seam it there would contradict the
+    // vertex identity the rest of the pass is built on. It matters: the
+    // corners that need seaming are the ones a shallow crossing produced, and
+    // a shallow crossing is exactly the ill-conditioned intersection whose
+    // answer lands a micron out. At `scale * 1e-10` a 200 mm model seamed only
+    // within 20 nm and left 30 edges open along the blades of the louvred
+    // basket fixture.
+    let tolerance = (scale * 1.0e-10).max(WELD_EPSILON);
     let cell = (scale / 64.0).max(tolerance * 16.0);
 
     let key = |point: Vec3| -> [i64; 3] {
@@ -1017,6 +1102,19 @@ fn emit_faces(plane: Plane, loops: &[Vec<u32>], vertices: &[Vec3], output: &mut 
         let point = vertices[index as usize];
         [point.dot(basis_u), point.dot(basis_v)]
     };
+    // The way back to 3D from a triangulated face is a lookup, not an inverse
+    // projection. Neither triangulator invents a point — every vertex they
+    // emit is one they were given — so the original 3D vertex is always
+    // available, and using it is the only way to keep the face's corners
+    // exactly where the rest of the solid still believes they are.
+    //
+    // Rebuilding a corner as `u*basis_u + v*basis_v + offset*normal` instead
+    // reconstructs it through a basis this function invented, and lands it a
+    // few parts in 1e8 from where it started. That is above the welder's
+    // tolerance, so the neighbouring face — which was not triangulated, and
+    // kept the original — stops sharing the edge: the pass that exists to
+    // tidy the surface up tears it instead.
+    let mut exact: FastMap<[u64; 2], Vec3> = FastMap::default();
 
     // Step 5: classify loops and emit faces.
     let mut outlines: Vec<(Vec<Point2>, f64)> = Vec::new();
@@ -1024,6 +1122,12 @@ fn emit_faces(plane: Plane, loops: &[Vec<u32>], vertices: &[Vec3], output: &mut 
     let mut outline_rings: Vec<Vec<u32>> = Vec::new();
     for chain in loops.iter().cloned() {
         let projected: Vec<Point2> = chain.iter().map(|index| project(*index)).collect();
+        for (point, index) in projected.iter().zip(chain.iter()) {
+            exact.insert(
+                [point[0].to_bits(), point[1].to_bits()],
+                vertices[*index as usize],
+            );
+        }
         let area = super::poly2d::signed_area(&projected);
         if area > 0.0 {
             outlines.push((projected, area));
@@ -1054,10 +1158,16 @@ fn emit_faces(plane: Plane, loops: &[Vec<u32>], vertices: &[Vec3], output: &mut 
     }
 
     let unproject = |point: Point2| -> Vec3 {
-        basis_u
-            .mul(point[0])
-            .add(basis_v.mul(point[1]))
-            .add(plane.normal.mul(plane.offset))
+        match exact.get(&[point[0].to_bits(), point[1].to_bits()]) {
+            Some(vertex) => *vertex,
+            // Unreachable while the triangulators stay Steiner-point-free; kept
+            // so that a future one which is not silently degrades to the old
+            // approximation rather than dropping the vertex.
+            None => basis_u
+                .mul(point[0])
+                .add(basis_v.mul(point[1]))
+                .add(plane.normal.mul(plane.offset)),
+        }
     };
 
     for (index, (outline, _)) in outlines.iter().enumerate() {
@@ -1086,19 +1196,46 @@ fn emit_faces(plane: Plane, loops: &[Vec<u32>], vertices: &[Vec3], output: &mut 
             // that edge, and dropping it here is precisely what opens a seam
             // there. The triangulator keeps them now, so there is nothing left
             // to trade away.
-            for triangle in triangulate_with_holes(outline, &[]) {
-                if let Some(polygon) = Polygon::new(triangle.iter().map(|p| unproject(*p)).collect())
-                {
-                    output.push(polygon);
-                }
-            }
+            emit_triangles(
+                &triangulate_with_holes(outline, &[]),
+                plane,
+                &unproject,
+                output,
+            );
         } else {
-            for triangle in triangulate_with_holes(outline, &assigned[index]) {
-                if let Some(polygon) = Polygon::new(triangle.iter().map(|p| unproject(*p)).collect())
-                {
-                    output.push(polygon);
-                }
-            }
+            emit_triangles(
+                &triangulate_with_holes(outline, &assigned[index]),
+                plane,
+                &unproject,
+                output,
+            );
+        }
+    }
+}
+
+/// Emits a triangulation as polygons carrying the *group's* plane.
+///
+/// Deriving each triangle's own plane from its three points — which is what
+/// `Polygon::new` does — is wrong here. A triangulated merged face is mostly
+/// slivers, and a sliver's Newell normal is dominated by the noise in its two
+/// near-parallel edges: it can come out tilted off the face, or reversed, and
+/// a reversed face plane is a hole as far as the next boolean is concerned.
+/// The face's plane is already known exactly and every triangle lies in it by
+/// construction, so it is passed down instead of re-derived. The winding
+/// agrees: the triangulators return counter-clockwise triangles in the
+/// `(u, v)` basis, and `plane_basis` builds that basis right-handed about the
+/// normal.
+fn emit_triangles(
+    triangles: &[[Point2; 3]],
+    plane: Plane,
+    unproject: &impl Fn(Point2) -> Vec3,
+    output: &mut Vec<Polygon>,
+) {
+    for triangle in triangles {
+        let points: Vec<Vec3> = triangle.iter().map(|point| unproject(*point)).collect();
+        let polygon = Polygon::with_plane(points, plane);
+        if polygon.area() > 0.0 {
+            output.push(polygon);
         }
     }
 }
@@ -1344,6 +1481,45 @@ mod tests {
     use super::*;
     use crate::csg::{self, primitives};
 
+    /// Two solids that meet face to face are a union the kernel has to get
+    /// right — a printed-in-place hinge is nothing but that. It used to
+    /// return *less* volume than one operand on its own, because the operands
+    /// had been through the merge pass and came back with a pinhole in them,
+    /// and a BSP cannot classify "inside" against a surface with a hole in it.
+    /// The booleans no longer merge, which is what this pins.
+    #[test]
+    fn a_union_of_two_solids_that_touch_face_to_face_keeps_both() {
+        let left = primitives::cube(Vec3::new(10.0, 10.0, 10.0), false);
+        let right = primitives::cube(Vec3::new(10.0, 10.0, 10.0), false)
+            .transformed(Matrix4::translation(Vec3::new(10.0, 0.0, 0.0)));
+        let mesh = left.union(&right).sealed().to_indexed_mesh();
+        assert!(mesh.is_manifold(), "{}", mesh.statistics());
+        assert!(
+            (mesh.volume() - 2000.0).abs() < 1.0e-9,
+            "touching cubes should union to both, got {}",
+            mesh.volume()
+        );
+    }
+
+    /// A boolean must hand back raw fragments. Merging between booleans is
+    /// what fed the next one a surface it could not classify against; the
+    /// merge belongs on the export path and nowhere else.
+    #[test]
+    fn a_boolean_does_not_merge_its_own_result() {
+        let left = primitives::cube(Vec3::new(10.0, 10.0, 10.0), false);
+        let right = primitives::cube(Vec3::new(10.0, 10.0, 10.0), false)
+            .transformed(Matrix4::translation(Vec3::new(0.0, 0.0, 10.0)));
+        let raw = left.union(&right);
+        let merged = raw.sealed();
+        assert!(
+            raw.polygons.len() > merged.polygons.len(),
+            "the boolean returned {} faces and the merge {} — the merge has \
+             moved back into the boolean",
+            raw.polygons.len(),
+            merged.polygons.len()
+        );
+    }
+
     #[test]
     fn simplifying_a_split_face_restores_one_quad() {
         // Two coplanar halves of a 2x1 rectangle share an interior edge.
@@ -1410,7 +1586,9 @@ mod tests {
         let a = primitives::cube(Vec3::new(10.0, 10.0, 10.0), false);
         let b = primitives::cube(Vec3::new(10.0, 10.0, 10.0), false)
             .transformed(Matrix4::translation(Vec3::new(0.0, 0.0, 10.0)));
-        let solid = a.union(&b);
+        // `sealed` because that is the export path: booleans hand back raw
+        // fragments now, and the shared wall is merged away on the way out.
+        let solid = a.union(&b).sealed();
         let mesh = solid.to_indexed_mesh();
         assert!(mesh.is_manifold(), "{}", mesh.statistics());
         assert_eq!(mesh.triangles.len(), 12, "stacked cubes should be one box");
@@ -1423,7 +1601,7 @@ mod tests {
         let block = primitives::cube(Vec3::new(20.0, 20.0, 5.0), false);
         let tool = primitives::cube(Vec3::new(4.0, 4.0, 20.0), false)
             .transformed(Matrix4::translation(Vec3::new(8.0, 8.0, -5.0)));
-        let solid = block.difference(&tool);
+        let solid = block.difference(&tool).sealed();
         let mesh = solid.to_indexed_mesh();
         assert!(mesh.is_manifold(), "{}", mesh.statistics());
         assert!(

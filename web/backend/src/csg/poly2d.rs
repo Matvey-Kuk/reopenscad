@@ -742,8 +742,26 @@ fn triangulate_with_holes_inner(outer: &[Point2], holes: &[Vec<Point2>]) -> Vec<
             .then(a.3.total_cmp(&b.3))
     });
 
+    // A ring without holes gets the same treatment as one with them: clip,
+    // then *check*, then sweep if the check fails. Skipping the check here on
+    // the grounds that a hole is what makes a ring hard was wrong — a merged
+    // face of a louvred wall is a sliver-ridden 20-gon with no holes at all,
+    // the clipper stalls on it, and what comes back is a cap with a slit in it.
     if prepared.is_empty() {
-        return ear_clip(&ring);
+        let clipped = ear_clip(&ring);
+        if triangulation_conforms(&clipped, &ring, &[]) {
+            return clipped;
+        }
+        if let Some(pieces) = monotone_pieces(&ring, &[]) {
+            let mut swept: Vec<[Point2; 3]> = Vec::new();
+            for piece in &pieces {
+                swept.extend(ear_clip(piece));
+            }
+            if triangulation_conforms(&swept, &ring, &[]) {
+                return swept;
+            }
+        }
+        return clipped;
     }
 
     // With holes there are two constructions, and neither is right everywhere,
@@ -1359,6 +1377,13 @@ fn ear_clip(polygon: &[Point2]) -> Vec<[Point2; 3]> {
     let mut triangles: Vec<[Point2; 3]> = Vec::new();
     let maximum_iterations = vertices.len() * 3 + 16;
     let mut iterations = 0usize;
+    // Flat vertices the loop below drops to keep making progress, as
+    // `[before, dropped, after]`. Dropping one is harmless for *area* and
+    // fatal for *conformity*: such a vertex is on this ring because a face in
+    // another plane has a corner on this edge, so losing it leaves that face's
+    // two short edges facing this face's one long one — a slit. They go back
+    // at the end.
+    let mut dropped: Vec<[Point2; 3]> = Vec::new();
 
     while vertices.len() > 3 {
         iterations += 1;
@@ -1419,10 +1444,13 @@ fn ear_clip(polygon: &[Point2]) -> Vec<[Point2; 3]> {
             let a = vertices[before];
             let b = vertices[index];
             let c = vertices[after];
-            if same_point(a, b)
-                || same_point(b, c)
-                || cross(sub(b, a), sub(c, b)).abs() <= AREA_EPSILON
-            {
+            if same_point(a, b) || same_point(b, c) {
+                vertices.remove(index);
+                removed = true;
+                break;
+            }
+            if cross(sub(b, a), sub(c, b)).abs() <= AREA_EPSILON {
+                dropped.push([a, b, c]);
                 vertices.remove(index);
                 removed = true;
                 break;
@@ -1446,7 +1474,39 @@ fn ear_clip(polygon: &[Point2]) -> Vec<[Point2; 3]> {
             );
         }
     }
+    restore_dropped_vertices(&mut triangles, &dropped);
     triangles
+}
+
+/// Puts back the flat vertices [`ear_clip`] dropped, without moving anything.
+///
+/// Dropping `b` from `a, b, c` left the edge `a -> c` in the triangulation,
+/// used exactly once, because it was a boundary edge of the ring as it stood
+/// at that moment. Splitting the triangle carrying it at `b` re-creates
+/// `a -> b` and `b -> c`, covers the same area with the same winding, and is
+/// not itself flat — the apex is off the line through `a` and `c`.
+///
+/// Reverse order matters: a vertex dropped later can sit on an edge that an
+/// earlier drop created, so the later ones have to be back first.
+fn restore_dropped_vertices(triangles: &mut Vec<[Point2; 3]>, dropped: &[[Point2; 3]]) {
+    let carries = |triangle: &[Point2; 3], from: Point2, to: Point2| -> Option<usize> {
+        (0..3).find(|corner| {
+            same_point(triangle[*corner], from) && same_point(triangle[(corner + 1) % 3], to)
+        })
+    };
+    for [a, b, c] in dropped.iter().rev() {
+        let Some(position) = triangles
+            .iter()
+            .position(|triangle| carries(triangle, *a, *c).is_some())
+        else {
+            continue;
+        };
+        let triangle = triangles[position];
+        let corner = carries(&triangle, *a, *c).expect("the edge was just located");
+        let apex = triangle[(corner + 2) % 3];
+        triangles[position] = [*a, *b, apex];
+        triangles.push([*b, *c, apex]);
+    }
 }
 
 /// Emits a triangle, dropping degenerate ones and flipping to CCW.
@@ -1707,6 +1767,56 @@ mod tests {
         // Outer grows to 22x22, hole shrinks to 2x2.
         assert!((grown.area() - (484.0 - 4.0)).abs() < 1.0e-9, "got {}", grown.area());
         assert!(signed_area(&grown.contours[1]) < 0.0, "hole stays CW");
+    }
+
+    /// A ring with a vertex exactly mid-edge — the shape the T-junction repair
+    /// leaves behind — must come back triangulated *through* that vertex. The
+    /// clipper is allowed to drop it while it works; it is not allowed to hand
+    /// it back missing, because the face on the other side of that edge has a
+    /// corner there and the two would stop meeting.
+    #[test]
+    fn a_vertex_sitting_mid_edge_survives_triangulation() {
+        let ring = vec![
+            [0.0, 0.0],
+            [5.0, 0.0], // collinear: the seam vertex
+            [10.0, 0.0],
+            [10.0, 10.0],
+            [0.0, 10.0],
+        ];
+        let triangles = triangulate_with_holes(&ring, &[]);
+        assert!((total_area(&triangles) - 100.0).abs() < 1.0e-9);
+        assert!(
+            triangulation_conforms(&triangles, &ring, &[]),
+            "the triangulation left an edge the ring does not have"
+        );
+        assert!(
+            triangles
+                .iter()
+                .any(|triangle| triangle.iter().any(|point| same_point(*point, [5.0, 0.0]))),
+            "the mid-edge vertex was dropped"
+        );
+    }
+
+    /// The restorer has to survive a run of them, and it has to put them back
+    /// in the right order — a later drop can sit on an edge an earlier one
+    /// created.
+    #[test]
+    fn several_mid_edge_vertices_on_one_side_all_survive() {
+        let seam: Vec<Point2> = (1..5).map(|step| [step as f64 * 2.0, 0.0]).collect();
+        let mut ring = vec![[0.0, 0.0]];
+        ring.extend(seam.iter().copied());
+        ring.extend([[10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]);
+        let triangles = triangulate_with_holes(&ring, &[]);
+        assert!((total_area(&triangles) - 100.0).abs() < 1.0e-9);
+        assert!(triangulation_conforms(&triangles, &ring, &[]));
+        for point in &seam {
+            assert!(
+                triangles
+                    .iter()
+                    .any(|triangle| triangle.iter().any(|corner| same_point(*corner, *point))),
+                "mid-edge vertex {point:?} was dropped"
+            );
+        }
     }
 
     #[test]
