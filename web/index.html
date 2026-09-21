@@ -29,6 +29,7 @@
           <span>ReOpenSCAD</span>
           <a class="brand-credit" href="https://github.com/openscad/openscad/" target="_blank" rel="noreferrer noopener">Inspired by OpenSCAD</a>
           <a class="brand-credit" href="https://www.linkedin.com/in/motakuk/" target="_blank" rel="noreferrer noopener">Vibecoded by Matvey Kukuy</a>
+          <a class="brand-credit" href="https://github.com/Matvey-Kuk/reopenscad" target="_blank" rel="noreferrer noopener">GitHub</a>
           <a class="brand-credit" href="https://github.com/Matvey-Kuk/reopenscad/issues" target="_blank" rel="noreferrer noopener">Report issues</a>
         </div>
         <div class="workspace-identity">
@@ -63,7 +64,13 @@
         </div>
         <div class="toolbar-spacer"></div>
         <button class="agent-button" id="mcpButton" data-icon="agent" title="Connect an AI agent over MCP" aria-haspopup="dialog"><span>Connect AI</span><kbd>MCP</kbd></button>
+        <button class="tool-button" id="shareButton" data-icon="share" title="Share this workspace" aria-label="Share this workspace" aria-haspopup="dialog"></button>
         <button class="export-button" id="exportButton" data-icon="export"><span>Export</span><kbd>STL</kbd></button>
+      </div>
+
+      <div class="readonly-banner" id="readonlyBanner" hidden>
+        <span><b>Read-only view.</b> You are looking at a shared copy; edits are not saved.</span>
+        <button type="button" id="forkWorkspace">Copy to a new workspace to edit</button>
       </div>
 
       <main class="workspace" id="workspace">
@@ -103,13 +110,8 @@
             <pre class="highlight" id="highlight" aria-hidden="true"></pre>
             <textarea id="codeEditor" aria-label="OpenSCAD source code" spellcheck="false" autocomplete="off"></textarea>
             <div class="kickstart" id="kickstart" hidden>
-              <div class="kickstart-intro">
-                <span class="eyebrow">Empty workspace</span>
-                <h2>Start with a shape.</h2>
-                <p>Pick a kick-start model to drop into the editor, or start from nothing.</p>
-                <button type="button" class="kickstart-blank" id="kickstartBlank">Start with a blank editor</button>
-              </div>
-              <div class="kickstart-grid" id="kickstartGrid" role="list"></div>
+              <div class="kickstart-catalogue" id="kickstartRecents"></div>
+              <div class="kickstart-catalogue" id="kickstartGrid"></div>
             </div>
           </div>
         </section>
@@ -137,7 +139,7 @@
             <div class="empty-state" id="emptyState">
               <img src="/legacy-assets/icons/reopenscad.svg" alt="" />
               <h1>Shape the idea.</h1>
-              <p>Press <kbd>F5</kbd> to preview your OpenSCAD model.</p>
+              <p id="emptyHint">Press <kbd>F5</kbd> to preview your OpenSCAD model.</p>
               <button id="firstPreview">Preview model</button>
             </div>
             <canvas id="renderCanvas" class="render-canvas" aria-label="Rendered OpenSCAD model"></canvas>
@@ -174,7 +176,7 @@
                  zoom cluster on the right at the pane's usual width. -->
             <div class="view-hint">
               <div><span>DRAG / SHIFT+MIDDLE</span> orbit <span>SWIPE ←→</span> turn</div>
-              <div><span>MIDDLE / RIGHT / SHIFT+SCROLL</span> pan <span>SCROLL</span> zoom</div>
+              <div><span>ALT+DRAG / MIDDLE / RIGHT</span> pan <span>SCROLL</span> zoom</div>
             </div>
             <div class="viewport-fab">
               <button id="zoomIn" aria-label="Zoom in">+</button>
@@ -207,6 +209,20 @@
       </footer>
     </div>
 
+    <div class="share-popover" id="sharePopover" hidden role="dialog" aria-label="Share this workspace">
+      <b>Share</b>
+      <div class="share-link">
+        <label for="shareEditLink">Anyone with this link can edit</label>
+        <div><input id="shareEditLink" readonly spellcheck="false" /><button type="button" data-copy="shareEditLink">Copy</button></div>
+        <small>The same link you are on. It is the only key this workspace has.</small>
+      </div>
+      <div class="share-link">
+        <label for="shareViewLink">Anyone with this link can view</label>
+        <div><input id="shareViewLink" readonly spellcheck="false" placeholder="Creating…" /><button type="button" data-copy="shareViewLink">Copy</button></div>
+
+      </div>
+    </div>
+
     <div class="export-popover" id="exportPopover" hidden>
       <b>Export model</b>
       <button data-format="stl"><span>STL</span><small>Mesh for fabrication</small></button>
@@ -214,6 +230,8 @@
       <button data-format="off"><span>OFF</span><small>Geometry exchange</small></button>
       <button data-format="obj"><span>OBJ</span><small>Indexed mesh exchange</small></button>
       <button data-format="3mf"><span>3MF</span><small>Slicer package with units</small></button>
+      <button data-format="step"><span>STEP</span><small>Solid B-rep for CAD</small></button>
+      <button data-format="glb"><span>GLB</span><small>glTF for web and AR</small></button>
       <button id="exportPng"><span>PNG</span><small>Current viewport image</small></button>
     </div>
 
@@ -278,7 +296,6 @@
         <div class="mcp-body disclaimer-body" id="disclaimerBody">
           <p>ReOpenSCAD is a hobby project, published for demonstration purposes. It is provided <b>as is</b>, with <b>no warranty</b> and <b>no liability</b> of any kind.</p>
           <p><b>Workspaces are not private.</b> There is no login — the URL is the only key, so anyone holding the link can read and change your work.</p>
-          <p><b>This is not storage you can rely on.</b> Workspaces are deleted automatically — after two weeks without an edit, and sooner than that whenever the server is holding more than it keeps. Opening or rendering a workspace does not keep it alive; only editing does. Keep your own copy of anything that matters.</p>
           <p>Exported geometry is not checked for you. Verify it before you print or manufacture from it.</p>
           <p class="disclaimer-affiliation" id="disclaimerAffiliation"></p>
         </div>

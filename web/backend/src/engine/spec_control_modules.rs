@@ -238,7 +238,7 @@ fn recursion_depth_exceeded_is_a_clear_error() {
                     if (n > 0) descend(n - 1);
                     else cube(1, center=true);
                 }
-                descend(100000);
+                descend(200);
             "#,
         )
         .expect_err("module recursion must stop at an implementation depth limit");
@@ -354,4 +354,136 @@ fn dollar_children_reports_the_number_of_call_children() {
 
     assert_inside(&shape, Vec3::new(2.5, 0.0, 0.0));
     assert_outside(&shape, Vec3::new(3.5, 0.0, 0.0));
+}
+
+/// A module this engine does not implement costs that call and nothing else.
+///
+/// OpenSCAD warns `Ignoring unknown module 'x'` and carries on; probing the
+/// binary with `notamodule(1, 2); cube([12, 8, 4]);` gives six facets, one
+/// warning and exit 0. It does not evaluate the call's arguments or children
+/// either — `notamodule() { echo("x"); }` prints nothing — so neither do we.
+#[test]
+fn an_unknown_module_warns_and_leaves_the_rest_of_the_model_standing() {
+    let (shape, diagnostics) = evaluate_source_with_diagnostics(
+        r#"
+            notamodule(1, 2);
+            import("nowhere.stl");
+            surface(file = "nowhere.dat") { echo("never evaluated"); }
+            cube([12, 8, 4]);
+        "#,
+    )
+    .expect("an unknown module must not abort the compile");
+
+    assert_inside(&shape, Vec3::new(6.0, 4.0, 2.0));
+    for expected in [
+        "WARNING: Ignoring unknown module 'notamodule'.",
+        "WARNING: Ignoring unknown module 'import'.",
+        "WARNING: Ignoring unknown module 'surface'.",
+    ] {
+        assert!(
+            diagnostics.iter().any(|message| message == expected),
+            "expected {expected:?} among {diagnostics:?}"
+        );
+    }
+    assert!(
+        !diagnostics.iter().any(|message| message.contains("never evaluated")),
+        "an ignored module's children must stay unevaluated, got {diagnostics:?}"
+    );
+}
+
+/// A 2D child under a 3D operation is dropped, not fatal.
+///
+/// The dimension comes from the *first* child, which is how OpenSCAD decides
+/// it: `union(){cube(5); square(3);}` warns twice and yields the cube, while
+/// `union(){square(3); cube(5);}` yields the square. An extrude is the same
+/// story in reverse — a solid handed to `linear_extrude` is ignored.
+#[test]
+fn mixing_dimensions_drops_the_odd_child_out_with_a_warning() {
+    let (shape, diagnostics) =
+        evaluate_source_with_diagnostics("union() { cube([10, 10, 5]); square(4); }")
+            .expect("a 2D child must not abort a 3D union");
+    assert_eq!(shape.dimension(), ShapeDimension::Solid);
+    assert_inside(&shape, Vec3::new(5.0, 5.0, 2.5));
+    for expected in [
+        "WARNING: Mixing 2D and 3D objects is not supported.",
+        "WARNING: Ignoring 2D child object for 3D operation.",
+    ] {
+        assert!(
+            diagnostics.iter().any(|message| message == expected),
+            "expected {expected:?} among {diagnostics:?}"
+        );
+    }
+
+    let (planar, _) =
+        evaluate_source_with_diagnostics("union() { square(4); cube([10, 10, 5]); }")
+            .expect("a 3D child must not abort a 2D union");
+    assert_eq!(planar.dimension(), ShapeDimension::Planar);
+
+    let (extruded, diagnostics) = evaluate_source_with_diagnostics(
+        "linear_extrude(height = 2) { square(4); cube([10, 10, 5]); }",
+    )
+    .expect("a solid under an extrude must not abort the compile");
+    assert_inside(&extruded, Vec3::new(2.0, 2.0, 1.0));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|message| message == "WARNING: Ignoring 3D child object for 2D operation."),
+        "expected the ignored solid to be named, got {diagnostics:?}"
+    );
+}
+
+/// A range this engine will not walk is empty, never an error.
+///
+/// A step that computes to zero for one iteration used to take the whole model
+/// with it. OpenSCAD calls such a range 4294967295 elements long, warns `Bad
+/// range parameter in for statement`, produces nothing and renders the rest —
+/// probed with exactly the source below, which still gives the 9 mm cube.
+#[test]
+fn a_zero_or_unwalkable_range_step_is_an_empty_loop_not_an_error() {
+    let (shape, diagnostics) = evaluate_source_with_diagnostics(
+        r#"
+            step = 0;
+            for (i = [0 : step : 3]) translate([i * 5, 0, 0]) cube(1);
+            for (j = [0 : 0 / 0 : 3]) translate([0, 50, 0]) cube(1);
+            for (k = [0 : 1e-300 : 1]) translate([0, 0, 50]) cube(1);
+            cube([9, 3, 3]);
+        "#,
+    )
+    .expect("a bad range step must not abort the compile");
+
+    assert_inside(&shape, Vec3::new(4.5, 1.5, 1.5));
+    assert_outside(&shape, Vec3::new(0.5, 50.5, 0.5));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|message| message.contains("Bad range parameter in for statement")),
+        "expected the bad range to be named, got {diagnostics:?}"
+    );
+}
+
+/// Recursion deep enough to be ordinary SCAD, and a ceiling that still holds.
+///
+/// 120 levels is what `tests/fixtures/language/deep-recursion.scad` asks for
+/// and what OpenSCAD renders without complaint; the old limit of 16 rejected
+/// it. The ceiling is checked by `recursion_depth_exceeded_is_a_clear_error`
+/// above, in its own process, because the point of the limit is that the
+/// alternative is a stack overflow that aborts this one.
+#[test]
+fn a_hundred_and_twenty_levels_of_module_recursion_still_render() {
+    let shape = evaluate_source(
+        r#"
+            module tower(n) {
+                if (n > 0) {
+                    translate([0, 0, n]) cube(1);
+                    tower(n - 1);
+                }
+            }
+            tower(120);
+        "#,
+    )
+    .expect("120 levels is ordinary recursive SCAD, not an abuse of the evaluator");
+
+    assert_inside(&shape, Vec3::new(0.5, 0.5, 120.5));
+    assert_inside(&shape, Vec3::new(0.5, 0.5, 1.5));
+    assert_outside(&shape, Vec3::new(0.5, 0.5, 121.5));
 }

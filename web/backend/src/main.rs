@@ -2,6 +2,7 @@
 #[path = "csg/mod.rs"]
 mod csg;
 mod engine;
+mod gltf;
 /// `Preview::vertices` is read only by this module's own tests.
 #[allow(dead_code)]
 mod mcpapp;
@@ -9,6 +10,7 @@ mod mcpapp;
 /// without it, and only a deployment that sets `DATABASE_URL` needs it.
 #[cfg(feature = "postgres")]
 mod pgstore;
+mod step;
 mod threemf;
 
 use mcpapp::base64_encode;
@@ -109,11 +111,18 @@ const BODY_CHUNK: usize = 16 * 1024;
 
 /// Workspace files kept on disk. Oldest are evicted once the cap is reached.
 const MAX_WORKSPACES: usize = 512;
+/// Ceiling on a stored render thumbnail, as the `data:` URL's own length.
+///
+/// The browser writes a 320-wide JPEG, which lands around 8 KB of base64 for a
+/// typical model and a little over 20 KB for a busy one. 96 KB leaves a wide
+/// margin over that while keeping the workspace document small enough that
+/// loading one is still a single cheap read — and it bounds what an attacker
+/// can park in the store per workspace, which is the reason it is a hard limit
+/// rather than a guideline.
+const MAX_PREVIEW_BYTES: usize = 96 * 1024;
 /// Workspaces held in RAM with their full source. Everything else lives on
 /// disk and is faulted in on demand.
 const MAX_CACHED_WORKSPACES: usize = 64;
-/// Idle lifetime of a workspace file before the sweeper deletes it (14 days).
-const WORKSPACE_TTL_MS: u64 = 14 * 24 * 60 * 60 * 1000;
 
 /// Per-IP request bucket: burst then a sustained refill rate.
 const IP_REQUEST_BURST: f64 = 300.0;
@@ -157,7 +166,7 @@ const MCP_UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 const MCP_STATIC_CACHE_TTL_MS: u64 = 3_600_000;
 /// Shared by legacy `initialize` and modern `server/discover` so the two eras
 /// describe the server identically.
-const MCP_INSTRUCTIONS: &str = "Create and edit single-file SCAD workspaces, then render or export them. Workspaces are TEMPORARY scratch space, not storage: they are deleted after a period without edits, and sooner when the server is at capacity. Reading or rendering a workspace does NOT keep it alive - only editing does. Always keep the authoritative copy of the source in a local .scad file and treat the workspace as a preview surface you can recreate at any time. Workspace URLs are access capabilities: anyone holding the link has full read/write, so do not post them anywhere public. Read ui://reopenscad/workspace/{workspaceId} for an embedded 3D preview app with STL and 3MF downloads.";
+const MCP_INSTRUCTIONS: &str = "Create and edit single-file SCAD workspaces, then render or export them. Workspaces do not expire, but a deployment holds a bounded number of them and evicts the least recently touched when it is full, so keep the authoritative copy of the source in a local .scad file and treat the workspace as a surface you can recreate. Workspace URLs are access capabilities: anyone holding the link has full read/write, so do not post them anywhere public. A workspace can also carry a separate read-only link, minted in the browser under Share; that link cannot be turned back into the editable one, and there is no MCP tool that creates or resolves one. Read ui://reopenscad/workspace/{workspaceId} for an embedded 3D preview app with STL and 3MF downloads.";
 
 #[derive(Clone)]
 struct AppState {
@@ -229,6 +238,28 @@ struct Workspace {
     /// Fabrication clearance used by the intersection checker, in millimetres.
     #[serde(default = "default_tolerance")]
     tolerance: f64,
+    /// A small `data:` URL of the last render, drawn by the browser that made
+    /// it, or empty for a workspace nobody has rendered yet.
+    ///
+    /// Stored rather than regenerated because the only thing that can produce
+    /// it is a WebGL context with the model already on screen — the server
+    /// meshes geometry but has no renderer, and spinning one up to redraw
+    /// thumbnails on demand would be a large amount of machinery for a picture
+    /// the client is holding anyway. It rides in the workspace document, so it
+    /// inherits that document's atomic write and its eviction, and it is never
+    /// included in a `/events` poll: see `workspace_payload`.
+    #[serde(default)]
+    preview: String,
+    /// Capability for the read-only view, or empty until the workspace has
+    /// been shared once.
+    ///
+    /// Deliberately independent of `id` rather than derived from it: the whole
+    /// point of the read-only link is that holding it does not get you the
+    /// editable one, and anything derivable — a hash, a prefix, a
+    /// transformation — is only as strong as the reader's willingness to try.
+    /// The mapping lives on the server and goes one way for everybody else.
+    #[serde(default)]
+    share_token: String,
     #[serde(default)]
     events: Vec<WorkspaceEvent>,
 }
@@ -371,19 +402,17 @@ impl WorkspaceStore {
         Ok(store)
     }
 
-    /// Enforces the TTL and the workspace count cap. `headroom` reserves slots
-    /// for workspaces about to be created.
+    /// Enforces the workspace count cap. `headroom` reserves slots for
+    /// workspaces about to be created.
+    ///
+    /// There is deliberately no age limit. A workspace used to be deleted after
+    /// fourteen idle days, which made the URL a promise the service did not
+    /// keep: the link is the only handle anyone has on their work, it looks
+    /// permanent, and it silently stopped resolving while they were not
+    /// looking. Nothing expires now — a workspace is evicted only when the
+    /// store is full, least-recently-touched first, which is pressure rather
+    /// than a clock.
     fn prune(&self, inner: &mut StoreInner, headroom: usize) {
-        let now = unix_millis();
-        let expired: Vec<String> = inner
-            .index
-            .iter()
-            .filter(|(_, meta)| now.saturating_sub(meta.updated_at) > WORKSPACE_TTL_MS)
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in expired {
-            self.forget(inner, &id);
-        }
         let capacity = MAX_WORKSPACES.saturating_sub(headroom);
         if inner.index.len() <= capacity {
             return;
@@ -402,10 +431,92 @@ impl WorkspaceStore {
 
     /// Drops one workspace from disk and from every in-memory structure.
     fn forget(&self, inner: &mut StoreInner, id: &str) {
+        // The share sidecar goes with the workspace it points at, or eviction
+        // would leave a slowly growing field of files naming nothing.
+        //
+        // Read directly rather than through `load`, which calls *this* on a
+        // document it cannot parse — going the other way round closes a
+        // mutual recursion that ends in a stack overflow. Best-effort by
+        // nature: a document too corrupt to parse has no recoverable token,
+        // and the sidecar it may have owned is already inert.
+        let token = inner
+            .cache
+            .get(id)
+            .map(|workspace| workspace.share_token.clone())
+            .or_else(|| {
+                fs::read(self.root.join(format!("{id}.json")))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Workspace>(&bytes).ok())
+                    .map(|workspace| workspace.share_token)
+            });
+        if let Some(token) = token.filter(|token| !token.is_empty()) {
+            let _ = fs::remove_file(self.share_path(&token));
+        }
         let _ = fs::remove_file(self.root.join(format!("{id}.json")));
         inner.index.remove(id);
         inner.cache.remove(id);
         inner.order.retain(|key| key != id);
+    }
+
+    /// Where a share token's pointer file lives.
+    ///
+    /// A file per token rather than an in-memory map, because `open` reads no
+    /// workspace contents at boot — that is what keeps startup O(count) rather
+    /// than O(bytes) — and a token index would have had to read all of them.
+    /// The `.share` extension keeps these out of the `.json` scan that builds
+    /// the workspace index.
+    fn share_path(&self, token: &str) -> PathBuf {
+        self.root.join(format!("{token}.share"))
+    }
+
+    /// The token for `id`, minting one the first time it is asked for.
+    ///
+    /// Idempotent: sharing a workspace twice hands back the same link, so a
+    /// link already sent to somebody keeps working.
+    fn share_token(&self, id: &str) -> Result<String, UpdateError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| UpdateError::Internal("Workspace store is unavailable.".into()))?;
+        let mut workspace = self
+            .load(&mut inner, id)
+            .map_err(UpdateError::Internal)?
+            .ok_or(UpdateError::NotFound)?;
+        if !workspace.share_token.is_empty() {
+            return Ok(workspace.share_token);
+        }
+        let token = generate_share_token(&self.nonce);
+        // The pointer lands before the workspace does. A sidecar with no
+        // workspace naming it is inert; a workspace naming a sidecar that does
+        // not exist is a link that 404s.
+        fs::write(self.share_path(&token), &workspace.id)
+            .map_err(|error| UpdateError::Internal(error.to_string()))?;
+        workspace.share_token = token.clone();
+        self.persist(&workspace).map_err(UpdateError::Internal)?;
+        Self::cache_put(&mut inner, workspace);
+        Ok(token)
+    }
+
+    /// The workspace a read-only token points at.
+    fn resolve_share(&self, token: &str) -> Result<Option<Workspace>, String> {
+        if !valid_share_token(token) {
+            return Ok(None);
+        }
+        let Ok(id) = fs::read_to_string(self.share_path(token)) else {
+            return Ok(None);
+        };
+        let id = id.trim();
+        if !valid_workspace_id(id) {
+            return Ok(None);
+        }
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "Workspace store is unavailable.".to_string())?;
+        let workspace = self.load(&mut inner, id)?;
+        // A sidecar that still names a workspace whose own token has moved on
+        // is stale, and must not resolve: otherwise revoking would not.
+        Ok(workspace.filter(|workspace| workspace.share_token == token))
     }
 
     /// Records `workspace` in the LRU cache, evicting the coldest entries.
@@ -481,6 +592,8 @@ impl WorkspaceStore {
             }
         };
         let workspace = Workspace {
+            preview: String::new(),
+            share_token: String::new(),
             id: id.clone(),
             name: sanitize_name(name),
             code,
@@ -644,6 +757,29 @@ impl WorkspaceStore {
         Ok(workspace)
     }
 
+    /// Replaces the stored thumbnail. Deliberately not a revision-bearing
+    /// edit: a preview is derived from the source rather than part of it, so
+    /// two tabs racing to upload one should both simply win, and neither
+    /// should make the other's next save conflict.
+    fn set_preview(&self, id: &str, preview: &str) -> Result<(), UpdateError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| UpdateError::Internal("Workspace store is unavailable.".into()))?;
+        let mut workspace = self
+            .load(&mut inner, id)
+            .map_err(UpdateError::Internal)?
+            .ok_or(UpdateError::NotFound)?;
+        workspace.preview = preview.to_string();
+        // `updated_at` is left alone on purpose. It is what eviction orders by,
+        // and a thumbnail upload is the machine talking, not the user: letting
+        // it count as a touch would let a background refresh keep a workspace
+        // alive ahead of one someone is actually editing.
+        self.persist(&workspace).map_err(UpdateError::Internal)?;
+        Self::cache_put(&mut inner, workspace);
+        Ok(())
+    }
+
     fn persist(&self, workspace: &Workspace) -> Result<(), String> {
         let final_path = self.root.join(format!("{}.json", workspace.id));
         let temporary_path = self.root.join(format!(
@@ -787,6 +923,30 @@ impl Store {
             Self::Postgres(store) => store.update_settings(id, plate, tolerance),
         }
     }
+
+    fn set_preview(&self, id: &str, preview: &str) -> Result<(), UpdateError> {
+        match self {
+            Self::Filesystem(store) => store.set_preview(id, preview),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => store.set_preview(id, preview),
+        }
+    }
+
+    fn share_token(&self, id: &str) -> Result<String, UpdateError> {
+        match self {
+            Self::Filesystem(store) => store.share_token(id),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => store.share_token(id),
+        }
+    }
+
+    fn resolve_share(&self, token: &str) -> Result<Option<Workspace>, String> {
+        match self {
+            Self::Filesystem(store) => store.resolve_share(token),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => store.resolve_share(token),
+        }
+    }
 }
 
 /// Picks the backend from the environment.
@@ -848,6 +1008,27 @@ fn normalize_source(source: &str) -> String {
     } else {
         "browser".into()
     }
+}
+
+/// 128 bits of hex. Not the funny-id shape on purpose: a read-only link should
+/// not be mistakable for a workspace link at a glance, in a chat window or in
+/// a bug report.
+fn generate_share_token(nonce: &AtomicU64) -> String {
+    let mut random = [0u8; 16];
+    if fs::File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut random))
+        .is_err()
+    {
+        let seed = nonce.fetch_add(1, Ordering::Relaxed) ^ unix_millis();
+        for (index, byte) in random.iter_mut().enumerate() {
+            *byte = seed.rotate_left(index as u32).to_le_bytes()[index % 8];
+        }
+    }
+    random.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn valid_share_token(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn valid_workspace_id(value: &str) -> bool {
@@ -1029,6 +1210,7 @@ const ROBOTS_TXT: &str = "\
 # cached or indexed. The landing page below is deliberately left open.\n\
 User-agent: *\n\
 Disallow: /workspaces/\n\
+Disallow: /shared/\n\
 Disallow: /api/\n\
 Disallow: /mcp\n\
 ";
@@ -1709,10 +1891,20 @@ fn route_cost(method: &str, path: &str) -> RouteCost {
     if path == "/api/workspaces" && method == "POST" {
         return RouteCost::Evaluator;
     }
+    // Reading a shared workspace is a plain document read, but it is reachable
+    // by anyone holding a link, so it is metered like the other cheap routes
+    // rather than being exempt.
+    if path.starts_with("/api/shared/") {
+        return RouteCost::Cheap;
+    }
     if let Some((_, action)) = workspace_api_route(path) {
         return match (method, action) {
             (_, "events") => RouteCost::Poll,
             (_, "render") | (_, "export") | (_, "intersections") => RouteCost::Evaluator,
+            // A thumbnail upload is a write to the store, and a write is what
+            // the stricter bucket exists to meter. `GET` of one is a plain
+            // read and falls through to `Cheap` with everything else.
+            ("PUT", "preview") => RouteCost::Evaluator,
             ("PATCH", "") | ("PUT", "") | ("POST", "") => RouteCost::Evaluator,
             _ => RouteCost::Cheap,
         };
@@ -2342,6 +2534,12 @@ fn serve_request(
     if let Some((id, action)) = workspace_api_route(&request.path) {
         return handle_workspace_route(stream, state, &request, id, action);
     }
+    if let Some(token) = request.path.strip_prefix("/api/shared/") {
+        return match request.method.as_str() {
+            "GET" => handle_shared_workspace(stream, state, token.trim_end_matches('/')),
+            _ => respond_error(stream, 405, "A read-only workspace cannot be written to."),
+        };
+    }
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/api/health") => handle_health(stream),
         ("POST", "/api/render") => handle_render(stream, state, &request.body),
@@ -2660,6 +2858,9 @@ fn handle_workspace_route(
         },
         ("PATCH", "") => handle_update_workspace(stream, state, request, id),
         ("GET", "code") => handle_query_workspace_code(stream, state, request, id),
+        ("GET", "preview") => handle_get_workspace_preview(stream, state, id),
+        ("POST", "share") => handle_create_share_link(stream, state, id),
+        ("PUT", "preview") => handle_put_workspace_preview(stream, state, request, id),
         ("GET", "events") => handle_workspace_events(stream, state, request, id),
         ("POST", "render") => handle_workspace_render(stream, state, request, id),
         ("GET", "export") | ("POST", "export") => {
@@ -2762,6 +2963,152 @@ fn handle_query_workspace_code(
         Ok(payload) => respond_value(stream, 200, &payload),
         Err(error) => respond_error(stream, 400, &error),
     }
+}
+
+/// Mints (or returns) the read-only link for a workspace.
+///
+/// Idempotent, so sharing twice hands back the same link and one already sent
+/// to somebody keeps working.
+fn handle_create_share_link(stream: &mut TcpStream, state: &AppState, id: &str) -> io::Result<()> {
+    match state.workspaces.share_token(id) {
+        Ok(token) => respond_value(
+            stream,
+            200,
+            &json!({"ok": true, "workspaceId": id, "shareToken": token}),
+        ),
+        Err(UpdateError::NotFound) => respond_error(stream, 404, "Workspace not found."),
+        Err(UpdateError::Internal(message)) => respond_error(stream, 500, &message),
+        Err(_) => respond_error(stream, 500, "Could not create a read-only link."),
+    }
+}
+
+/// The read-only view of a shared workspace.
+///
+/// Answers the source and the viewer settings and **not** the workspace id.
+/// That omission is the entire security property of the feature: a read-only
+/// link that carried the id would be an editable link with an extra step.
+fn handle_shared_workspace(
+    stream: &mut TcpStream,
+    state: &AppState,
+    token: &str,
+) -> io::Result<()> {
+    match state.workspaces.resolve_share(token) {
+        Ok(Some(workspace)) => respond_value(
+            stream,
+            200,
+            &json!({
+                "ok": true,
+                "readOnly": true,
+                "code": workspace.code,
+                "revision": workspace.revision,
+                "plate": workspace.plate,
+                "tolerance": workspace.tolerance,
+            }),
+        ),
+        Ok(None) => respond_error(stream, 404, "This read-only link is not valid."),
+        Err(error) => respond_error(stream, 500, &error),
+    }
+}
+
+/// The stored render thumbnail, or 404 when nothing has rendered this
+/// workspace yet.
+///
+/// A separate route rather than a field on the workspace payload: the recents
+/// list asks for a dozen of these at once and wants them cached, while every
+/// other consumer of a workspace — the editor, the long poll, the MCP tools —
+/// wants nothing to do with a base64 image.
+fn handle_get_workspace_preview(
+    stream: &mut TcpStream,
+    state: &AppState,
+    id: &str,
+) -> io::Result<()> {
+    let workspace = match state.workspaces.get(id) {
+        Ok(Some(workspace)) => workspace,
+        Ok(None) => return respond_error(stream, 404, "Workspace not found."),
+        Err(error) => return respond_error(stream, 500, &error),
+    };
+    if workspace.preview.is_empty() {
+        return respond_error(stream, 404, "No preview has been stored for this workspace.");
+    }
+    respond_value(
+        stream,
+        200,
+        &json!({"ok": true, "workspaceId": id, "preview": workspace.preview}),
+    )
+}
+
+/// Stores a render thumbnail drawn by the browser.
+///
+/// Accepts only a `data:image/...;base64,` URL, and only one small enough to
+/// belong in a workspace document. Both checks are the point: this is the one
+/// endpoint that takes opaque bytes and hands them back to another browser to
+/// render, so anything that is not plainly an image — an `svg` with script in
+/// it, an arbitrary `data:text/html` — has no business being stored under a
+/// key the app will later put in an `img` tag.
+fn handle_put_workspace_preview(
+    stream: &mut TcpStream,
+    state: &AppState,
+    request: &Request,
+    id: &str,
+) -> io::Result<()> {
+    let input = match parse_json_body(&request.body) {
+        Ok(input) => input,
+        Err(error) => return respond_error(stream, 400, &error),
+    };
+    let preview = input
+        .get("preview")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if preview.is_empty() {
+        return respond_error(stream, 400, "A preview data URL is required.");
+    }
+    if preview.len() > MAX_PREVIEW_BYTES {
+        return respond_error(
+            stream,
+            413,
+            &format!(
+                "Preview exceeds the {} KiB limit.",
+                MAX_PREVIEW_BYTES / 1024
+            ),
+        );
+    }
+    if !is_safe_preview_data_url(preview) {
+        return respond_error(
+            stream,
+            400,
+            "A preview must be a base64 PNG, JPEG or WebP data URL.",
+        );
+    }
+    match state.workspaces.set_preview(id, preview) {
+        Ok(()) => respond_value(stream, 200, &json!({"ok": true, "workspaceId": id})),
+        Err(UpdateError::NotFound) => respond_error(stream, 404, "Workspace not found."),
+        Err(UpdateError::Internal(message)) => respond_error(stream, 500, &message),
+        // `set_preview` performs no validation and takes no revision, so the
+        // remaining variants cannot arise; answering 500 is the honest reply
+        // if that ever stops being true.
+        Err(_) => respond_error(stream, 500, "Could not store the preview."),
+    }
+}
+
+/// True for a `data:` URL this app is willing to store and serve back.
+///
+/// Raster types only, base64 only, and a strict base64 alphabet — no SVG
+/// (which can carry script), no `charset`/parameter soup, nothing that could
+/// be coaxed into being interpreted as anything but an image.
+fn is_safe_preview_data_url(value: &str) -> bool {
+    const ALLOWED: &[&str] = &[
+        "data:image/png;base64,",
+        "data:image/jpeg;base64,",
+        "data:image/webp;base64,",
+    ];
+    let Some(prefix) = ALLOWED.iter().find(|prefix| value.starts_with(**prefix)) else {
+        return false;
+    };
+    let payload = &value[prefix.len()..];
+    !payload.is_empty()
+        && payload
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
 }
 
 /// The partial-read payload shared by `GET /api/workspaces/{id}/code` and the
@@ -3316,10 +3663,10 @@ fn handle_workspace_export(
         Ok(mesh) => mesh,
         Err(error) => return respond_error(stream, 422, &error),
     };
-    let data = encode_mesh(&selected_mesh, format.as_str(), &workspace.name);
-    if data.len() > MAX_OUTPUT {
-        return respond_error(stream, 422, "Export exceeds the 64 MiB limit.");
-    }
+    let data = match encode_mesh(&selected_mesh, format.as_str(), &workspace.name) {
+        Ok(data) => data,
+        Err(error) => return respond_error(stream, 422, &error),
+    };
     let content_type = export_content_type(format.as_str());
     let disposition = format!("attachment; filename=\"model.{format}\"");
     respond_text(
@@ -3334,7 +3681,9 @@ fn handle_workspace_export(
 /// The formats every export surface offers: the workspace export route, the
 /// stateless `/api/export` route and the MCP `render_workspace` tool. Keeping
 /// one list means a new format can never be wired into just one of them.
-const EXPORT_FORMATS: [&str; 4] = ["stl", "off", "obj", "3mf"];
+/// The format id doubles as the file extension (`model.{format}`), so these
+/// are the extensions users see on the download.
+const EXPORT_FORMATS: [&str; 6] = ["stl", "off", "obj", "3mf", "step", "glb"];
 
 fn is_supported_export_format(format: &str) -> bool {
     EXPORT_FORMATS.contains(&format)
@@ -3344,18 +3693,36 @@ fn supported_export_formats_sentence() -> String {
     format!("Supported export formats are {}.", EXPORT_FORMATS.join(", "))
 }
 
+/// The one message every oversized export answers with, so the HTTP routes and
+/// the MCP tool cannot describe the same limit two different ways.
+const EXPORT_TOO_LARGE: &str = "Export exceeds the 64 MiB limit.";
+
 /// Serialize a mesh in one of [`EXPORT_FORMATS`].
 ///
-/// `title` only reaches formats that carry metadata (3MF); the mesh formats
-/// ignore it. Callers must validate the format first.
-fn encode_mesh(mesh: &engine::Mesh, format: &str, title: &str) -> Vec<u8> {
-    match format {
+/// `title` reaches the formats that carry metadata — 3MF's title, STEP's
+/// product name, glTF's node name — and the bare mesh formats ignore it.
+/// Callers must validate the format first.
+///
+/// The size check lives here rather than at each call site because the two
+/// newest formats need it *during* serialisation, not after. STEP runs about
+/// ten times the size of the same model's STL, so "build it, then measure it"
+/// would let a single request materialise hundreds of megabytes on its way to
+/// a rejection — a cheap way to push this server over its memory limit. Both
+/// writers take the budget and give up the moment they cross it.
+fn encode_mesh(mesh: &engine::Mesh, format: &str, title: &str) -> Result<Vec<u8>, String> {
+    let data = match format {
         "stl" => mesh.binary_stl(),
         "off" => mesh.off(),
         "obj" => mesh.obj(),
         "3mf" => threemf::write(mesh, title),
+        "step" => step::write(mesh, title, MAX_OUTPUT).ok_or(EXPORT_TOO_LARGE)?,
+        "glb" => gltf::write(mesh, title, MAX_OUTPUT).ok_or(EXPORT_TOO_LARGE)?,
         _ => unreachable!("unvalidated export format {format:?}"),
+    };
+    if data.len() > MAX_OUTPUT {
+        return Err(EXPORT_TOO_LARGE.into());
     }
+    Ok(data)
 }
 
 fn export_content_type(format: &str) -> &'static str {
@@ -3363,6 +3730,10 @@ fn export_content_type(format: &str) -> &'static str {
         "stl" => "model/stl",
         "obj" => "model/obj",
         "3mf" => "model/3mf",
+        // Both registered with IANA; `model/step` is the Part 21 text form and
+        // `model/gltf-binary` is the `.glb` container.
+        "step" => "model/step",
+        "glb" => "model/gltf-binary",
         _ => "application/octet-stream",
     }
 }
@@ -4187,13 +4558,11 @@ fn mcp_tool_definitions() -> Vec<Value> {
         mcp_tool(
             "create_workspace",
             "Create a single-file SCAD workspace and return its browser URL. \
-             IMPORTANT - the workspace is TEMPORARY, not storage. It is deleted after a period \
-             without edits, and sooner when the server is at capacity; opening or rendering it does \
-             not extend its life, only editing does. Save the SCAD source to a local .scad file (for \
-             example alongside the user's project) and treat that file as the source of truth - if \
-             the workspace disappears, recreate it from the local file. The returned URL is an \
-             access capability: anyone with the link can read and change the work, so share it \
-             deliberately and never post it publicly.",
+             The workspace does not expire, but a deployment holds a bounded number of them and \
+             evicts the least recently touched one when it is full, so save the SCAD source to a \
+             local .scad file (for example alongside the user's project) and treat that file as \
+             the source of truth. The returned URL is an access capability: anyone with the link \
+             can read and change the work, so share it deliberately and never post it publicly.",
             json!({
                 "type": "object",
                 "properties": {
@@ -4239,8 +4608,11 @@ fn mcp_tool_definitions() -> Vec<Value> {
         ),
         mcp_tool(
             "render_workspace",
-            "Render a workspace as STL, OBJ, OFF, or 3MF and return data plus an export URL. \
-             Object IDs for the optional objectIds filter come from list_workspace_objects.",
+            "Render a workspace and return data plus an export URL. Mesh formats: stl, off, \
+             obj, 3mf. step is an ISO 10303-21 AP214 solid B-rep, with merged planar faces and \
+             shared edges, for CAD packages. glb is glTF 2.0 binary, in metres, for web and AR \
+             viewers. Object IDs for the optional objectIds filter come from \
+             list_workspace_objects.",
             json!({
                 "type": "object",
                 "required": ["workspaceId", "revision"],
@@ -4522,10 +4894,7 @@ fn mcp_render_workspace(
         engine::Quality::Render,
         None,
     )?;
-    let data = encode_mesh(&selected_mesh, format, &workspace.name);
-    if data.len() > MAX_OUTPUT {
-        return Err("Export exceeds the 64 MiB limit.".into());
-    }
+    let data = encode_mesh(&selected_mesh, format, &workspace.name)?;
     let include_data = arguments
         .get("includeData")
         .and_then(Value::as_bool)
@@ -4644,22 +5013,23 @@ fn supported_scad_dictionary() -> Value {
     json!({
         "engine": "ReOpenSCAD native Rust evaluator",
         "geometry": {
-            "primitives2d": ["square", "polygon", "circle"],
-            "primitives3d": ["cube", "sphere", "cylinder"],
+            "primitives2d": ["square", "polygon", "circle", "text"],
+            "primitives3d": ["cube", "sphere", "cylinder", "polyhedron"],
             "parameterAliases": {
                 "circle": {"diameter": "d"},
                 "sphere": {"diameter": "d"},
                 "cylinder": {"diameter": "d", "bottomDiameter": "d1", "topDiameter": "d2"}
             },
-            "transforms": ["translate", "rotate", "scale", "mirror", "color"],
-            "csg": ["union", "difference", "intersection", "hull", "minkowski"],
-            "operations2d": ["offset"],
-            "extrusions": ["linear_extrude"]
+            "transforms": ["translate", "rotate", "scale", "mirror", "multmatrix", "resize", "color"],
+            "csg": ["union", "difference", "intersection", "hull", "minkowski", "render", "group"],
+            "operations2d": ["offset", "projection"],
+            "extrusions": ["linear_extrude", "rotate_extrude"]
         },
         "language": [
             "variables", "vectors", "ranges", "arithmetic", "comparison", "boolean operators",
+            "bitwise operators (& | ~ << >>)", "hexadecimal literals (0x1f)",
             "ternary expressions", "if/else", "for", "intersection_for", "let", "assert",
-            "echo", "modules", "functions", "children"
+            "echo", "modules", "functions", "children", "recursive modules"
         ],
         "functions": [
             "abs", "sign", "floor", "ceil", "round", "sqrt", "exp", "ln", "log", "sin",
@@ -4670,7 +5040,9 @@ fn supported_scad_dictionary() -> Value {
         "exportFormats": EXPORT_FORMATS,
         "notes": [
             "The dictionary describes implemented behavior, not full OpenSCAD parity.",
-            "minkowski uses an approximation in this engine build."
+            "minkowski uses an approximation in this engine build.",
+            "A module outside this list is ignored with a warning rather than failing the compile,              so the rest of the model still renders.",
+            "Module recursion is bounded by the evaluator's stack budget; very deep recursion is              reported as an error instead of being allowed to exhaust the process."
         ]
     })
 }
@@ -4863,10 +5235,10 @@ fn handle_export(stream: &mut TcpStream, state: &AppState, body: &[u8]) -> io::R
         Ok(mesh) => mesh,
         Err(error) => return respond_error(stream, 422, &error),
     };
-    let data = encode_mesh(&mesh, format.as_str(), "model");
-    if data.len() > MAX_OUTPUT {
-        return respond_error(stream, 422, "Export exceeds the 64 MiB limit.");
-    }
+    let data = match encode_mesh(&mesh, format.as_str(), "model") {
+        Ok(data) => data,
+        Err(error) => return respond_error(stream, 422, &error),
+    };
     let content_type = export_content_type(format.as_str());
     let disposition = format!("attachment; filename=\"model.{format}\"");
     respond_text(
@@ -4907,7 +5279,7 @@ fn handle_static(stream: &mut TcpStream, state: &AppState, route: &str) -> io::R
     if route.starts_with("/backend/") || route.starts_with("/.reopenscad-workspaces/") {
         return respond_text(stream, 404, "text/plain", b"Not found", &[]);
     }
-    if workspace_shell_id(route).is_some() {
+    if workspace_shell_id(route).is_some() || shared_shell_token(route).is_some() {
         let index = state.web_root.join("index.html");
         return respond_text(stream, 200, mime_type(&index), &fs::read(index)?, &[]);
     }
@@ -4958,6 +5330,15 @@ fn workspace_shell_id(route: &str) -> Option<&str> {
         .strip_prefix("/workspaces/")
         .map(|id| id.trim_end_matches('/'))
         .filter(|id| valid_workspace_id(id))
+}
+
+/// `/shared/<token>` serves the same shell as a workspace route. Which mode
+/// the app comes up in is decided in the browser, from the path.
+fn shared_shell_token(route: &str) -> Option<&str> {
+    route
+        .strip_prefix("/shared/")
+        .map(|token| token.trim_end_matches('/'))
+        .filter(|token| valid_share_token(token))
 }
 
 fn mime_type(path: &Path) -> &'static str {
@@ -5236,6 +5617,8 @@ mod tests {
             updated_at: 2,
             plate: "prusa-mk4s".into(),
             tolerance: 0.35,
+            preview: String::new(),
+            share_token: String::new(),
             events: Vec::new(),
         };
         // Nothing changed: the settings still have to be there.
@@ -6172,7 +6555,7 @@ mod tests {
         assert!(is_supported_export_format("3mf"));
         assert!(!is_supported_export_format("amf"));
         for format in EXPORT_FORMATS {
-            let data = encode_mesh(&mesh, format, "unit test");
+            let data = encode_mesh(&mesh, format, "unit test").expect("encodes");
             assert!(!data.is_empty(), "{format} produced no bytes");
         }
         // The tool schema and the validator must not drift apart: a format the
@@ -6189,9 +6572,28 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(advertised, EXPORT_FORMATS.map(String::from).to_vec());
 
-        let package = encode_mesh(&mesh, "3mf", "unit test");
+        let package = encode_mesh(&mesh, "3mf", "unit test").expect("encodes");
         assert_eq!(&package[..4], b"PK\x03\x04", "3MF must be a ZIP container");
         assert_eq!(export_content_type("3mf"), "model/3mf");
+
+        // Every format's magic is what tells a consumer what it received, and
+        // the content type is what tells the browser. Both are easy to wire to
+        // the wrong encoder, so both are pinned here rather than only inside
+        // the writers' own tests.
+        let step = encode_mesh(&mesh, "step", "unit test").expect("encodes");
+        assert!(step.starts_with(b"ISO-10303-21;"), "STEP must be Part 21");
+        assert_eq!(export_content_type("step"), "model/step");
+        let glb = encode_mesh(&mesh, "glb", "unit test").expect("encodes");
+        assert_eq!(&glb[..4], b"glTF", "GLB must carry the glTF magic");
+        assert_eq!(export_content_type("glb"), "model/gltf-binary");
+        // Format ids are also file extensions, so they have to be safe in a
+        // `Content-Disposition` filename without quoting.
+        for format in EXPORT_FORMATS {
+            assert!(
+                format.chars().all(|c| c.is_ascii_alphanumeric()),
+                "{format} is used verbatim as model.{format}"
+            );
+        }
     }
 
     #[test]
@@ -6540,6 +6942,8 @@ mod tests {
             updated_at: 2,
             plate: String::new(),
             tolerance: DEFAULT_TOLERANCE,
+            preview: String::new(),
+            share_token: String::new(),
             events: Vec::new(),
         };
         let idle = workspace_events_payload(&workspace.id, &workspace, 7);
@@ -6554,23 +6958,106 @@ mod tests {
         assert_eq!(changed["code"], json!(workspace.code));
     }
 
+    /// The whole security property of a read-only link, stated as a test: it
+    /// resolves to the source, and it never yields the workspace id. Anything
+    /// that leaked the id would make the read-only link an editable one with
+    /// an extra step.
     #[test]
-    fn workspace_store_evicts_expired_entries() {
+    fn a_read_only_link_resolves_without_revealing_the_workspace_it_points_at() {
+        let (store, root) = temporary_store();
+        let workspace = store.create("cube(7);".into(), None).unwrap();
+        let token = store.share_token(&workspace.id).unwrap();
+        assert!(valid_share_token(&token), "{token:?} is not a share token");
+        assert!(
+            !token.contains(&workspace.id) && !workspace.id.contains(&token),
+            "the token and the id must not contain one another"
+        );
+
+        let shared = store.resolve_share(&token).unwrap().expect("resolves");
+        assert_eq!(shared.code, "cube(7);");
+
+        // The payload the browser is handed, built exactly as the handler
+        // builds it: source and settings, and no `id` anywhere in it.
+        let payload = json!({
+            "ok": true,
+            "readOnly": true,
+            "code": shared.code,
+            "revision": shared.revision,
+            "plate": shared.plate,
+            "tolerance": shared.tolerance,
+        });
+        let serialized = serde_json::to_string(&payload).unwrap();
+        assert!(
+            !serialized.contains(&workspace.id),
+            "the shared payload leaks the workspace id: {serialized}"
+        );
+        assert!(payload.get("workspaceId").is_none());
+        assert!(payload.get("id").is_none());
+
+        // Sharing twice is the same link, so one already sent keeps working.
+        assert_eq!(store.share_token(&workspace.id).unwrap(), token);
+        // And a token nobody minted resolves to nothing.
+        assert!(store
+            .resolve_share("00000000000000000000000000000000")
+            .unwrap()
+            .is_none());
+        assert!(store.resolve_share("not-a-token").unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Evicting a workspace takes its read-only pointer with it, or the store
+    /// would slowly fill with files naming workspaces that no longer exist.
+    #[test]
+    fn evicting_a_workspace_also_drops_its_read_only_link() {
+        let (store, root) = temporary_store();
+        let workspace = store.create("cube(1);".into(), None).unwrap();
+        let token = store.share_token(&workspace.id).unwrap();
+        assert!(store.share_path(&token).exists());
+        {
+            let mut inner = store.inner.lock().unwrap();
+            store.forget(&mut inner, &workspace.id);
+        }
+        assert!(
+            !store.share_path(&token).exists(),
+            "the share pointer outlived the workspace"
+        );
+        assert!(store.resolve_share(&token).unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The `.share` sidecars must not be mistaken for workspaces by the boot
+    /// scan, which would make them show up as (unreadable) workspaces.
+    #[test]
+    fn share_pointers_are_not_counted_as_workspaces() {
+        let (store, root) = temporary_store();
+        let workspace = store.create("cube(1);".into(), None).unwrap();
+        store.share_token(&workspace.id).unwrap();
+        assert_eq!(store.len(), 1);
+        let reopened = WorkspaceStore::open(root.clone()).unwrap();
+        assert_eq!(reopened.len(), 1, "a sidecar was indexed as a workspace");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A workspace URL is the only handle anyone has on their work, so age
+    /// alone must never take one away. This used to be
+    /// `workspace_store_evicts_expired_entries`, asserting the opposite.
+    #[test]
+    fn workspace_store_keeps_an_untouched_workspace_indefinitely() {
         let (store, root) = temporary_store();
         let workspace = store.create("cube(1);".into(), None).unwrap();
         let path = root.join(format!("{}.json", workspace.id));
-        assert!(path.exists());
         {
             let mut inner = store.inner.lock().unwrap();
-            let stale = unix_millis() - WORKSPACE_TTL_MS - 1;
+            // A year idle, well past the fourteen days that used to delete it.
+            let ancient = unix_millis() - 365 * 24 * 60 * 60 * 1000;
             inner
                 .index
-                .insert(workspace.id.clone(), WorkspaceMeta { updated_at: stale });
+                .insert(workspace.id.clone(), WorkspaceMeta { updated_at: ancient });
             store.prune(&mut inner, 0);
         }
-        assert_eq!(store.len(), 0);
-        assert!(!path.exists(), "expired workspace files must be deleted");
-        assert!(store.get(&workspace.id).unwrap().is_none());
+        assert_eq!(store.len(), 1, "nothing expires");
+        assert!(path.exists(), "an idle workspace file must survive");
+        assert!(store.get(&workspace.id).unwrap().is_some());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6859,6 +7346,12 @@ mod tests {
             get("/workspaces/wobbly-wombat-ec5e6bd2b1eaa013ccba04c67f88").contains(ROBOTS_META)
         );
         assert!(get("/?workspace=wobbly-wombat-ec5e6bd2b1eaa013ccba04c67f88").contains(ROBOTS_META));
+        // A read-only link is a capability too: it reveals the source to
+        // whoever holds it, so it must not be indexed either.
+        assert!(
+            get("/shared/0f1e2d3c4b5a69788796a5b4c3d2e1f0").contains(ROBOTS_META),
+            "a shared view must be noindex"
+        );
         let landing = get("/");
         assert!(landing.contains("<title>ReOpenSCAD</title>"));
         assert!(!landing.contains("name=\"robots\""));
@@ -6883,6 +7376,7 @@ mod tests {
         for rule in [
             "User-agent: *",
             "Disallow: /workspaces/",
+            "Disallow: /shared/",
             "Disallow: /api/",
             "Disallow: /mcp",
         ] {

@@ -141,3 +141,100 @@ fn fragment_counts_change_generated_meshes() {
     .unwrap();
     assert!(high_circle.mesh.triangles.len() > low_circle.mesh.triangles.len());
 }
+
+// ---------------------------------------------------------------------------
+// rotate_extrude()
+// ---------------------------------------------------------------------------
+
+fn rotate_extrude_parts(source: &str) -> (f64, usize) {
+    match evaluate_source(source) {
+        Shape::RotateExtrude {
+            angle, fragments, ..
+        } => (angle, fragments),
+        other => panic!("expected a rotate_extrude, found {other:?}"),
+    }
+}
+
+/// The bare call sweeps a full turn, which is what nearly every use of it is.
+#[test]
+fn rotate_extrude_sweeps_the_whole_turn_by_default() {
+    assert_eq!(
+        rotate_extrude_parts("rotate_extrude() translate([10, 0]) circle(2);").0,
+        360.0
+    );
+    assert_eq!(
+        rotate_extrude_parts("rotate_extrude(angle = 90) translate([10, 0]) circle(2);").0,
+        90.0
+    );
+    assert_eq!(
+        rotate_extrude_parts("rotate_extrude(270) translate([10, 0]) circle(2);").0,
+        270.0
+    );
+}
+
+/// Facets follow the radius the sweep actually has to approximate — the
+/// profile's *outermost* reach — not the profile's own size. A thread or an
+/// O-ring groove is a small profile held far out from the axis, and sizing its
+/// facets by the profile would visibly polygonise the ring it travels on.
+#[test]
+fn rotate_extrude_facets_follow_the_outer_radius_not_the_profile() {
+    // A 2 mm circle 50 mm out: the sweep is a 52 mm ring and is faceted as one.
+    let (_, far) = rotate_extrude_parts("rotate_extrude() translate([50, 0]) circle(2);");
+    // The same profile sitting on the axis sweeps a 2 mm ring and needs far less.
+    let (_, near) = rotate_extrude_parts("rotate_extrude() translate([2, 0]) circle(2);");
+    assert!(
+        far > near * 2,
+        "a far-flung profile must be faceted for its own radius: {far} vs {near}"
+    );
+    assert_eq!(
+        rotate_extrude_parts("rotate_extrude($fn = 12) translate([50, 0]) circle(2);").1,
+        12,
+        "$fn still wins outright"
+    );
+}
+
+/// A profile that reaches across the axis would sweep through itself. OpenSCAD
+/// refuses it outright ("may not lie across the Y axis") and so does this,
+/// because the alternative is a self-intersecting solid that every later
+/// boolean has to cope with.
+#[test]
+fn rotate_extrude_refuses_a_profile_that_crosses_the_axis() {
+    let tokens = Lexer::new("rotate_extrude() translate([-2, 0]) circle(5);")
+        .tokenize()
+        .expect("lex");
+    let statements = Parser::new(tokens).parse_program().expect("parse");
+    let mut evaluator = Evaluator::default();
+    let shape = evaluator.evaluate(&statements);
+    assert!(
+        shape.is_err()
+            || shape
+                .as_ref()
+                .is_ok_and(|shape| shape.bounds().max.x <= 0.0),
+        "a profile crossing the axis must not produce a solid"
+    );
+    assert!(
+        evaluator
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("rotate_extrude") && line.contains("x < 0")),
+        "the refusal has to say why: {:?}",
+        evaluator.diagnostics
+    );
+}
+
+/// A revolved profile is a solid, and the profile itself has to be planar.
+#[test]
+fn rotate_extrude_is_a_solid_built_from_a_planar_profile() {
+    assert_eq!(
+        evaluate_source("rotate_extrude() translate([10, 0]) circle(2);").dimension(),
+        ShapeDimension::Solid
+    );
+    let tokens = Lexer::new("rotate_extrude() cube(3);")
+        .tokenize()
+        .expect("lex");
+    let statements = Parser::new(tokens).parse_program().expect("parse");
+    assert!(
+        Evaluator::default().evaluate(&statements).is_err(),
+        "a 3D child is not a profile"
+    );
+}

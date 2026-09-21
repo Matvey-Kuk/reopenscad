@@ -443,9 +443,9 @@ gcloud sql connect "$SQL_INSTANCE" --user=reopenscad --database=reopenscad
 #     FROM workspaces;
 ```
 
-Retention runs itself: every ten minutes a sweeper thread deletes workspaces
-idle for more than 14 days and trims the table to the newest
-`REOPENSCAD_MAX_WORKSPACES`, with two set-based `DELETE`s.
+Retention runs itself: every ten minutes a sweeper thread trims the table to
+the newest `REOPENSCAD_MAX_WORKSPACES`, with one set-based `DELETE`. Nothing is
+deleted for being old — see below.
 
 ### Request logs contain workspace credentials
 
@@ -502,9 +502,12 @@ Pick a number far above any plausible legitimate total and watch
 Beyond a toy deployment, put authentication in front of `POST /api/workspaces`
 rather than relying on a number here.
 
-The 14-day idle TTL is compiled in as `WORKSPACE_TTL_MS`
-(`backend/src/main.rs`). It only deletes untouched workspaces, but it does mean
-a bookmarked URL expires.
+There is no idle TTL. Workspaces used to be deleted after fourteen untouched
+days, which made a bookmarked URL expire silently — the link is the only handle
+anyone has on their work, it looks permanent, and it stopped resolving while
+they were not looking. Capacity is now the only thing that evicts anything, so
+the number above is the whole retention policy and sizing it is the whole
+decision.
 
 Backups are the Cloud SQL automated ones enabled in §3. Verify a restore before
 relying on it — given the eviction hazard above, it is the actual safety net.

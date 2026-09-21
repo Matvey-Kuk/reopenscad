@@ -39,6 +39,16 @@ CREATE TABLE IF NOT EXISTS workspaces (
     plate      TEXT NOT NULL DEFAULT '',
     tolerance  DOUBLE PRECISION NOT NULL DEFAULT 0.2,
 
+    -- A small render thumbnail as a base64 `data:` URL, written by the browser
+    -- that drew it and shown in the "recent workspaces" list. Empty until a
+    -- render has happened; bounded by MAX_PREVIEW_BYTES (96 KiB) in the server.
+    preview    TEXT NOT NULL DEFAULT '',
+
+    -- Capability for the read-only view, or '' until the workspace is shared.
+    -- Independent of `id` rather than derived from it: holding the read-only
+    -- link must not get you the editable one.
+    share_token TEXT NOT NULL DEFAULT '',
+
     -- The recent edit log the `/events` long poll replays to other tabs and to
     -- the browser after an MCP agent writes. Capped at 64 entries by the
     -- UPDATE statement itself, so the bound holds across instances. Kept in the
@@ -51,6 +61,11 @@ CREATE TABLE IF NOT EXISTS workspaces (
 -- Pruning orders by `updated_at` (TTL sweep and the count cap), and without
 -- this both are sequential scans of the whole table every ten minutes.
 -- Workspace reads need no index: they are primary-key lookups.
+-- Unique where it exists, so two workspaces can never answer to the same
+-- read-only link. Partial, so every unshared row can keep the same '' default.
+CREATE UNIQUE INDEX IF NOT EXISTS workspaces_share_token_idx
+    ON workspaces (share_token) WHERE share_token <> '';
+
 CREATE INDEX IF NOT EXISTS workspaces_updated_at_idx
     ON workspaces (updated_at DESC, id DESC);
 

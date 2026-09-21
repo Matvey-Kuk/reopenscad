@@ -328,6 +328,36 @@ impl Region2d {
         self.contours = cleaned;
     }
 
+    /// `fill()`: the region with every hole closed.
+    ///
+    /// Keeps the contours at even-odd nesting depth 0 and drops everything
+    /// below them. Depth 0 is exactly the set of outermost boundaries, so this
+    /// discards the holes (depth 1) *and* any island sitting inside a hole
+    /// (depth 2 and deeper) — which is what the OpenSCAD binary does:
+    /// `fill() difference() { circle(10); difference() { circle(6); circle(3); } }`
+    /// renders the same 124-facet disc as `circle(10)` alone, not a disc with a
+    /// ring scored into it. Dropping only the odd depths would have kept that
+    /// island as a separate contour and left a seam in the result.
+    ///
+    /// The filter runs on a normalised copy because nesting depth is only
+    /// meaningful once degenerate contours are gone and winding has been
+    /// fixed. The survivors are already CCW and are still at depth 0 with
+    /// respect to one another, so the result needs no second normalisation.
+    pub fn filled(&self) -> Region2d {
+        let mut region = self.clone();
+        region.normalize();
+        let depths = nesting_depths(&region.contours);
+        Region2d::new(
+            region
+                .contours
+                .into_iter()
+                .zip(depths)
+                .filter(|(_, depth)| *depth == 0)
+                .map(|(contour, _)| contour)
+                .collect(),
+        )
+    }
+
     /// Ear-clipping triangulation honouring holes. Triangles wind CCW.
     pub fn triangulate(&self) -> Vec<[Point2; 3]> {
         // Work on a normalised copy: the ear clipper relies on CCW outers and
@@ -677,7 +707,8 @@ fn push_arc(
 
     let sweep = turn.abs().atan2(along);
     let full_circle = fragments.max(3) as f64;
-    let steps = (((full_circle * sweep) / (2.0 * std::f64::consts::PI)).round() as i64).max(1) as usize;
+    let steps =
+        (((full_circle * sweep) / (2.0 * std::f64::consts::PI)).round() as i64).max(1) as usize;
     if steps > 1 && sweep > POINT_EPSILON && radius > POINT_EPSILON {
         let step = sweep / steps as f64;
         let outer_radius = radius / (step * 0.5).cos();
@@ -713,6 +744,10 @@ fn triangulate_with_holes_inner(outer: &[Point2], holes: &[Vec<Point2>]) -> Vec<
     }
 
     let mut ring: Vec<Point2> = outer.to_vec();
+    prune_spurs(&mut ring);
+    if ring.len() < 3 {
+        return Vec::new();
+    }
     if signed_area(&ring) < 0.0 {
         ring.reverse();
     }
@@ -722,11 +757,13 @@ fn triangulate_with_holes_inner(outer: &[Point2], holes: &[Vec<Point2>]) -> Vec<
         .filter(|hole| hole.len() >= 3)
         .map(|hole| {
             let mut hole = hole.clone();
+            prune_spurs(&mut hole);
             if signed_area(&hole) > 0.0 {
                 hole.reverse();
             }
             hole
         })
+        .filter(|hole| hole.len() >= 3)
         .collect();
 
     // Bridging works right-to-left: a hole further right can only ever be
@@ -801,6 +838,60 @@ fn triangulate_with_holes_inner(outer: &[Point2], holes: &[Vec<Point2>]) -> Vec<
     bridged
 }
 
+/// Removes zero-width spurs — `..., c, d, c, ...` — from a contour.
+///
+/// A merged face's boundary is traced by cancelling shared edges, and where a
+/// face touches a neighbour along a line rather than across an area, the trace
+/// walks out to the far end of that line and straight back. The result is a
+/// contour that visits a vertex twice with nothing enclosed in between.
+///
+/// Nothing can triangulate that. The spur's two edges are the same undirected
+/// edge traversed in both directions, so every candidate triangulation is
+/// rejected as non-conforming and the clipper falls back to output that covers
+/// the wrong area — measured on a screw-top jar, eight such contours between
+/// them lost 4.7 mm^3 and left nine edges with an odd number of faces on them.
+///
+/// Dropping the spur is safe precisely because of what makes it untriangulable:
+/// its two edges cancel, so removing both leaves the surface's edge bookkeeping
+/// exactly as it was, and it encloses no area, so the face is unchanged.
+fn prune_spurs(contour: &mut Vec<Point2>) {
+    // Repeated, because removing one spur's tip can expose another behind it:
+    // `c, d, e, d, c` is a two-deep antenna and comes back as `c` alone.
+    loop {
+        dedup_ring_2d(contour);
+        if contour.len() < 3 {
+            return;
+        }
+        let count = contour.len();
+        let tip = (0..count).find(|index| {
+            let before = contour[(index + count - 1) % count];
+            let after = contour[(index + 1) % count];
+            same_point(before, after)
+        });
+        match tip {
+            Some(index) => {
+                contour.remove(index);
+            }
+            None => return,
+        }
+    }
+}
+
+/// Drops consecutive duplicates, wrapping around the ring.
+fn dedup_ring_2d(contour: &mut Vec<Point2>) {
+    let mut kept: Vec<Point2> = Vec::with_capacity(contour.len());
+    for point in contour.drain(..) {
+        if kept.last().is_some_and(|last| same_point(*last, point)) {
+            continue;
+        }
+        kept.push(point);
+    }
+    while kept.len() > 1 && same_point(kept[0], kept[kept.len() - 1]) {
+        kept.pop();
+    }
+    *contour = kept;
+}
+
 /// True when `triangles` is a conforming triangulation of `outer` minus
 /// `holes`: it covers exactly the right area, and the only edges it leaves
 /// unpaired are the input contour edges themselves.
@@ -814,8 +905,7 @@ fn triangulation_conforms(
     outer: &[Point2],
     holes: &[Vec<Point2>],
 ) -> bool {
-    let expected =
-        signed_area(outer) + holes.iter().map(|hole| signed_area(hole)).sum::<f64>();
+    let expected = signed_area(outer) + holes.iter().map(|hole| signed_area(hole)).sum::<f64>();
     let produced: f64 = triangles.iter().map(|triangle| signed_area(triangle)).sum();
     if (produced - expected).abs() > expected.abs() * 1.0e-9 + AREA_EPSILON {
         return false;
@@ -1044,7 +1134,9 @@ fn subdivision_faces(
     next: &[usize],
     diagonals: &[(usize, usize)],
 ) -> Vec<Vec<Point2>> {
-    let mut edges: Vec<(usize, usize)> = (0..points.len()).map(|index| (index, next[index])).collect();
+    let mut edges: Vec<(usize, usize)> = (0..points.len())
+        .map(|index| (index, next[index]))
+        .collect();
     for (from, to) in diagonals {
         edges.push((*from, *to));
         edges.push((*to, *from));
@@ -1136,9 +1228,7 @@ fn rightmost_index(contour: &[Point2]) -> usize {
     for index in 1..contour.len() {
         let candidate = contour[index];
         let current = contour[best];
-        if candidate[0] > current[0]
-            || (candidate[0] == current[0] && candidate[1] > current[1])
-        {
+        if candidate[0] > current[0] || (candidate[0] == current[0] && candidate[1] > current[1]) {
             best = index;
         }
     }
@@ -1152,6 +1242,20 @@ fn is_reflex(ring: &[Point2], index: usize) -> bool {
     let current = ring[index];
     let next = ring[(index + 1) % count];
     cross(sub(current, previous), sub(next, current)) < -AREA_EPSILON
+}
+
+/// True when a *counter-clockwise* ring is convex: it turns left, or goes
+/// straight, at every vertex.
+///
+/// The winding precondition is real — a CW ring is reflex everywhere by this
+/// test — so callers normalise first. Reusing [`is_reflex`] keeps the sign
+/// convention and the [`AREA_EPSILON`] tolerance in one place; the absolute
+/// (rather than relative) epsilon is right here because a normalised ring has
+/// already had its collinear vertices removed, so all that is left to absorb
+/// is round-off. Erring towards "not convex" is the safe direction: the one
+/// caller, `planar::minkowski`, only loses a fast path by it.
+pub fn is_convex_ring(ring: &[Point2]) -> bool {
+    ring.len() >= 3 && (0..ring.len()).all(|index| !is_reflex(ring, index))
 }
 
 /// Splices one CW hole into a CCW ring with a doubled bridge edge.
@@ -1329,7 +1433,13 @@ fn normalized(a: Point2) -> Point2 {
 /// outside it. Since the pinch point itself is shared, containment says
 /// nothing; what decides it is whether either edge leaving that occurrence
 /// points into the ear's interior angle at the shared corner.
-fn pinch_reaches_into_ear(vertices: &[Point2], position: usize, a: Point2, b: Point2, c: Point2) -> bool {
+fn pinch_reaches_into_ear(
+    vertices: &[Point2],
+    position: usize,
+    a: Point2,
+    b: Point2,
+    c: Point2,
+) -> bool {
     let count = vertices.len();
     let corner = vertices[position];
     let (from, to) = if same_point(corner, a) {
@@ -1538,14 +1648,106 @@ mod tests {
     }
 
     fn triangle_area(triangle: &[Point2; 3]) -> f64 {
-        cross(
-            sub(triangle[1], triangle[0]),
-            sub(triangle[2], triangle[0]),
-        ) * 0.5
+        cross(sub(triangle[1], triangle[0]), sub(triangle[2], triangle[0])) * 0.5
     }
 
     fn total_area(triangles: &[[Point2; 3]]) -> f64 {
         triangles.iter().map(triangle_area).sum()
+    }
+
+    /// Contours of a circle of `radius`, wound CCW.
+    fn disc(radius: f64) -> Vec<Point2> {
+        super::super::primitives::circle_points(radius, 64)
+    }
+
+    /// Area of the 64-gon the kernel uses for `circle(r)`.
+    fn disc_area(radius: f64) -> f64 {
+        signed_area(&disc(radius))
+    }
+
+    #[test]
+    fn is_convex_ring_separates_a_square_from_an_l() {
+        assert!(is_convex_ring(&square(10.0)));
+        assert!(is_convex_ring(&disc(10.0)));
+        // An L: the vertex at (5, 5) turns right.
+        assert!(!is_convex_ring(&[
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [10.0, 5.0],
+            [5.0, 5.0],
+            [5.0, 10.0],
+            [0.0, 10.0]
+        ]));
+        // The same square wound clockwise: convexity is only defined here for
+        // CCW rings, and this documents that the precondition is load-bearing.
+        let mut reversed = square(10.0);
+        reversed.reverse();
+        assert!(!is_convex_ring(&reversed));
+    }
+
+    /// `fill()` of a washer is the disc: the hole contour goes, the outer
+    /// boundary stays, and the area jumps by exactly the hole's.
+    #[test]
+    fn fill_closes_a_ring() {
+        let mut hole = disc(6.0);
+        hole.reverse();
+        let mut ring = Region2d::new(vec![disc(10.0), hole]);
+        ring.normalize();
+        assert_eq!(ring.contours.len(), 2);
+        assert!((ring.area() - (disc_area(10.0) - disc_area(6.0))).abs() < 1.0e-9);
+
+        let filled = ring.filled();
+        assert_eq!(filled.contours.len(), 1);
+        assert!((filled.area() - disc_area(10.0)).abs() < 1.0e-9);
+        // The ideal figures the fixture is written against, to 0.5%: a 64-gon
+        // is not a circle, so this cannot be an equality.
+        assert!((filled.area() - std::f64::consts::PI * 100.0).abs() < 1.6);
+    }
+
+    /// Depth 2 and deeper go too. Keeping only the odd depths would leave the
+    /// island floating in the filled disc as a separate contour, which is not
+    /// what the OpenSCAD binary produces.
+    #[test]
+    fn fill_drops_an_island_inside_a_hole() {
+        let mut hole = disc(6.0);
+        hole.reverse();
+        let mut region = Region2d::new(vec![disc(10.0), hole, disc(3.0)]);
+        region.normalize();
+        assert_eq!(region.contours.len(), 3);
+
+        let filled = region.filled();
+        assert_eq!(filled.contours.len(), 1);
+        assert!((filled.area() - disc_area(10.0)).abs() < 1.0e-9);
+    }
+
+    /// Two separate bodies stay two: depth 0 is per-boundary, not a single
+    /// outermost contour.
+    #[test]
+    fn fill_keeps_every_disjoint_outer_boundary() {
+        let mut left_hole = rectangle(2.0, 2.0, 4.0, 4.0);
+        left_hole.reverse();
+        let mut right_hole = rectangle(22.0, 2.0, 24.0, 4.0);
+        right_hole.reverse();
+        let mut region = Region2d::new(vec![
+            rectangle(0.0, 0.0, 10.0, 10.0),
+            left_hole,
+            rectangle(20.0, 0.0, 30.0, 10.0),
+            right_hole,
+        ]);
+        region.normalize();
+        assert!((region.area() - (200.0 - 8.0)).abs() < 1.0e-12);
+
+        let filled = region.filled();
+        assert_eq!(filled.contours.len(), 2);
+        assert!((filled.area() - 200.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn fill_leaves_a_region_without_holes_alone() {
+        let region = Region2d::new(vec![square(10.0)]);
+        let filled = region.filled();
+        assert_eq!(filled.contours.len(), 1);
+        assert!((filled.area() - 100.0).abs() < 1.0e-12);
     }
 
     #[test]
@@ -1615,8 +1817,7 @@ mod tests {
         for count in [3usize, 4, 5, 7, 12, 32] {
             let contour: Vec<Point2> = (0..count)
                 .map(|index| {
-                    let angle =
-                        2.0 * std::f64::consts::PI * index as f64 / count as f64;
+                    let angle = 2.0 * std::f64::consts::PI * index as f64 / count as f64;
                     [5.0 * angle.cos(), 5.0 * angle.sin()]
                 })
                 .collect();
@@ -1653,7 +1854,11 @@ mod tests {
         let grown = region.offset(1.0, false, 32);
         assert_eq!(grown.contours.len(), 1);
         assert_eq!(grown.contours[0].len(), 4);
-        assert!((grown.area() - 144.0).abs() < 1.0e-9, "got {}", grown.area());
+        assert!(
+            (grown.area() - 144.0).abs() < 1.0e-9,
+            "got {}",
+            grown.area()
+        );
         let (minimum, maximum) = grown.bounds().unwrap();
         assert!((minimum[0] + 1.0).abs() < 1.0e-9);
         assert!((minimum[1] + 1.0).abs() < 1.0e-9);
@@ -1667,7 +1872,11 @@ mod tests {
         let shrunk = region.offset(-1.0, false, 32);
         assert_eq!(shrunk.contours.len(), 1);
         assert_eq!(shrunk.contours[0].len(), 4);
-        assert!((shrunk.area() - 64.0).abs() < 1.0e-9, "got {}", shrunk.area());
+        assert!(
+            (shrunk.area() - 64.0).abs() < 1.0e-9,
+            "got {}",
+            shrunk.area()
+        );
         let (minimum, maximum) = shrunk.bounds().unwrap();
         assert!((minimum[0] - 1.0).abs() < 1.0e-9);
         assert!((maximum[0] - 9.0).abs() < 1.0e-9);
@@ -1765,8 +1974,65 @@ mod tests {
         let grown = region.offset(1.0, false, 32);
         assert_eq!(grown.contours.len(), 2);
         // Outer grows to 22x22, hole shrinks to 2x2.
-        assert!((grown.area() - (484.0 - 4.0)).abs() < 1.0e-9, "got {}", grown.area());
+        assert!(
+            (grown.area() - (484.0 - 4.0)).abs() < 1.0e-9,
+            "got {}",
+            grown.area()
+        );
         assert!(signed_area(&grown.contours[1]) < 0.0, "hole stays CW");
+    }
+
+    /// A zero-width spur is what a merged face's boundary trace leaves behind
+    /// where the face touches a neighbour along a line rather than across an
+    /// area. It cannot be triangulated and it encloses nothing, so it is
+    /// pruned — and the face it was attached to comes out whole.
+    #[test]
+    fn a_zero_width_spur_is_pruned_and_the_face_survives() {
+        // A triangle with an antenna poking out of one corner and back.
+        let ring = vec![
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [10.0, 10.0],
+            [14.0, 10.0],
+            [10.0, 10.0],
+        ];
+        let triangles = triangulate_with_holes(&ring, &[]);
+        assert!(
+            (total_area(&triangles) - 50.0).abs() < 1.0e-9,
+            "the triangle's own area, and nothing from the spur: {}",
+            total_area(&triangles)
+        );
+        assert!(
+            !triangles.iter().any(|triangle| triangle
+                .iter()
+                .any(|point| same_point(*point, [14.0, 10.0]))),
+            "the spur's tip must not survive into the triangulation"
+        );
+    }
+
+    /// Antennae nest: pruning one tip can expose the one behind it.
+    #[test]
+    fn a_spur_several_vertices_deep_is_pruned_all_the_way_back() {
+        let mut contour = vec![
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [10.0, 10.0],
+            [14.0, 10.0],
+            [18.0, 12.0],
+            [14.0, 10.0],
+            [10.0, 10.0],
+        ];
+        prune_spurs(&mut contour);
+        assert_eq!(contour.len(), 3, "left {contour:?}");
+        assert!((signed_area(&contour).abs() - 50.0).abs() < 1.0e-9);
+    }
+
+    /// A ring that is nothing but a spur has no face in it at all, and must
+    /// come back empty rather than as a sliver.
+    #[test]
+    fn a_ring_that_is_only_a_spur_produces_nothing() {
+        let ring = vec![[0.0, 0.0], [10.0, 0.0], [0.0, 0.0], [10.0, 0.0]];
+        assert!(triangulate_with_holes(&ring, &[]).is_empty());
     }
 
     /// A ring with a vertex exactly mid-edge — the shape the T-junction repair
@@ -1838,8 +2104,7 @@ mod tests {
     /// area and a torn mesh.
     fn assert_conforming(outer: &[Point2], holes: &[Vec<Point2>]) -> usize {
         let triangles = triangulate_with_holes(outer, holes);
-        let expected =
-            signed_area(outer) + holes.iter().map(|hole| signed_area(hole)).sum::<f64>();
+        let expected = signed_area(outer) + holes.iter().map(|hole| signed_area(hole)).sum::<f64>();
         let produced = total_area(&triangles);
         assert!(
             (produced - expected).abs() < 1.0e-9,

@@ -13,7 +13,10 @@ Then open <http://127.0.0.1:5173>.
 
 The backend contains its own lexer, parser, expression evaluator, module and
 loop expansion, implicit CSG scene evaluator, marching-tetrahedra mesher, and
-STL/OFF/OBJ/3MF writers, including a stored-entry ZIP/OPC packer for 3MF.
+STL/OFF/OBJ/3MF writers, including a stored-entry ZIP/OPC packer for 3MF. It
+also carries its own single-stroke font, because `text()` has to draw with
+something and this service has no font files — see `backend/src/engine/font.rs`
+for why that is a deliberate difference from OpenSCAD rather than a gap.
 
 ## Dependencies
 
@@ -91,8 +94,10 @@ Run instance billable for as long as any browser tab is open.
 | Safe with >1 instance | **no** | yes |
 | Retention | prune on write | sweeper thread, every 10 min |
 
-Both enforce the same limits (14-day idle TTL, 512 workspaces, 64 edit events
-per workspace) and present the same API; the schema is documented in
+Both enforce the same limits (512 workspaces, 64 edit events per workspace) and
+present the same API. Nothing expires on a clock: a workspace URL is the only
+handle anyone has on their work, so age alone never takes one away — a
+workspace goes only when the store is full, least recently touched first. the schema is documented in
 `backend/sql/schema.sql` and applied automatically at startup. The 512-workspace
 cap bounds one developer's directory on disk, but is global and evicts other
 users' work in a shared database — raise `REOPENSCAD_MAX_WORKSPACES` before

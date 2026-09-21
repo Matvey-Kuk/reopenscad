@@ -1,0 +1,105 @@
+{
+  "note": "Kick-start models shown above an empty editor. Each entry has <slug>.scad next to this file and <slug>.png, a preview rendered by ReOpenSCAD's own viewer. Kept in step with the directory by web/tests/examples.test.mjs.",
+  "categories": [
+    {
+      "id": "mounts",
+      "name": "Mounts and brackets",
+      "blurb": "Parts that hold something else still.",
+      "examples": [
+        {
+          "slug": "vesa-adapter-plate",
+          "name": "VESA adapter plate",
+          "blurb": "Ribbed 75-to-100 mm plate for a monitor arm.",
+          "hint": "difference() · linear_extrude()"
+        },
+        {
+          "slug": "desk-headphone-hook",
+          "name": "Desk headphone hook",
+          "blurb": "Screws under a desk edge; teardrop bores need no support.",
+          "hint": "polygon() · linear_extrude()"
+        },
+        {
+          "slug": "pegboard-driver-rack",
+          "name": "Pegboard driver rack",
+          "blurb": "Four sockets on a standard 25.4 mm pegboard pitch.",
+          "hint": "for() · difference()"
+        }
+      ]
+    },
+    {
+      "id": "threads",
+      "name": "Threads",
+      "blurb": "Real helical threads, swept by twisting a profile.",
+      "examples": [
+        {
+          "slug": "screw-top-jar",
+          "name": "Screw-top jar",
+          "blurb": "Jar and lid on a coarse trapezoidal thread.",
+          "hint": "linear_extrude(twist=)"
+        },
+        {
+          "slug": "trapezoid-bolt-and-nut",
+          "name": "Bolt and nut",
+          "blurb": "M12-scale bolt with a matching hex nut.",
+          "hint": "intersection() · twist"
+        },
+        {
+          "slug": "threaded-bottle-spout",
+          "name": "Bottle spout",
+          "blurb": "Screw-on pouring spout and its matching neck.",
+          "hint": "difference() · twist"
+        }
+      ]
+    },
+    {
+      "id": "hinges",
+      "name": "Boxes with hinges",
+      "blurb": "Printed-in-place knuckle hinges, printed open.",
+      "examples": [
+        {
+          "slug": "hinged-utility-chest",
+          "name": "Utility chest",
+          "blurb": "Divided chest with a bevelled lid and cord closure.",
+          "hint": "intersection() · for()"
+        },
+        {
+          "slug": "hinged-pen-case",
+          "name": "Pen case",
+          "blurb": "Long case with a spring-button detent latch.",
+          "hint": "intersection() · polygon()"
+        },
+        {
+          "slug": "hinged-magnetic-octagon",
+          "name": "Octagonal box",
+          "blurb": "Trinket box closed by four 6 x 2 mm magnets.",
+          "hint": "intersection() · polygon()"
+        }
+      ]
+    },
+    {
+      "id": "text",
+      "name": "Lettering",
+      "blurb": "text() draws with this engine's own built-in font.",
+      "examples": [
+        {
+          "slug": "raised-nameplate",
+          "name": "Nameplate",
+          "blurb": "Chamfered plate with raised letters and screw holes.",
+          "hint": "text() · linear_extrude()"
+        },
+        {
+          "slug": "workshop-door-sign",
+          "name": "Door sign",
+          "blurb": "Two lines of raised type on a hanging plate.",
+          "hint": "text() · offset()"
+        },
+        {
+          "slug": "herb-label-stake",
+          "name": "Herb label",
+          "blurb": "Garden stake with the plant name across the head.",
+          "hint": "text() · polygon()"
+        }
+      ]
+    }
+  ]
+}

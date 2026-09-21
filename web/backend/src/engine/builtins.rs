@@ -266,8 +266,7 @@ fn stringify(arguments: &[Value]) -> BuiltinResult {
 
 fn value_string(value: &Value) -> String {
     match value {
-        Value::Number(value) if value.fract() == 0.0 => format!("{value:.0}"),
-        Value::Number(value) => value.to_string(),
+        Value::Number(value) => super::format_openscad_number(*value),
         Value::Bool(value) => value.to_string(),
         Value::String(value) => value.clone(),
         Value::Vector(values) => format!(
@@ -278,7 +277,12 @@ fn value_string(value: &Value) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        Value::Range { start, step, end } => format!("[{start}:{step}:{end}]"),
+        Value::Range { start, step, end } => format!(
+            "[{}:{}:{}]",
+            super::format_openscad_number(*start),
+            super::format_openscad_number(*step),
+            super::format_openscad_number(*end)
+        ),
         Value::Undefined => "undef".into(),
         Value::Function(_) => "function".into(),
     }

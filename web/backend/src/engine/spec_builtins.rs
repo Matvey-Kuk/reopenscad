@@ -55,6 +55,57 @@ fn assert_program_produces_geometry(source: &str) -> CompileOutput {
     output
 }
 
+/// `str()` and `echo` print six significant digits, not Rust's shortest
+/// round-trip. This reaches geometry through `text(str(x))`, so it is a
+/// dimension change rather than a cosmetic one.
+#[test]
+fn str_prints_six_significant_digits() {
+    let cases = [
+        ("str(1 / 3)", "0.333333"),
+        ("str(2.718281828459045)", "2.71828"),
+        ("str(0.1 + 0.2)", "0.3"),
+        // Past six digits before the point, and past five leading zeroes
+        // after it, the reference switches to an exponent with a signed
+        // exponent field.
+        ("str(3628800)", "3.6288e+6"),
+        ("str(100000)", "100000"),
+        ("str(1000000)", "1e+6"),
+        ("str(12345.6789)", "12345.7"),
+        ("str(1e11)", "1e+11"),
+        ("str(0.00001)", "0.00001"),
+        ("str(0.000001)", "1e-6"),
+        ("str(1e-10)", "1e-10"),
+        // Trailing zeroes are trimmed, and so is a point left bare by the
+        // trimming, so a whole number prints without one.
+        ("str(5)", "5"),
+        ("str(-3)", "-3"),
+        ("str(1.5)", "1.5"),
+        ("str(0)", "0"),
+        ("str(-0)", "0"),
+        ("str(1 / 0)", "inf"),
+        ("str(-1 / 0)", "-inf"),
+        ("str(0 / 0)", "nan"),
+        ("str([1, 2])", "[1, 2]"),
+        ("len(str(1 / 3))", "8"),
+    ];
+    for (expression, expected) in cases {
+        let actual = eval(expression)
+            .unwrap_or_else(|error| panic!("{expression} should evaluate: {error}"));
+        let Value::String(actual) = &actual else {
+            let Value::Number(number) = actual else {
+                panic!("{expression} should produce a string or number, got {actual:?}");
+            };
+            assert_eq!(
+                number.to_string(),
+                expected,
+                "{expression} should be {expected}"
+            );
+            continue;
+        };
+        assert_eq!(actual, expected, "{expression} should be {expected:?}");
+    }
+}
+
 #[test]
 fn math_builtins_match_openscad_2021_01() {
     let cases = [

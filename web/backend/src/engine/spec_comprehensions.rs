@@ -173,7 +173,7 @@ fn malformed_generators_are_rejected_during_parsing() {
     assert!(eval("[for (i = undef) i]")
         .unwrap_err()
         .to_string()
-        .contains("range or vector"));
+        .contains("range, vector, or string"));
 
     let deeply_nested = format!("[{}0]", "for (i = [0]) ".repeat(140));
     assert!(eval(&deeply_nested)

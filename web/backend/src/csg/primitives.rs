@@ -238,7 +238,10 @@ pub fn square(size: [f64; 2], center: bool) -> Region2d {
         return Region2d::default();
     }
     let (min, max) = if center {
-        ([-size[0] / 2.0, -size[1] / 2.0], [size[0] / 2.0, size[1] / 2.0])
+        (
+            [-size[0] / 2.0, -size[1] / 2.0],
+            [size[0] / 2.0, size[1] / 2.0],
+        )
     } else {
         ([0.0, 0.0], [size[0], size[1]])
     };
@@ -374,13 +377,68 @@ pub fn linear_extrude(
             let upper = level(contour, step + 1);
             for index in 0..contour.len() {
                 let next = (index + 1) % contour.len();
-                faces.push(vec![lower[index], lower[next], upper[next], upper[index]]);
+                push_wall(
+                    &mut faces,
+                    [lower[index], lower[next], upper[next], upper[index]],
+                );
             }
         }
     }
 
     Solid::from_faces(faces)
 }
+
+/// Pushes one wall panel, splitting it when its four corners do not share a
+/// plane.
+///
+/// A swept wall is a quadrilateral only by accident. Twist a profile, taper it,
+/// or revolve one whose two ends sit at different radii *and* different
+/// heights, and the panel's corners stop being coplanar — by a fraction of a
+/// millimetre, which is exactly enough to matter. Every polygon in this kernel
+/// carries a plane, booleans decide "inside" by classifying points against
+/// those planes, and a plane fitted to four points that do not share one is
+/// wrong everywhere except at the fit. The result is a solid that looks right
+/// and tears the moment anything is subtracted from it: a helical thread built
+/// this way came out of the kernel with 47000 unpaired edges.
+///
+/// Two triangles are always exactly planar, so a non-planar panel is split
+/// along its shorter diagonal — the one that leaves the better-conditioned
+/// pair, and the one a well-behaved mesher would pick.
+fn push_wall(faces: &mut Vec<Vec<Vec3>>, corners: [Vec3; 4]) {
+    let [a, b, c, d] = corners;
+    // Distance of the fourth corner from the plane of the first three, relative
+    // to the panel's own size, so the test means the same thing on a 0.1 mm
+    // thread crest and a 300 mm wall.
+    let normal = b.sub(a).cross(c.sub(a));
+    let scale = normal.length();
+    let out_of_plane = if scale > 0.0 {
+        normal.dot(d.sub(a)).abs() / scale
+    } else {
+        0.0
+    };
+    let extent = b.sub(a).length().max(c.sub(b).length()).max(1.0);
+    if scale > 0.0 && out_of_plane <= extent * PLANAR_WALL_TOLERANCE {
+        faces.push(vec![a, b, c, d]);
+        return;
+    }
+    if a.sub(c).length() <= b.sub(d).length() {
+        faces.push(vec![a, b, c]);
+        faces.push(vec![a, c, d]);
+    } else {
+        faces.push(vec![a, b, d]);
+        faces.push(vec![b, c, d]);
+    }
+}
+
+/// How far a wall panel's fourth corner may sit from the plane of the other
+/// three, as a fraction of the panel's own edge length, before it is split.
+///
+/// Tight enough that a genuinely curved panel is always split, loose enough
+/// that a flat one built by floating-point rotation is not — an untwisted
+/// extrusion's walls are exactly planar in exact arithmetic and a few ulps out
+/// in practice, and splitting those would change the facet set of every
+/// straight-sided model in the corpus for no benefit.
+const PLANAR_WALL_TOLERANCE: f64 = 1.0e-12;
 
 /// `rotate_extrude(angle)` of a 2D region living in the XZ half-plane `x >= 0`.
 pub fn rotate_extrude(region: &Region2d, angle: f64, fragments: usize) -> Solid {
@@ -415,12 +473,15 @@ pub fn rotate_extrude(region: &Region2d, angle: f64, fragments: usize) -> Solid 
                 let next = (index + 1) % contour.len();
                 // (u, v, theta) is a left-handed frame, so the profile order
                 // has to be reversed for the walls to face outward.
-                faces.push(vec![
-                    place(contour[index], next_step),
-                    place(contour[next], next_step),
-                    place(contour[next], step),
-                    place(contour[index], step),
-                ]);
+                push_wall(
+                    &mut faces,
+                    [
+                        place(contour[index], next_step),
+                        place(contour[next], next_step),
+                        place(contour[next], step),
+                        place(contour[index], step),
+                    ],
+                );
             }
         }
     }
@@ -518,31 +579,49 @@ pub fn minkowski(left: &Solid, right: &Solid) -> Result<Solid, String> {
 }
 
 /// `resize(newsize, auto)`.
+///
+/// The transform is a plain scaling about the origin, not about the child's
+/// own box: `resize()` in OpenSCAD moves a part that is not already centred.
 pub fn resize(solid: &Solid, newsize: Vec3, auto: [bool; 3]) -> Solid {
     let Some(bounds) = solid.bounds() else {
         return solid.clone();
     };
-    let size = bounds.size();
+    solid.transformed(Matrix4::scaling(resize_factors(
+        bounds.size(),
+        newsize,
+        auto,
+    )))
+}
+
+/// The per-axis scale factors `resize(newsize, auto)` applies to a body of
+/// extent `size`.
+///
+/// A zero (or negative) component means "leave that axis alone", and an `auto`
+/// axis without a size of its own copies the factor of the axis with the
+/// *largest requested* size — not the first one given, which is what
+/// `resize([0, 5, 20], auto = true)` distinguishes.
+pub fn resize_factors(size: Vec3, newsize: Vec3, auto: [bool; 3]) -> Vec3 {
     let mut factors = [1.0f64; 3];
-    for axis in 0..3 {
+    for (axis, factor) in factors.iter_mut().enumerate() {
         let target = newsize.component(axis);
         let current = size.component(axis);
         if target > 0.0 && current > 0.0 {
-            factors[axis] = target / current;
+            *factor = target / current;
         }
     }
-    // `auto` axes copy the first explicitly resized axis's factor.
-    let explicit = (0..3).find(|axis| newsize.component(*axis) > 0.0);
-    if let Some(explicit) = explicit {
-        for axis in 0..3 {
-            if newsize.component(axis) <= 0.0 && auto[axis] {
-                factors[axis] = factors[explicit];
-            }
+    let largest = (0..3).fold(0, |largest, axis| {
+        if newsize.component(axis) > newsize.component(largest) {
+            axis
+        } else {
+            largest
+        }
+    });
+    for axis in 0..3 {
+        if auto[axis] && newsize.component(axis) <= 0.0 {
+            factors[axis] = factors[largest];
         }
     }
-    solid.transformed(Matrix4::scaling(Vec3::new(
-        factors[0], factors[1], factors[2],
-    )))
+    Vec3::new(factors[0], factors[1], factors[2])
 }
 
 #[cfg(test)]
@@ -683,23 +762,26 @@ mod tests {
             Vec3::new(0.0, 0.0, 1.0),
         ];
         // OpenSCAD lists faces clockwise seen from outside.
-        let faces = vec![
-            vec![0, 1, 2],
-            vec![0, 2, 3],
-            vec![0, 3, 1],
-            vec![1, 3, 2],
-        ];
+        let faces = vec![vec![0, 1, 2], vec![0, 2, 3], vec![0, 3, 1], vec![1, 3, 2]];
         let solid = polyhedron(&points, &faces).unwrap();
         let mesh = solid.to_indexed_mesh();
         assert_eq!(mesh.triangles.len(), 4);
         assert_eq!(mesh.vertices.len(), 4);
         assert!(mesh.is_manifold());
-        assert!((mesh.volume() - 1.0 / 6.0).abs() < 1e-12, "{}", mesh.volume());
+        assert!(
+            (mesh.volume() - 1.0 / 6.0).abs() < 1e-12,
+            "{}",
+            mesh.volume()
+        );
     }
 
     #[test]
     fn polyhedron_rejects_a_bad_index() {
-        let points = [Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0)];
+        let points = [
+            Vec3::ZERO,
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ];
         assert!(polyhedron(&points, &[vec![0, 1, 9]]).is_err());
     }
 
@@ -762,6 +844,10 @@ mod tests {
         // Pappus: volume = 2*pi*centroid_radius*area, approached from below by
         // the faceted approximation.
         let exact = 2.0 * std::f64::consts::PI * 11.0 * 4.0;
-        assert!((mesh.volume() - exact).abs() / exact < 1e-2, "{}", mesh.volume());
+        assert!(
+            (mesh.volume() - exact).abs() / exact < 1e-2,
+            "{}",
+            mesh.volume()
+        );
     }
 }

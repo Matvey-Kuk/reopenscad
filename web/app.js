@@ -1,71 +1,191 @@
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
-const examples = {
-  starter: `// Parametric socket — edit values in the Customizer
-$fn = 72;
-outer_radius = 24; // [16:1:36]
-wall = 3;          // [1:0.5:7]
-height = 38;       // [18:1:60]
-teeth = 12;        // [6:1:20]
+// Kick-start models. The catalogue lives in `examples/manifest.json` next to
+// the `.scad` sources and their preview renders, rather than inline here: the
+// sources are real files that the test suite compiles and the OpenSCAD binary
+// checks, which a string literal in a bundle could never be.
+// Absolute, because the app is served at `/workspaces/<id>` as well as at
+// `/`, and a relative path would look for the catalogue inside the
+// workspace route.
+const EXAMPLES_BASE = '/examples/';
+let exampleCatalogue = null;
+let exampleCataloguePromise = null;
 
-module grip(r, h, count) {
-  for (a = [0 : 360 / count : 359])
-    rotate([0, 0, a])
-      translate([r, 0, h * 0.48])
-        cube([2.4, 4.2, h * 0.72], center = true);
+// --- Recently visited workspaces ------------------------------------------
+//
+// The workspace URL is the only handle anyone has on their work, and nothing in
+// the app used to remember it: close the tab without bookmarking and the model
+// was gone, still on the server and permanently unreachable. This is the
+// address book — kept in localStorage, because it is a property of this browser
+// and not of any workspace, and because a list of everything someone has opened
+// is exactly the sort of thing that should not live on a server that has no
+// accounts and no way to say who is asking.
+const RECENTS_STORAGE_KEY = 'reopenscad.recentWorkspaces';
+// Enough to cover "the thing I had open last week", short enough that the list
+// stays a list rather than a filing system.
+const RECENTS_LIMIT = 12;
+
+function readRecents() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(RECENTS_STORAGE_KEY) || '[]');
+    if (!Array.isArray(stored)) return [];
+    return stored
+      .filter((entry) => entry && typeof entry.id === 'string' && entry.id)
+      .map((entry) => ({ id: entry.id, visitedAt: Number(entry.visitedAt) || 0 }));
+  } catch {
+    return [];
+  }
 }
 
-difference() {
-  union() {
-    cylinder(h = height, r = outer_radius);
-    grip(outer_radius, height, teeth);
+function writeRecents(entries) {
+  try {
+    localStorage.setItem(RECENTS_STORAGE_KEY, JSON.stringify(entries.slice(0, RECENTS_LIMIT)));
+  } catch {
+    // A full or blocked store costs the user their history, not their work.
   }
-  translate([0, 0, wall])
-    cylinder(h = height + 1, r = outer_radius - wall);
-  translate([0, 0, -1])
-    cylinder(h = wall + 2, r = outer_radius * 0.38, $fn = 6);
-}`,
-  csg: `// Constructive solid geometry study
-$fn = 56;
-difference() {
-  union() {
-    cube([46, 46, 8], center = true);
-    cylinder(h = 32, r1 = 17, r2 = 12, center = true);
+}
+
+// Most recent first, which is the order the list is shown in and therefore the
+// order it is stored in — no sort at render time, and no clock read either.
+function rememberWorkspace(id) {
+  if (!id) return;
+  const rest = readRecents().filter((entry) => entry.id !== id);
+  writeRecents([{ id, visitedAt: Date.now() }, ...rest]);
+}
+
+// Asked in the page rather than through a native browser dialog, for the same
+// reason the source-conflict resolver is: a native one blocks the whole tab,
+// looks like it came from somewhere else, and cannot say the thing that
+// matters here — that the workspace itself survives. The wording is the
+// safeguard, so it gets room to be read.
+let pendingForget = null;
+
+function closeForgetPrompt() {
+  pendingForget = null;
+  // `getElementById`, not `$`, because this element is created here rather than
+  // declared in the shell — the same reason the conflict resolver does it.
+  document.getElementById('recentForgetPrompt')?.remove();
+}
+
+function forgetRecentWorkspace(id, anchor) {
+  if (pendingForget === id) {
+    closeForgetPrompt();
+    return;
   }
-  for (a = [0 : 90 : 270])
-    rotate([0, 0, a]) translate([13, 0, 0])
-      cylinder(h = 50, r = 3.2, center = true);
-  sphere(r = 9);
-}`,
-  extrude: `// Orbital lattice — native modules, loops and transforms
-count = 9;
-orbit = 22;
+  closeForgetPrompt();
+  pendingForget = id;
+  const prompt = document.createElement('div');
+  prompt.id = 'recentForgetPrompt';
+  prompt.className = 'forget-prompt';
+  prompt.setAttribute('role', 'dialog');
+  prompt.setAttribute('aria-label', 'Remove workspace from the list');
+  prompt.innerHTML = '<p>Remove workspace from the list? It will still be available '
+    + 'via a direct link.</p><div><button type="button" data-forget-confirm>Remove</button>'
+    + '<button type="button" data-forget-cancel>Cancel</button></div>';
+  document.body.append(prompt);
+  const rect = anchor.getBoundingClientRect();
+  prompt.style.top = `${rect.bottom + 6}px`;
+  prompt.style.left = `${Math.max(12, Math.min(rect.right - 210, innerWidth - 222))}px`;
+  prompt.querySelector('[data-forget-cancel]').addEventListener('click', closeForgetPrompt);
+  prompt.querySelector('[data-forget-confirm]').addEventListener('click', () => {
+    writeRecents(readRecents().filter((entry) => entry.id !== id));
+    closeForgetPrompt();
+    renderRecents();
+  });
+  prompt.querySelector('[data-forget-confirm]').focus();
+}
 
-union() {
-  cylinder(h = 5, r = 10, center = true);
-  for (a = [0 : 360 / count : 359])
-    rotate([0, 0, a])
-      translate([orbit, 0, 0])
-        sphere(r = 4.8);
-}`,
-  text: `// Intersected core
-intersection() {
-  sphere(r = 26);
-  rotate([18, 28, 42])
-    cube([38, 38, 38], center = true);
-  rotate([-18, 32, -28])
-    cube([42, 32, 42], center = true);
-}`,
-};
+// Anywhere else, and Escape, dismisses it — a prompt nobody answered must not
+// outlive the thing it is asking about.
+document.addEventListener('mousedown', (event) => {
+  if (!pendingForget) return;
+  if (event.target.closest('#recentForgetPrompt, [data-forget]')) return;
+  closeForgetPrompt();
+});
+document.addEventListener('keydown', (event) => {
+  if (pendingForget && event.key === 'Escape') closeForgetPrompt();
+});
 
-// Kick-start options shown above an empty editor instead of a toolbar example dropdown.
-const kickstartOptions = [
-  { key: 'starter', name: 'Parametric socket', blurb: 'Modules, loops and Customizer ranges.', hint: 'difference() · cylinder()' },
-  { key: 'csg', name: 'CSG study', blurb: 'Boolean solids carved by radial cuts.', hint: 'union() · sphere()' },
-  { key: 'extrude', name: 'Orbital lattice', blurb: 'A hub ringed by transformed copies.', hint: 'for() · rotate()' },
-  { key: 'text', name: 'Intersected core', blurb: 'Three volumes reduced to their overlap.', hint: 'intersection() · cube()' },
-];
+// --- Render thumbnails -----------------------------------------------------
+//
+// Drawn here rather than on the server because the only thing that can produce
+// one is a WebGL context with the model already on screen. Uploaded after a
+// render settles, and only when the source has actually changed since the last
+// upload: without that guard every preview re-render — one per keystroke, after
+// the debounce — would post a fresh image for geometry nobody altered.
+const PREVIEW_WIDTH = 320;
+let lastPreviewUpload = { id: null, code: null };
+
+function captureViewportPreview() {
+  if (!hasMesh) return null;
+  const source = renderCanvas;
+  if (!source.width || !source.height) return null;
+  const scale = Math.min(1, PREVIEW_WIDTH / source.width);
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(source.width * scale));
+  canvas.height = Math.max(1, Math.round(source.height * scale));
+  const context = canvas.getContext('2d');
+  if (!context) return null;
+  // The viewport is drawn on transparency; JPEG has no alpha, so without a
+  // ground the model would be composited onto black. Paint the panel colour
+  // first so a thumbnail looks like the app it came from.
+  context.fillStyle = '#151a21';
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(source, 0, 0, canvas.width, canvas.height);
+  // 0.72 keeps a 320-wide render near 8 KB. The server caps the stored string,
+  // and a thumbnail that gets refused is not worth retrying at lower quality.
+  return canvas.toDataURL('image/jpeg', 0.72);
+}
+
+async function uploadWorkspacePreview() {
+  if (!workspaceId || !workspaceOnline) return;
+  // A render is the strongest evidence a workspace is worth remembering, and
+  // it is what promotes one that was empty when it loaded. Ahead of the
+  // unchanged-source check below, so re-rendering also freshens its place in
+  // the list.
+  rememberWorkspace(workspaceId);
+  const code = editor.value;
+  if (lastPreviewUpload.id === workspaceId && lastPreviewUpload.code === code) return;
+  const preview = captureViewportPreview();
+  if (!preview) return;
+  // Claimed before the request rather than after, so a second render settling
+  // while this one is in flight does not post the same image twice.
+  lastPreviewUpload = { id: workspaceId, code };
+  try {
+    await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/preview`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ preview }),
+    });
+  } catch {
+    // A thumbnail is decoration. Losing one must never surface as an error
+    // beside the model it was taken of.
+    lastPreviewUpload = { id: null, code: null };
+  }
+}
+
+function loadCatalogue() {
+  if (exampleCataloguePromise) return exampleCataloguePromise;
+  exampleCataloguePromise = fetch(`${EXAMPLES_BASE}manifest.json`)
+    .then((response) => {
+      if (!response.ok) throw new Error(`manifest ${response.status}`);
+      return response.json();
+    })
+    .then((manifest) => {
+      exampleCatalogue = manifest;
+      return manifest;
+    })
+    .catch(() => {
+      // A missing catalogue is a deployment problem, not the user's: the empty
+      // workspace still works, it just has nothing to offer. Reported in the
+      // panel itself by renderKickstart, and deliberately not through
+      // `console.*` — see the note on `log`.
+      exampleCatalogue = null;
+      return null;
+    });
+  return exampleCataloguePromise;
+}
 
 const icons = {
   new: '<svg viewBox="0 0 24 24"><path d="M6 3.5h8l4 4V21H6z"/><path d="M14 3.5v4h4M9 13h6M12 10v6"/></svg>',
@@ -82,6 +202,7 @@ const icons = {
   agent: '<svg viewBox="0 0 24 24"><rect x="4" y="8" width="16" height="11" rx="2.5"/><path d="M12 4.5V8M9.5 13v1.6M14.5 13v1.6M2.5 12v3M21.5 12v3"/><circle cx="12" cy="3.4" r="1.3"/></svg>',
   sliders: '<svg viewBox="0 0 24 24"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h10M18 18h2"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="16" cy="18" r="2"/></svg>',
   fit: '<svg viewBox="0 0 24 24"><path d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5"/></svg>',
+  share: '<svg viewBox="0 0 24 24"><circle cx="18" cy="5.5" r="2.6"/><circle cx="6" cy="12" r="2.6"/><circle cx="18" cy="18.5" r="2.6"/><path d="M8.3 10.8 15.7 6.7M8.3 13.2l7.4 4.1"/></svg>',
   eye: '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M2.5 12S6 5.75 12 5.75 21.5 12 21.5 12 18 18.25 12 18.25 2.5 12 2.5 12Z"/><circle cx="12" cy="12" r="2.9"/></svg>',
   eyeOff: '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M10.2 6a9.9 9.9 0 0 1 1.8-.15c6 0 9.5 6.15 9.5 6.15a17.6 17.6 0 0 1-3.35 3.94M6.05 7.87A17.5 17.5 0 0 0 2.5 12s3.5 6.25 9.5 6.25a9.7 9.7 0 0 0 3.72-.72"/><path d="M9.9 9.98a2.95 2.95 0 0 0 4.14 4.15"/><path d="M3.6 3.6 20.4 20.4"/></svg>',
 };
@@ -155,6 +276,18 @@ let workspaceSaveController = null;
 let workspaceId = null;
 let workspaceRevision = 0;
 let workspaceOnline = false;
+// Set when the page is a `/shared/<token>` view. Declared here with the rest of
+// the workspace state rather than beside the code that uses it, because
+// `updateKickstart` reads it and is defined a thousand lines earlier — a `let`
+// below its first reader is a temporal-dead-zone trap waiting for someone to
+// move a call.
+//
+// A shared page has no workspace id, deliberately: that is what stops a
+// read-only link being an editable one with an extra step. The app runs
+// without one — no saving, no polling, and renders go to the stateless
+// `/api/render` with the source in the body, the same path a workspace that
+// could not reach the server already takes.
+let readOnlyToken = null;
 let workspaceGeneration = 0;
 let workspaceSavedCode = '';
 let workspaceHasLocalChanges = false;
@@ -401,6 +534,25 @@ class MeshViewport {
     gl.bindBuffer(gl.ARRAY_BUFFER, edgeBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, decoded.edges, gl.STATIC_DRAW);
     return { id, positionBuffer, normalBuffer, edgeBuffer, triangles: decoded.triangles, min: decoded.min, max: decoded.max };
+  }
+
+  // Drops every buffer and leaves the canvas empty.
+  //
+  // `hasMesh = false` alone only stops the *next* draw from being requested;
+  // the last frame stays on the canvas, so starting a new workspace left the
+  // previous model sitting behind the kick-start panel as though it were still
+  // loaded. Releasing the buffers and painting once is what actually clears it.
+  clearMesh() {
+    for (const batch of this.meshBatches) {
+      this.gl.deleteBuffer(batch.positionBuffer);
+      this.gl.deleteBuffer(batch.normalBuffer);
+      this.gl.deleteBuffer(batch.edgeBuffer);
+    }
+    this.meshBatches = [];
+    this.bounds = null;
+    this.center = [0, 0, 0];
+    this.radius = 1;
+    this.draw();
   }
 
   setMesh(encoded, objects = []) {
@@ -1032,6 +1184,15 @@ function hasPendingLocalWorkspaceChanges() {
 // workspace you came from), 'none' leaves history untouched (we are already on that URL).
 function setWorkspaceIdentity(id, navigation = nextWorkspaceNavigation) {
   nextWorkspaceNavigation = 'replace';
+  // Whatever the Share popover is showing belongs to the workspace being left.
+  // Closing it is the honest move: leaving it open would display one
+  // workspace's links under another's name, and a link is a credential.
+  if (id !== workspaceId) {
+    const popover = document.getElementById('sharePopover');
+    if (popover) popover.hidden = true;
+    shareTokenCache = { id: null, promise: null };
+    kickstartDismissed = false;
+  }
   workspaceId = id;
   $('#workspaceName').textContent = id;
   setDownloadBaseName(id);
@@ -1097,6 +1258,13 @@ function applyWorkspaceSettings(workspace) {
 
 function applyWorkspace(payload, { remote = false, force = false } = {}) {
   const workspace = workspaceFromPayload(payload);
+  // Into the address book — but only once there is something in it. Landing on
+  // "/" mints an empty workspace every time, and recording those would bury the
+  // user's actual work under a stack of blanks they never typed in. A workspace
+  // that gains content later is picked up by `uploadWorkspacePreview`.
+  if (!remote && workspace.id && (workspace.code || '').trim()) {
+    rememberWorkspace(workspace.id);
+  }
   const incomingRevision = Number(workspace.revision);
   let shouldRenderAiUpdate = false;
   if (remote && !force && typeof workspace.code === 'string' && workspace.code !== editor.value && hasPendingLocalWorkspaceChanges()) {
@@ -1162,6 +1330,7 @@ function normalizeUpdatedRanges(code, ranges) {
 // A brand new workspace starts genuinely empty so the kick-start options are what a first
 // visitor sees. `navigation` decides whether the previous workspace stays reachable via Back.
 async function createWorkspace(code = '', { navigation = 'replace' } = {}) {
+  leaveReadOnly();
   const generation = advanceWorkspaceGeneration();
   nextWorkspaceNavigation = navigation;
   setSyncState('Creating', 'saving');
@@ -1200,6 +1369,7 @@ async function createWorkspace(code = '', { navigation = 'replace' } = {}) {
 }
 
 async function loadWorkspace(id) {
+  leaveReadOnly();
   const generation = advanceWorkspaceGeneration();
   setWorkspaceIdentity(id, 'none');
   setSyncState('Loading', 'saving');
@@ -1798,6 +1968,12 @@ async function render(mode = 'preview') {
     renderTime.textContent = `${mode} · ${(data.elapsedMs / 1000).toFixed(2)} s`;
     $('#problemCount').textContent = '0';
     setStatus('Ready');
+    // After the frame is on screen and the status has settled, so the capture
+    // never lands in front of the user as a pause. Fire-and-forget: a
+    // thumbnail is decoration and must not hold up the render path.
+    requestAnimationFrame(() => {
+      uploadWorkspacePreview();
+    });
     return true;
   } catch (error) {
     if (error.name === 'AbortError' && request.timedOut) {
@@ -1962,38 +2138,137 @@ function updateCustomizer() {
   });
 }
 
-function loadExample(key) {
-  if (!examples[key]) return;
-  editor.value = examples[key];
+async function loadExample(slug) {
+  const card = $(`[data-example="${CSS.escape(slug)}"]`);
+  card?.setAttribute('aria-busy', 'true');
+  try {
+    const response = await fetch(`${EXAMPLES_BASE}${encodeURIComponent(slug)}.scad`);
+    if (!response.ok) throw new Error(`example ${response.status}`);
+    editor.value = await response.text();
+  } catch {
+    // The console pane is where every other failure is reported, so this one
+    // goes there too rather than into an alert the user has to dismiss.
+    log(`Could not open "${slug}". It may not be deployed with this build.`, 'error');
+    return;
+  } finally {
+    card?.removeAttribute('aria-busy');
+  }
   syncEditor();
   editor.focus();
-  editor.setSelectionRange(editor.value.length, editor.value.length);
+  editor.setSelectionRange(0, 0);
+  editor.scrollTop = 0;
   render('preview');
 }
 
-// The examples live above the edit field and only while it is empty — no toolbar dropdown.
-function renderKickstart() {
-  $('#kickstartGrid').innerHTML = kickstartOptions
-    .map((option) => `<button type="button" class="kickstart-card" role="listitem" data-example="${escapeAttribute(option.key)}"><b>${escapeHtml(option.name)}</b><small>${escapeHtml(option.blurb)}</small><code>${escapeHtml(option.hint)}</code></button>`)
+// The catalogue lives above the edit field and only while it is empty — no
+// toolbar dropdown. Grouped by what the model *is*, because eighteen cards in
+// one undifferentiated grid is a wall rather than a menu.
+// The recents group is rebuilt on its own, because it changes — a visit, a
+// removal — while the catalogue below it never does.
+function renderRecents() {
+  const host = $('#kickstartRecents');
+  const entries = readRecents();
+  // "New workspace" is always the first card, whether or not there is any
+  // history behind it — it is the one action an empty workspace always offers,
+  // and putting it in the grid rather than above it means there is one place
+  // to look instead of two.
+  const blank = '<button type="button" class="kickstart-card kickstart-new" role="listitem" '
+    + 'data-blank-editor aria-label="Blank workspace">'
+    + '<span class="kickstart-shot"><span class="kickstart-plus" aria-hidden="true">+</span></span>'
+    + '<b>Blank workspace</b><small>Start typing in an empty editor.</small></button>';
+  const cards = entries
+    .map((entry) => {
+      const id = escapeAttribute(entry.id);
+      // The ids are `adjective-animal-<hex>`. The two words are the half a
+      // person actually recognises — "the zippy zebra one" — so they are the
+      // card's title and the full id is the line underneath. No document name
+      // is involved: the workspace is the document.
+      const label = entry.id.split('-').slice(0, 2).join(' ') || entry.id;
+      return `<div class="kickstart-card kickstart-recent" role="listitem">`
+        + `<button type="button" class="kickstart-open" data-workspace="${id}">`
+        + `<span class="kickstart-shot" data-preview-for="${id}"></span>`
+        + `<b>${escapeHtml(label)}</b><small>${escapeHtml(entry.id)}</small></button>`
+        + `<button type="button" class="kickstart-forget" data-forget="${id}" `
+        + `aria-label="Remove ${escapeAttribute(label)} from the list" title="Remove from this list">&times;</button>`
+        + `</div>`;
+    })
     .join('');
+  const heading = entries.length
+    ? '<h3>Your workspaces</h3><p>Kept in this browser only. Removing one here does not delete it.</p>'
+    : '<h3>Your workspaces</h3><p>Nothing here yet.</p>';
+  host.innerHTML = `<section class="kickstart-group">${heading}`
+    + `<div class="kickstart-grid" role="list">${blank}${cards}</div></section>`;
+  // The preview route answers JSON rather than image bytes, so the thumbnails
+  // are fetched and set as `src` afterwards. A workspace that has never been
+  // rendered simply has none, and its box stays the empty placeholder.
+  for (const slot of $$('[data-preview-for]', host)) {
+    const id = slot.dataset.previewFor;
+    fetch(`/api/workspaces/${encodeURIComponent(id)}/preview`)
+      .then((response) => (response.ok ? response.json() : null))
+      .then((payload) => {
+        if (!payload?.preview || !slot.isConnected) return;
+        const image = document.createElement('img');
+        image.alt = '';
+        image.decoding = 'async';
+        image.src = payload.preview;
+        slot.append(image);
+      })
+      .catch(() => {});
+  }
 }
 
-// Dismissal is scoped to the workspace: choosing a blank editor here should not
-// hide the options forever, only in the workspace where the choice was made.
-function kickstartDismissedKey(id = workspaceId) {
-  return `reopenscad.kickstart.dismissed.${id || 'pending'}`;
+async function renderKickstart() {
+  renderRecents();
+  const grid = $('#kickstartGrid');
+  if (grid.dataset.rendered === '1') return;
+  const manifest = await loadCatalogue();
+  if (!manifest) {
+    grid.innerHTML = '<p class="kickstart-empty">The example catalogue is not available in this build.</p>';
+    grid.dataset.rendered = '1';
+    return;
+  }
+  grid.innerHTML = manifest.categories
+    .map((category) => {
+      const cards = category.examples
+        .map((example) => {
+          const slug = escapeAttribute(example.slug);
+          return `<button type="button" class="kickstart-card" role="listitem" data-example="${slug}">`
+            + `<span class="kickstart-shot"><img src="${EXAMPLES_BASE}${slug}.png" alt="" loading="lazy" decoding="async" onerror="this.dataset.failed='1'" /></span>`
+            + `<b>${escapeHtml(example.name)}</b>`
+            + `<small>${escapeHtml(example.blurb)}</small>`
+            + `<code>${escapeHtml(example.hint)}</code></button>`;
+        })
+        .join('');
+      return `<section class="kickstart-group"><h3>${escapeHtml(category.name)}</h3>`
+        + `<p>${escapeHtml(category.blurb)}</p>`
+        + `<div class="kickstart-grid" role="list">${cards}</div></section>`;
+    })
+    .join('');
+  grid.dataset.rendered = '1';
 }
+
+// Set by "Blank workspace", cleared whenever the workspace changes. In memory
+// rather than in storage on purpose: an empty workspace *should* offer help,
+// so coming back to one later starts the catalogue over. Dismissing it is a
+// statement about this sitting, not about the workspace.
+let kickstartDismissed = false;
 
 function updateKickstart() {
-  const dismissed = localStorage.getItem(kickstartDismissedKey()) === '1';
-  $('#kickstart').hidden = dismissed || editor.value.trim().length > 0;
+  const empty = editor.value.trim().length === 0;
+  // A read-only view never offers the catalogue. Every card in it either edits
+  // this editor or makes a workspace, and neither is a thing a reader came
+  // here to do — a shared blank model should just show the blank editor.
+  const hidden = !empty || kickstartDismissed || Boolean(readOnlyToken);
+  $('#kickstart').hidden = hidden;
+  // Built the first time it is actually shown, so a workspace that opens with
+  // code in it never pays for the manifest or the twelve preview requests.
+  if (!hidden) renderKickstart();
+  // An empty editor has nothing to preview, so the offer to preview it is a
+  // button that can only produce an error. The heading beside it still reads
+  // as an invitation, which is the right thing for an empty workspace to say.
+  $('#firstPreview').hidden = empty;
+  $('#emptyHint').hidden = empty;
 }
-
-$('#kickstartBlank').addEventListener('click', () => {
-  localStorage.setItem(kickstartDismissedKey(), '1');
-  updateKickstart();
-  editor.focus();
-});
 
 editor.addEventListener('input', () => {
   if (aiUpdatedRanges.length) {
@@ -2064,6 +2339,7 @@ $('#newButton').addEventListener('click', async () => {
   intersectionIds.clear();
   renderObjectList();
   hasMesh = false;
+  meshViewport.clearMesh();
   emptyState.hidden = false;
 });
 $('#fileInput').addEventListener('change', async (event) => {
@@ -2077,9 +2353,43 @@ $('#fileInput').addEventListener('change', async (event) => {
   log(`${file.name} opened.`, 'success');
   render('preview');
 });
-$('#kickstartGrid').addEventListener('click', (event) => {
+// Delegated from the panel, not from the catalogue: the recents list is a
+// sibling of it, and binding to the catalogue alone left every card in the
+// recents group inert.
+$('#kickstart').addEventListener('click', (event) => {
+  const remove = event.target.closest('[data-forget]');
+  if (remove) {
+    forgetRecentWorkspace(remove.dataset.forget, remove);
+    return;
+  }
+  if (event.target.closest('[data-blank-editor]')) {
+    // Not a new workspace: the catalogue is only ever on screen when this one
+    // is already empty, so minting a second empty workspace would change the
+    // URL and leave the screen looking identical — which is exactly what it
+    // used to do, and why clicking this appeared to do nothing at all.
+    kickstartDismissed = true;
+    updateKickstart();
+    editor.focus();
+    return;
+  }
+  const recent = event.target.closest('[data-workspace]');
+  if (recent) {
+    location.href = `/workspaces/${encodeURIComponent(recent.dataset.workspace)}`;
+    return;
+  }
   const card = event.target.closest('[data-example]');
   if (card) loadExample(card.dataset.example);
+});
+// The panel takes pointer events so that it can scroll — eighteen cards did not
+// fit, and a wheel over a `pointer-events: none` layer goes to the editor
+// underneath, which does not scroll either. Taking them back means a click on
+// the background no longer reaches the editor, so it is forwarded by hand: the
+// panel covers the edit field, and clicking it to start typing is the obvious
+// thing to try.
+$('#kickstart').addEventListener('mousedown', (event) => {
+  if (event.target.closest('button, a, [data-example], [data-workspace], [data-blank-editor]')) return;
+  event.preventDefault();
+  editor.focus();
 });
 
 $$('[data-projection]').forEach((button) => button.addEventListener('click', () => {
@@ -2258,7 +2568,16 @@ $('#viewport').addEventListener('wheel', (event) => {
 // Fusion that chord orbits, and a trackpad with no third button pans with Shift + wheel.
 // Orbit keeps the plain left drag, so no single press can ever mean both gestures.
 function isPanGesture(event) {
-  return (event.button === 1 && !event.shiftKey) || event.button === 2;
+  // Alt/Option + left drag pans. Measured against what was already here: every
+  // left-drag variant orbited, so the only way to pan was a middle or right
+  // button — and a laptop trackpad has neither, which left pan reachable only
+  // through Shift + wheel. Alt is the free modifier: Shift is already the
+  // orbit chord on the middle button (as it is in Fusion 360), and Cmd/Ctrl +
+  // click is a right-click on macOS, which would collide with the right-drag
+  // pan below.
+  return (event.button === 0 && event.altKey)
+    || (event.button === 1 && !event.shiftKey)
+    || event.button === 2;
 }
 
 renderCanvas.addEventListener('pointerdown', (event) => {
@@ -2352,6 +2671,101 @@ $('#exportPng').addEventListener('click', async () => {
 
 document.addEventListener('pointerdown', (event) => {
   if (!event.target.closest('#exportButton') && !event.target.closest('.export-popover')) exportPopover.hidden = true;
+});
+
+// --- Sharing ---------------------------------------------------------------
+//
+// Two links, and the difference between them is the whole feature. The one in
+// the address bar is a capability to *edit*: there is no login, so handing it
+// to somebody hands them write access. The read-only one is an independent
+// random token the server maps to this workspace in one direction only — a
+// holder of it cannot derive the editable link, which is what makes it safe to
+// paste somewhere the editable link would not be.
+const sharePopover = $('#sharePopover');
+// Keyed by workspace, because the cache outlives the workspace otherwise: open
+// Share, press New, open Share again, and the popover would hand out the
+// *previous* workspace's read-only link under the new workspace's name.
+let shareTokenCache = { id: null, promise: null };
+
+function workspaceEditUrl() {
+  return `${location.origin}/workspaces/${encodeURIComponent(workspaceId || '')}`;
+}
+
+async function ensureShareToken() {
+  // A workspace the server has not seen yet cannot be shared, and the first
+  // thing anyone does is type and immediately hit Share — so land the pending
+  // save before asking rather than reporting "unavailable" at them.
+  await flushWorkspaceSave();
+  if (!workspaceId || !workspaceOnline) return null;
+  const id = workspaceId;
+  if (shareTokenCache.id === id && shareTokenCache.promise) return shareTokenCache.promise;
+  const promise = fetch(`/api/workspaces/${encodeURIComponent(id)}/share`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+  })
+    .then((response) => (response.ok ? response.json() : null))
+    .then((payload) => payload?.shareToken || null)
+    .catch(() => null)
+    .then((token) => {
+      // Never cache a failure. The usual cause is a workspace that was still
+      // being created, which fixes itself a second later — remembering "no"
+      // would make one unlucky click permanent for the life of the page.
+      if (!token && shareTokenCache.id === id) shareTokenCache = { id: null, promise: null };
+      return token;
+    });
+  shareTokenCache = { id, promise };
+  return promise;
+}
+
+async function openSharePopover(anchor) {
+  const rect = anchor.getBoundingClientRect();
+  sharePopover.style.left = `${Math.max(12, Math.min(rect.right - 300, innerWidth - 312))}px`;
+  sharePopover.style.top = `${rect.bottom + 5}px`;
+  sharePopover.hidden = false;
+  $('#shareEditLink').value = workspaceEditUrl();
+  const view = $('#shareViewLink');
+  // Minted on first ask rather than at creation: most workspaces are never
+  // shared, and a capability that does not exist cannot leak.
+  view.value = '';
+  view.placeholder = 'Creating…';
+  const token = await ensureShareToken();
+  if (sharePopover.hidden) return;
+  if (token) {
+    view.value = `${location.origin}/shared/${token}`;
+  } else {
+    view.placeholder = 'Unavailable — this workspace is not saved on the server.';
+  }
+}
+
+$('#shareButton').addEventListener('click', (event) => {
+  if (!sharePopover.hidden) {
+    sharePopover.hidden = true;
+    return;
+  }
+  openSharePopover(event.currentTarget);
+});
+
+$$('[data-copy]', sharePopover).forEach((button) => button.addEventListener('click', async () => {
+  const field = document.getElementById(button.dataset.copy);
+  if (!field.value) return;
+  field.select();
+  try {
+    await navigator.clipboard.writeText(field.value);
+  } catch {
+    // Clipboard permission can be refused; the text is selected either way, so
+    // the manual copy is one keystroke rather than a dead end.
+    document.execCommand?.('copy');
+  }
+  const previous = button.textContent;
+  button.textContent = 'Copied';
+  setTimeout(() => { button.textContent = previous; }, 1400);
+}));
+
+document.addEventListener('pointerdown', (event) => {
+  if (!event.target.closest('#shareButton') && !event.target.closest('.share-popover')) {
+    sharePopover.hidden = true;
+  }
 });
 
 $('#objectList').addEventListener('click', (event) => {
@@ -3015,6 +3429,58 @@ window.addEventListener('keydown', (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'n') { event.preventDefault(); $('#newButton').click(); }
 });
 
+function shareTokenFromLocation() {
+  const match = location.pathname.match(/^\/shared\/([0-9a-f]{32})\/?$/);
+  return match ? match[1] : null;
+}
+
+async function loadSharedWorkspace(token) {
+  readOnlyToken = token;
+  advanceWorkspaceGeneration();
+  // No id, so nothing can save, poll, upload a preview or mint a share link.
+  workspaceId = null;
+  workspaceOnline = false;
+  document.body.classList.add('read-only');
+  $('#readonlyBanner').hidden = false;
+  editor.readOnly = true;
+  $('#shareButton').hidden = true;
+  setSyncState('Read only', 'local');
+  try {
+    const response = await fetch(`/api/shared/${encodeURIComponent(token)}`);
+    if (!response.ok) throw new Error(`shared ${response.status}`);
+    const payload = await response.json();
+    editor.value = typeof payload.code === 'string' ? payload.code : '';
+    syncEditor(false);
+    applyWorkspaceSettings(payload);
+    $('#workspaceName').textContent = 'Shared view';
+  } catch {
+    log('This read-only link is not valid. It may have been removed.', 'error');
+    setStatus('Ready');
+  }
+}
+
+// Every way out of a read-only view goes through here — the fork button, but
+// also New and Open, which are still live and would otherwise leave the banner
+// up over a workspace that is perfectly editable.
+function leaveReadOnly() {
+  if (!readOnlyToken) return;
+  readOnlyToken = null;
+  document.body.classList.remove('read-only');
+  $('#readonlyBanner').hidden = true;
+  editor.readOnly = false;
+  $('#shareButton').hidden = false;
+}
+
+// The way out a reader is offered: the same source in a workspace of their
+// own. Nothing is copied beyond what they can already see, so this needs no
+// permission they do not have.
+$('#forkWorkspace').addEventListener('click', async () => {
+  const code = editor.value;
+  leaveReadOnly();
+  await createWorkspace(code, { navigation: 'push' });
+  if (editor.value.trim()) render('preview');
+});
+
 function workspaceIdFromLocation() {
   const routeMatch = location.pathname.match(/^\/workspaces\/([^/]+)\/?$/);
   return routeMatch ? decodeURIComponent(routeMatch[1]) : new URLSearchParams(location.search).get('workspace');
@@ -3029,7 +3495,6 @@ async function bootstrap() {
   // Legacy unscoped cache: it belonged to whichever workspace was edited last, so visiting
   // "/" used to clone that source into a brand new workspace. Drop it for good.
   localStorage.removeItem('reopenscad.code');
-  renderKickstart();
   populatePlateSelect();
   restoreTolerance();
   restoreAgentButtonNudge();
@@ -3040,7 +3505,9 @@ async function bootstrap() {
   editor.value = '';
   syncEditor(false);
   checkEngine();
-  if (requestedId) await loadWorkspace(requestedId);
+  const sharedToken = shareTokenFromLocation();
+  if (sharedToken) await loadSharedWorkspace(sharedToken);
+  else if (requestedId) await loadWorkspace(requestedId);
   else await createWorkspace('');
   if (editor.value.trim()) setTimeout(() => render('preview'), 180);
 }

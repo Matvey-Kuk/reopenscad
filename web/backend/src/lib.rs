@@ -6,5 +6,7 @@
 
 pub mod csg;
 pub mod engine;
+pub mod gltf;
 pub mod mcpapp;
+pub mod step;
 pub mod threemf;

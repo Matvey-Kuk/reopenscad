@@ -38,7 +38,6 @@ use crate::{
     default_workspace_name, normalize_source, sanitize_name, sanitize_plate, sanitize_tolerance,
     unix_millis, valid_workspace_id, validate_source, EditResult, UpdateError, Workspace,
     WorkspaceEvent, WorkspaceUpdate, DEFAULT_TOLERANCE, MAX_BODY, MAX_EVENTS, MAX_WORKSPACES,
-    WORKSPACE_TTL_MS,
 };
 
 /// Idle connections kept alive between requests. The server is thread-per-
@@ -73,7 +72,7 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(600);
 const MIGRATION_LOCK_KEY: i64 = 0x_7265_6f70_656e_0001;
 
 const SELECT_COLUMNS: &str =
-    "id, name, code, revision, created_at, updated_at, plate, tolerance, events";
+    "id, name, code, revision, created_at, updated_at, plate, tolerance, preview, share_token, events";
 
 /// The retained-workspace ceiling, from `REOPENSCAD_MAX_WORKSPACES`.
 ///
@@ -363,11 +362,11 @@ impl PgWorkspaceStore {
     /// `REOPENSCAD_MAX_WORKSPACES` exists so an operator can raise the ceiling
     /// far above plausible abuse without rebuilding. Sizing it is a real
     /// decision, not a formality: see DEPLOY.md.
+    /// There is deliberately no age limit here either; see the note on the
+    /// filesystem store's `prune`. Rows go only when the ceiling is reached.
     fn prune(&self) -> Result<(), String> {
-        let cutoff = unix_millis().saturating_sub(WORKSPACE_TTL_MS) as i64;
         let overflow = max_workspaces() as i64;
         self.pool.with(|client| {
-            client.execute("DELETE FROM workspaces WHERE updated_at < $1", &[&cutoff])?;
             client.execute(
                 "DELETE FROM workspaces WHERE id IN (
                      SELECT id FROM workspaces ORDER BY updated_at DESC, id DESC OFFSET $1
@@ -416,6 +415,8 @@ impl PgWorkspaceStore {
                     updated_at: now as u64,
                     plate,
                     tolerance,
+                    preview: String::new(),
+                    share_token: String::new(),
                     events: Vec::new(),
                 });
             }
@@ -618,6 +619,86 @@ impl PgWorkspaceStore {
             .ok_or(UpdateError::NotFound)
     }
 
+    /// Replaces the stored thumbnail. No revision, and no touch of
+    /// `updated_at` — see the note on the filesystem store's `set_preview`.
+    pub fn set_preview(&self, id: &str, preview: &str) -> Result<(), UpdateError> {
+        if !valid_workspace_id(id) {
+            return Err(UpdateError::NotFound);
+        }
+        let (owned, preview) = (id.to_string(), preview.to_string());
+        let updated = self
+            .pool
+            .with(|client| {
+                client.execute(
+                    "UPDATE workspaces SET preview = $1 WHERE id = $2",
+                    &[&preview, &owned],
+                )
+            })
+            .map_err(UpdateError::Internal)?;
+        if updated == 0 {
+            return Err(UpdateError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// The token for `id`, minting one the first time it is asked for.
+    ///
+    /// The `WHERE share_token = ''` makes minting a compare-and-swap under the
+    /// row lock: two tabs sharing at the same moment cannot produce two links,
+    /// because the loser updates zero rows and re-reads the winner's.
+    pub fn share_token(&self, id: &str) -> Result<String, UpdateError> {
+        if !valid_workspace_id(id) {
+            return Err(UpdateError::NotFound);
+        }
+        let owned = id.to_string();
+        let token = crate::generate_share_token(&self.nonce);
+        let existing = self
+            .pool
+            .with(|client| {
+                client.query_opt(
+                    "UPDATE workspaces SET share_token = $1
+                     WHERE id = $2 AND share_token = ''
+                     RETURNING share_token",
+                    &[&token, &owned],
+                )
+            })
+            .map_err(UpdateError::Internal)?;
+        if let Some(row) = existing {
+            return row.try_get::<_, String>("share_token").map_err(|error| {
+                UpdateError::Internal(format!("share token column is unreadable: {error}"))
+            });
+        }
+        // Either the workspace is gone or it was already shared.
+        let row = self
+            .pool
+            .with(|client| {
+                client.query_opt(
+                    "SELECT share_token FROM workspaces WHERE id = $1",
+                    &[&owned],
+                )
+            })
+            .map_err(UpdateError::Internal)?
+            .ok_or(UpdateError::NotFound)?;
+        row.try_get::<_, String>("share_token").map_err(|error| {
+            UpdateError::Internal(format!("share token column is unreadable: {error}"))
+        })
+    }
+
+    /// The workspace a read-only token points at.
+    pub fn resolve_share(&self, token: &str) -> Result<Option<Workspace>, String> {
+        if !crate::valid_share_token(token) {
+            return Ok(None);
+        }
+        let owned = token.to_string();
+        let row = self.pool.with(|client| {
+            client.query_opt(
+                &format!("SELECT {SELECT_COLUMNS} FROM workspaces WHERE share_token = $1"),
+                &[&owned],
+            )
+        })?;
+        row.map(|row| row_to_workspace(&row)).transpose()
+    }
+
     fn generate_id(&self) -> String {
         crate::generate_workspace_id(&self.nonce)
     }
@@ -655,6 +736,8 @@ fn row_to_workspace(row: &Row) -> Result<Workspace, String> {
         updated_at: column::<i64>(row, "updated_at")?.max(0) as u64,
         plate: column(row, "plate")?,
         tolerance: column(row, "tolerance")?,
+        preview: column(row, "preview")?,
+        share_token: column(row, "share_token")?,
         // A row whose event log somehow failed to round-trip must not make the
         // workspace unreadable; the log is a UI convenience, the code is not.
         events: serde_json::from_value(events).unwrap_or_default(),
@@ -725,6 +808,23 @@ const MIGRATIONS: &[(i32, &[&str])] = &[(
         // sequential scans of the whole table every ten minutes.
         "CREATE INDEX IF NOT EXISTS workspaces_updated_at_idx
              ON workspaces (updated_at DESC, id DESC)",
+    ],
+), (
+    2,
+    // The render thumbnail the recents list shows. `DEFAULT ''` rather than
+    // nullable so the row maps to the same `String` the filesystem store's
+    // `serde` default produces, and so an existing deployment migrates without
+    // rewriting every row.
+    &["ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS preview TEXT NOT NULL DEFAULT ''"],
+), (
+    3,
+    &[
+        // The read-only capability. Unique where it exists, so two workspaces
+        // can never answer to the same link; `''` means "never shared", and a
+        // partial index lets every unshared row keep that same empty value.
+        "ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS share_token TEXT NOT NULL DEFAULT ''",
+        "CREATE UNIQUE INDEX IF NOT EXISTS workspaces_share_token_idx
+             ON workspaces (share_token) WHERE share_token <> ''",
     ],
 )];
 

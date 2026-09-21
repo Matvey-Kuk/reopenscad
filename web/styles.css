@@ -30,7 +30,17 @@ button { color: inherit; }
    touchscreen laptop that works fine. Pure CSS so it lands before app.js runs
    and still holds if the script fails. */
 .mobile-gate { display: none; }
-.app-shell { display: grid; grid-template-rows: 42px 50px 1fr 25px; height: 100vh; background: var(--base); }
+/* header, toolbar, read-only banner, workspace, status bar.
+   Every child names its own row rather than relying on source order, because a
+   `display: none` grid item is not laid out at all: while the banner is hidden
+   the auto-placer would shift the workspace and the status bar up a row each,
+   handing the workspace the banner's `auto` and the status bar the `1fr`. */
+.app-shell { display: grid; grid-template-rows: 42px 50px auto 1fr 25px; height: 100vh; background: var(--base); }
+.app-shell > .app-header { grid-row: 1; }
+.app-shell > .toolbar { grid-row: 2; }
+.app-shell > .readonly-banner { grid-row: 3; }
+.app-shell > .workspace { grid-row: 4; }
+.app-shell > .status-bar { grid-row: 5; }
 .app-header { display: flex; align-items: center; border-bottom: 1px solid #090b0e; background: #12161b; padding: 0 12px; user-select: none; }
 .brand { display: flex; align-items: center; gap: 8px; min-width: 264px; font-weight: 700; letter-spacing: -.2px; }
 .brand img { width: 21px; height: 21px; filter: saturate(.85); }
@@ -107,21 +117,82 @@ button { color: inherit; }
 
 /* Kick-start options replace the legacy example dropdown: they sit above the edit
    field and only exist while the workspace source is still empty. */
-.kickstart { position: absolute; z-index: 4; left: 48px; right: 0; top: 0; max-height: 100%; overflow: auto; padding: 20px 20px 22px; pointer-events: none; background: linear-gradient(#171c23 78%, rgba(23,28,35,0)); animation: arrive .35s ease both; }
+.kickstart { position: absolute; z-index: 4; left: 48px; right: 0; top: 0; max-height: 100%; overflow: auto; padding: 20px 20px 22px; pointer-events: auto; background: linear-gradient(#171c23 78%, rgba(23,28,35,0)); animation: arrive .35s ease both; }
 .kickstart[hidden] { display: none; }
-.kickstart-intro .eyebrow { display: block; }
-.kickstart-intro h2 { margin: 6px 0 4px; color: #dee3e9; font-size: 18px; letter-spacing: -.03em; }
-.kickstart-intro p { margin: 0 0 15px; max-width: 46ch; color: var(--muted); font-size: 10px; line-height: 1.55; }
-.kickstart-blank { pointer-events: auto; margin: 0 0 15px; border: 0; background: transparent; color: var(--muted); padding: 0; font: 9px var(--mono); letter-spacing: .06em; text-transform: uppercase; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; transition: color .14s; }
-.kickstart-blank:hover { color: #dee3e9; }
-.kickstart-blank:focus-visible { outline: 1px solid var(--blue); outline-offset: 2px; }
-.kickstart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px; max-width: 452px; }
-.kickstart-card { pointer-events: auto; display: flex; flex-direction: column; align-items: flex-start; gap: 5px; min-height: 78px; border: 1px solid #2c333d; border-radius: 5px; background: linear-gradient(#1e242c, #191e25); padding: 10px 11px; text-align: left; cursor: pointer; transition: border-color .14s ease, transform .14s ease, background .14s ease; }
+/* The catalogue is grouped, because eighteen unlabelled cards is a wall. Each
+   group is a heading plus its own auto-fitting row, so the whole thing reflows
+   from one column to four without any breakpoint arithmetic. */
+.kickstart-catalogue { display: grid; gap: 18px; max-width: 980px; }
+.kickstart-group > h3 { margin: 0; color: #cfd6de; font-size: 11px; letter-spacing: -.01em; }
+.kickstart-group > p { margin: 2px 0 9px; color: var(--dim); font-size: 9px; }
+/* `auto-fill`, not `auto-fit`: auto-fit collapses the empty tracks, so a
+   single recent workspace stretched across the whole row — and because the
+   thumbnail is a fixed 4:3 box, a full-width card is also a very tall one.
+   auto-fill keeps the track, so one card is the same size as one of three. */
+.kickstart-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(178px, 1fr)); gap: 8px; }
+.kickstart-card { display: grid; grid-template-rows: auto auto auto auto; gap: 4px; border: 1px solid #2c333d; border-radius: 5px; background: linear-gradient(#1e242c, #191e25); padding: 8px 9px 9px; text-align: left; cursor: pointer; transition: border-color .14s ease, transform .14s ease, background .14s ease; }
 .kickstart-card:hover { border-color: #4e6a86; background: linear-gradient(#232b34, #1b212a); transform: translateY(-1px); }
 .kickstart-card:focus-visible { outline: 1px solid var(--blue); outline-offset: 1px; }
 .kickstart-card b { color: #e2e7ec; font-size: 11px; letter-spacing: -.01em; }
 .kickstart-card small { color: var(--muted); font-size: 9px; line-height: 1.45; }
-.kickstart-card code { margin-top: auto; color: #7f9a6a; font: 8px var(--mono); letter-spacing: .02em; }
+.kickstart-card code { color: #7f9a6a; font: 8px var(--mono); letter-spacing: .02em; }
+/* A fixed aspect box, so the row's cards line up whatever each render's own
+   proportions are, and so the grid does not reflow as the images arrive. */
+.kickstart-shot { display: grid; place-items: center; aspect-ratio: 4 / 3; margin-bottom: 3px; border-radius: 3px; background: #151a21 repeating-linear-gradient(45deg, rgba(255,255,255,.014) 0 6px, transparent 6px 12px); overflow: hidden; }
+.kickstart-shot img { width: 100%; height: 100%; object-fit: contain; padding: 5px; }
+/* Until an image loads (or if one is missing) the box stays a quiet placeholder
+   rather than a broken-image glyph. */
+.kickstart-shot img[data-failed] { display: none; }
+.kickstart-card[aria-busy="true"] { opacity: .6; }
+.kickstart-empty { margin: 0; color: var(--dim); font-size: 10px; }
+/* The new-workspace card is the same footprint as the ones beside it, so the
+   row reads as one set of choices rather than an action bolted onto a list. */
+/* The "+" sits in the same fixed-aspect box the thumbnails use, so this card
+   is sized by the same rule they are: short and wide on its own, square
+   beside a row of them, was the whole complaint. A `min-height` would have
+   fixed it today and drifted the next time a card gained a line. */
+/* No `justify-items: center` here: that shrinks every grid item to its own
+   content, which collapsed the aspect box to the width of the "+" inside it
+   and took the card back to 91px. The items stretch; the glyph is centred
+   inside the box and the labels by `text-align`. */
+.kickstart-new { border-style: dashed; border-color: #343d48; background: transparent; text-align: center; }
+.kickstart-new:hover { border-style: solid; border-color: #4e6a86; background: linear-gradient(#232b34, #1b212a); }
+.kickstart-new b { color: #dee3e9; }
+.kickstart-new small { color: var(--dim); }
+/* The box itself stays blank — the striped placeholder behind a missing
+   thumbnail would read as a render that failed to load. */
+.kickstart-new .kickstart-shot { background: none; }
+.kickstart-plus { display: grid; place-items: center; width: 38px; height: 38px; border-radius: 50%; background: #262e38; color: #9aa4b0; font-size: 21px; line-height: 1; }
+.kickstart-new:hover .kickstart-plus { background: #33414f; color: #e2e7ec; }
+/* Recents sit above the catalogue and are separated from it, because they are
+   the user's own work rather than something on offer. */
+#kickstartRecents { margin-bottom: 18px; padding-bottom: 16px; border-bottom: 1px solid #262d36; }
+#kickstartRecents[hidden] { display: none; }
+/* The card is a button plus a dismiss, so the card itself stops being the
+   button: the open action is the inner one and the X sits over the corner. */
+.kickstart-recent { position: relative; padding: 0; }
+.kickstart-open { display: grid; gap: 4px; width: 100%; border: 0; border-radius: 5px; background: transparent; color: inherit; padding: 8px 9px 9px; text-align: left; font: inherit; cursor: pointer; }
+.kickstart-open b { display: block; overflow: hidden; color: #e2e7ec; font-size: 11px; letter-spacing: -.01em; text-overflow: ellipsis; white-space: nowrap; text-transform: capitalize; }
+/* The id is the link, so it is shown in the face it is read in, and truncated
+   rather than wrapped — it is for recognition, not for transcription. */
+.kickstart-open small { display: block; overflow: hidden; color: #6f7883; font: 8px var(--mono); text-overflow: ellipsis; white-space: nowrap; }
+.kickstart-forget { position: absolute; top: 4px; right: 4px; width: 18px; height: 18px; display: grid; place-items: center; border: 0; border-radius: 3px; background: rgba(20,25,31,.82); color: #8b949f; font-size: 13px; line-height: 1; opacity: 0; cursor: pointer; transition: opacity .12s, color .12s, background .12s; }
+.kickstart-recent:hover .kickstart-forget, .kickstart-forget:focus-visible { opacity: 1; }
+.kickstart-forget:hover { background: #3a2226; color: #f0b6ba; }
+/* Never hidden from the keyboard: opacity alone would leave it reachable by Tab
+   but invisible, which is worse than showing it. */
+.kickstart-forget:focus-visible { outline: 1px solid var(--blue); outline-offset: 1px; }
+/* Anchored to the X it came from, and sized for the sentence rather than for
+   the button: that sentence is the only thing that distinguishes "forget this
+   link" from "delete my model". */
+.forget-prompt { position: fixed; z-index: 45; width: 210px; border: 1px solid #39424d; border-radius: 4px; background: #20262e; padding: 10px; box-shadow: 0 13px 38px rgba(0,0,0,.45); animation: arrive .14s ease both; }
+.forget-prompt p { margin: 0 0 9px; color: #c7cdd4; font-size: 10px; line-height: 1.5; }
+.forget-prompt div { display: flex; gap: 6px; }
+.forget-prompt button { flex: 1; border: 1px solid #39424d; border-radius: 3px; background: #2a323c; color: #dee3e9; padding: 5px 0; font: 9px var(--mono); letter-spacing: .04em; text-transform: uppercase; cursor: pointer; }
+.forget-prompt button:hover { border-color: #4e6a86; background: #323b46; }
+.forget-prompt [data-forget-confirm] { border-color: #6b3b41; background: #3a2226; color: #f0b6ba; }
+.forget-prompt [data-forget-confirm]:hover { border-color: #8d4d55; background: #4a2a2f; }
+.forget-prompt button:focus-visible { outline: 1px solid var(--blue); outline-offset: 1px; }
 
 .viewport-header { justify-content: space-between; padding: 0 8px; }
 .view-mode { height: 100%; display: flex; align-items: center; gap: 3px; }
@@ -242,10 +313,53 @@ kbd { font: 9px var(--mono); }
 .check-intersections { width: 100%; height: 31px; display: flex; align-items: center; justify-content: center; gap: 7px; margin-top: 9px; border: 1px solid #485d36; border-radius: 3px; background: linear-gradient(#26351f,#1d2918); color: #a8cf80; cursor: pointer; font-size: 9px; font-weight: 700; }.check-intersections:hover { border-color: #668449; filter: brightness(1.08); }.check-intersections:disabled { opacity: .45; cursor: wait; }.check-intersections span { width: 9px; height: 9px; border: 1px solid currentColor; transform: rotate(45deg); }
 .intersection-results { max-height: 126px; overflow: auto; margin-top: 8px; }.inspection-empty { color: #515b65; font: 8px/1.4 var(--mono); text-align: center; padding: 5px; }.intersection-result { width: 100%; display: grid; grid-template-columns: 6px 1fr; gap: 7px; border: 0; border-top: 1px solid #292f37; background: transparent; padding: 7px 2px; text-align: left; cursor: pointer; }.intersection-result:hover { background: rgba(228,102,95,.06); }.intersection-result i { width: 5px; height: 5px; margin-top: 3px; border-radius: 50%; background: var(--red); }.intersection-result b { display: block; color: #d29a96; font-size: 8px; }.intersection-result small { color: #646e78; font: 7px var(--mono); }
 
-.export-popover { position: fixed; z-index: 20; min-width: 230px; padding: 8px; border: 1px solid #39424d; border-radius: 4px; background: #20262e; box-shadow: 0 13px 38px rgba(0,0,0,.45); }.export-popover[hidden] { display: none; }.export-popover > b { display: block; padding: 5px 8px 8px; color: #87919c; font: 8px var(--mono); text-transform: uppercase; letter-spacing: .12em; }.export-popover button { width: 100%; display: grid; grid-template-columns: 39px 1fr; justify-content: initial; border: 0; border-radius: 3px; background: transparent; color: #c7cdd4; padding: 8px; text-align: left; cursor: pointer; font-size: 10px; }.export-popover button:hover { background: #303944; color: #fff; }.export-popover button span { color: var(--yellow); font: 10px var(--mono); }.export-popover button small { color: #77818c; font-size: 9px; }
+/* --- Sharing ------------------------------------------------------------ */
+.share-popover { position: fixed; z-index: 30; width: 300px; padding: 10px; border: 1px solid #39424d; border-radius: 4px; background: #20262e; box-shadow: 0 13px 38px rgba(0,0,0,.45); }
+.share-popover[hidden] { display: none; }
+.share-popover > b { display: block; padding: 3px 2px 9px; color: #87919c; font: 8px var(--mono); text-transform: uppercase; letter-spacing: .12em; }
+.share-link + .share-link { margin-top: 11px; padding-top: 11px; border-top: 1px solid #2a313b; }
+.share-link label { display: block; margin-bottom: 5px; color: #dee3e9; font-size: 10px; }
+.share-link > div { display: flex; gap: 5px; }
+/* The link is the credential, so it is shown in the face credentials are read
+   in, and it scrolls rather than wraps: a wrapped URL invites a partial copy. */
+.share-link input { flex: 1; min-width: 0; border: 1px solid #39424d; border-radius: 3px; background: #171c23; color: #c7cdd4; padding: 5px 6px; font: 9px var(--mono); }
+.share-link input:focus-visible { outline: 1px solid var(--blue); outline-offset: -1px; }
+.share-link button { border: 1px solid #39424d; border-radius: 3px; background: #2a323c; color: #dee3e9; padding: 0 9px; font: 9px var(--mono); letter-spacing: .04em; text-transform: uppercase; cursor: pointer; }
+.share-link button:hover { border-color: #4e6a86; background: #323b46; }
+.share-link small { display: block; margin-top: 5px; color: var(--dim); font-size: 9px; line-height: 1.45; }
+
+/* --- Read-only view ------------------------------------------------------ */
+/* A full-width bar rather than a badge: "you cannot save here" has to be seen
+   before someone types a paragraph into it, not discovered afterwards. */
+.readonly-banner { display: flex; align-items: center; gap: 12px; padding: 7px 14px; border-bottom: 1px solid #0a0d10; background: linear-gradient(#2c2a1d, #24231a); color: #ddd2a6; font-size: 10px; }
+.readonly-banner[hidden] { display: none; }
+.readonly-banner b { color: #f1e0a8; }
+.readonly-banner button { margin-left: auto; border: 1px solid #6b6134; border-radius: 3px; background: #33301f; color: #f1e0a8; padding: 5px 10px; font: 9px var(--mono); letter-spacing: .04em; text-transform: uppercase; cursor: pointer; white-space: nowrap; }
+.readonly-banner button:hover { border-color: #97883f; background: #3f3b25; }
+.readonly-banner button:focus-visible { outline: 1px solid var(--blue); outline-offset: 1px; }
+/* The editor still scrolls, selects and copies — it just cannot be typed into,
+   and says so by not taking the caret colour. */
+body.read-only #codeEditor { caret-color: transparent; cursor: default; }
+/* Nothing that writes to the workspace belongs on screen in a view nobody can
+   write to. */
+body.read-only #saveButton, body.read-only #mcpButton { display: none; }
+/* Sits between two 32px pill buttons, so it matches their height and leans on
+   the toolbar's own gap rather than carrying a margin of its own — the extra
+   6px on the agent button made the space on its left half again as wide as
+   the space on its right. */
+#shareButton { width: 32px; height: 32px; }
+/* `[hidden]` is only `display: none` at user-agent weight, which a class
+   setting `display` outranks — the share button stayed on screen in a view
+   that has nothing to share. */
+.tool-button[hidden] { display: none; }
+
+.export-popover { position: fixed; z-index: 20; min-width: 230px; padding: 8px; border: 1px solid #39424d; border-radius: 4px; background: #20262e; box-shadow: 0 13px 38px rgba(0,0,0,.45); }.export-popover[hidden] { display: none; }.export-popover > b { display: block; padding: 5px 8px 8px; color: #87919c; font: 8px var(--mono); text-transform: uppercase; letter-spacing: .12em; }/* The format column is sized for the longest label rather than for "STL", and the
+   label never wraps: at 39px "STL \00b7 1" broke after the middle dot and the row
+   grew a second line that read like a separate entry. */
+.export-popover button { width: 100%; display: grid; grid-template-columns: 52px minmax(0, 1fr); justify-content: initial; align-items: baseline; gap: 0 4px; border: 0; border-radius: 3px; background: transparent; color: #c7cdd4; padding: 8px; text-align: left; cursor: pointer; font-size: 10px; }.export-popover button:hover { background: #303944; color: #fff; }.export-popover button span { color: var(--yellow); font: 10px var(--mono); white-space: nowrap; }.export-popover button small { color: #77818c; font-size: 9px; }
 
 /* ---- Agent / MCP connection panel ------------------------------------- */
-.agent-button { height: 32px; display: flex; align-items: center; gap: 8px; margin-right: 6px; border: 1px solid #4a4634; border-radius: 4px; background: linear-gradient(#242a32, #1c2129); color: #ddd2a6; padding: 0 8px 0 10px; font-weight: 700; cursor: pointer; }
+.agent-button { height: 32px; display: flex; align-items: center; gap: 8px; border: 1px solid #4a4634; border-radius: 4px; background: linear-gradient(#242a32, #1c2129); color: #ddd2a6; padding: 0 8px 0 10px; font-weight: 700; cursor: pointer; }
 .agent-button:hover { border-color: #7a6d3c; background: linear-gradient(#2b323b, #21262e); color: #f4e6b6; }
 .agent-button:active { transform: translateY(1px); }
 /* Until the user has opened the MCP panel once, the button advertises itself:
@@ -383,7 +497,7 @@ kbd { font: 9px var(--mono); }
 }
 
 @media (max-width: 720px) {
-  :root { --objects-width: 0px; }.objects-pane { display: none; }.workspace-identity { margin-left: 8px; }.brand { min-width: 0; }.brand-credit { display: none; }.kickstart { padding: 12px; }.kickstart-intro h2 { font-size: 15px; }
+  :root { --objects-width: 0px; }.objects-pane { display: none; }.workspace-identity { margin-left: 8px; }.brand { min-width: 0; }.brand-credit { display: none; }.kickstart { padding: 12px; }
 }
 
 @media (pointer: coarse) and (max-width: 1024px) {

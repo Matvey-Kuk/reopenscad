@@ -123,12 +123,176 @@ test('examples are kick-start options above an empty editor, not a toolbar dropd
   // The grid sits inside the editor pane, above the edit field.
   const editorPane = html.slice(html.indexOf('class="editor-pane"'), html.indexOf('class="splitter vertical"'));
   assert.match(editorPane, /id="kickstart"/);
-  assert.match(javascript, /const kickstartOptions = \[/);
-  assert.match(javascript, /function updateKickstart\(\)[\s\S]*?editor\.value\.trim\(\)\.length > 0/);
+  // The catalogue is fetched from real files rather than inlined here, so the
+  // sources the cards open are the same ones the Rust suite compiles and the
+  // OpenSCAD oracle checks.
+  assert.doesNotMatch(javascript, /const kickstartOptions = \[/);
+  assert.match(javascript, /const EXAMPLES_BASE = '\/examples\/';/);
+  assert.match(javascript, /fetch\(`\$\{EXAMPLES_BASE\}manifest\.json`\)/);
+  assert.match(javascript, /fetch\(`\$\{EXAMPLES_BASE\}\$\{encodeURIComponent\(slug\)\}\.scad`\)/);
+  assert.match(javascript, /function updateKickstart\(\)[\s\S]*?editor\.value\.trim\(\)\.length === 0/);
   assert.match(javascript, /data-example=/);
+  // Built only when the panel is actually shown: a workspace that opens with
+  // code in it must not pay for the manifest and eighteen preview requests.
+  assert.match(javascript, /if \(!hidden\) renderKickstart\(\);/);
+  // Every card carries its own render.
+  assert.match(javascript, /class="kickstart-shot"><img src="\$\{EXAMPLES_BASE\}\$\{slug\}\.png"/);
   // A new workspace must actually be empty, or the kick-start options can never appear.
   assert.doesNotMatch(javascript, /createWorkspace\(examples\.starter/);
   assert.match(javascript, /async function createWorkspace\(code = ''/);
+});
+
+test('recently visited workspaces are remembered in this browser, with previews', () => {
+  // The URL is the only handle on a workspace, so the app has to keep one.
+  assert.match(javascript, /const RECENTS_STORAGE_KEY = 'reopenscad\.recentWorkspaces';/);
+  assert.match(html, /id="kickstartRecents"/);
+  // In this browser, never on the server: a list of everything someone opened
+  // is the one thing an account-less service must not collect.
+  const recents = javascript.slice(javascript.indexOf('function readRecents'), javascript.indexOf('function loadCatalogue'));
+  assert.match(recents, /localStorage\.getItem\(RECENTS_STORAGE_KEY\)/);
+  assert.match(recents, /localStorage\.setItem\(RECENTS_STORAGE_KEY/);
+  assert.doesNotMatch(recents, /fetch\([^)]*recent/i);
+  // Most recent first, which is the order it is stored in.
+  assert.match(recents, /\[\{ id, visitedAt: Date\.now\(\) \}, \.\.\.rest\]/);
+  // A blank workspace — what landing on "/" mints — must not be listed.
+  assert.match(javascript, /workspace\.id && \(workspace\.code \|\| ''\)\.trim\(\)/);
+  // Removing one is a list operation and says so, because the wording is the
+  // only thing standing between the user and thinking they deleted their work.
+  // Asked in the page, like every other confirmation here — a native dialog
+  // blocks the tab and cannot carry the second sentence.
+  assert.match(html + javascript, /Remove workspace from the list\? It will still be available/);
+  assert.match(javascript, /class = 'forget-prompt'|className = 'forget-prompt'/);
+  // ...and it only touches local storage.
+  const forget = javascript.slice(javascript.indexOf('function forgetRecentWorkspace'), javascript.indexOf('// --- Render thumbnails'));
+  assert.doesNotMatch(forget, /fetch\(/);
+  assert.doesNotMatch(forget, /method: 'DELETE'/);
+});
+
+test('render thumbnails are captured locally and uploaded once per change', () => {
+  const capture = javascript.slice(javascript.indexOf('function captureViewportPreview'), javascript.indexOf('function loadCatalogue'));
+  assert.match(capture, /toDataURL\('image\/jpeg', 0\.72\)/);
+  // JPEG has no alpha and the viewport is drawn on transparency, so the
+  // thumbnail is composited onto the panel colour rather than onto black.
+  assert.match(capture, /fillStyle = '#151a21'/);
+  // Not re-uploaded for geometry nobody changed: a preview render fires on
+  // every debounced keystroke.
+  assert.match(capture, /lastPreviewUpload\.id === workspaceId && lastPreviewUpload\.code === code/);
+  assert.match(capture, /method: 'PUT'/);
+  // Decoration: it must never surface as an error beside the model.
+  assert.match(capture, /catch \{/);
+});
+
+test('starting a new workspace clears the viewport, not just the flag', () => {
+  // `hasMesh = false` stops the next draw being requested; the last frame stays
+  // on the canvas until the buffers go and something repaints.
+  assert.match(javascript, /clearMesh\(\) \{[\s\S]*?this\.meshBatches = \[\];[\s\S]*?this\.draw\(\);/);
+  const newButton = javascript.slice(javascript.indexOf("$('#newButton').addEventListener"), javascript.indexOf("$('#fileInput').addEventListener"));
+  assert.match(newButton, /hasMesh = false;\s*\n\s*meshViewport\.clearMesh\(\);/);
+});
+
+test('the kick-start panel scrolls, and clicking it still reaches the editor', () => {
+  // `pointer-events: none` made the whole catalogue unscrollable: a wheel over
+  // it went to the editor underneath, which does not scroll either.
+  assert.match(css, /\.kickstart \{[^}]*overflow: auto;[^}]*pointer-events: auto;/);
+  // Taking pointer events back means forwarding a background click by hand.
+  assert.match(javascript, /\$\('#kickstart'\)\.addEventListener\('mousedown'[\s\S]*?editor\.focus\(\)/);
+  // Delegated from the panel so the recents group is live too, not from the
+  // catalogue, which is only one of its two children.
+  assert.match(javascript, /\$\('#kickstart'\)\.addEventListener\('click'/);
+});
+
+test('sharing offers an editable link and a read-only one that cannot become it', () => {
+  assert.match(html, /id="shareButton"/);
+  assert.match(html, /id="shareEditLink"/);
+  assert.match(html, /id="shareViewLink"/);
+  // The distinction is the feature, so the popover states it rather than
+  // leaving the reader to infer it from two URLs that look alike.
+  assert.match(html, /Anyone with this link can edit/);
+  assert.match(html, /Anyone with this link can view/);
+  // The read-only link carries no caption under it: the label above already
+  // says "can view", and a second sentence restating it was noise.
+  assert.doesNotMatch(html, /It cannot be turned back into the editable link above/);
+  // The token cache is keyed by workspace and a failure is never cached —
+  // otherwise one unlucky click before the first save would show "unavailable"
+  // for the life of the page, and a new workspace would inherit the previous
+  // workspace's read-only link.
+  assert.match(javascript, /let shareTokenCache = \{ id: null, promise: null \};/);
+  assert.match(javascript, /if \(!token && shareTokenCache\.id === id\) shareTokenCache = \{ id: null, promise: null \};/);
+  assert.match(javascript, /async function ensureShareToken[\s\S]{0,400}await flushWorkspaceSave\(\);/);
+  // Minted on first ask, not at creation: a capability nobody made cannot leak.
+  const sharing = javascript.slice(javascript.indexOf('async function ensureShareToken'), javascript.indexOf("$('#shareButton')"));
+  assert.match(sharing, /\/share`, \{\s*\n\s*method: 'POST'/);
+  // A read-only view is served the source and nothing that identifies the
+  // workspace, so the client cannot reconstruct the editable link either.
+  assert.match(javascript, /\/api\/shared\/\$\{encodeURIComponent\(token\)\}/);
+  const shared = javascript.slice(javascript.indexOf('async function loadSharedWorkspace'), javascript.indexOf("$('#forkWorkspace')"));
+  assert.doesNotMatch(shared, /workspaceId = payload/);
+  assert.match(shared, /workspaceId = null/);
+});
+
+test('a read-only view cannot save, and offers a way out that can', () => {
+  assert.match(html, /id="readonlyBanner"/);
+  assert.match(html, /Copy to a new workspace to edit/);
+  // Saving, polling and preview upload all key off `workspaceId`, which a
+  // shared view deliberately does not have — that is what makes it read-only
+  // rather than read-only-by-convention.
+  assert.match(javascript, /async function saveWorkspace\(\) \{\s*\n\s*if \(!workspaceId/);
+  assert.match(javascript, /function scheduleWorkspaceSave[\s\S]*?if \(applyingRemoteUpdate \|\| !workspaceId\) return;/);
+  assert.match(javascript, /editor\.readOnly = true/);
+  // Every exit goes through one place, or New and Open would leave the banner
+  // up over a workspace that is perfectly editable.
+  assert.match(javascript, /function leaveReadOnly\(\)/);
+  assert.match(javascript, /async function createWorkspace[\s\S]{0,80}leaveReadOnly\(\);/);
+  assert.match(javascript, /async function loadWorkspace[\s\S]{0,80}leaveReadOnly\(\);/);
+});
+
+test('the shell pins its grid rows so a hidden banner cannot shift the layout', () => {
+  // A `display: none` grid item is not laid out, so auto-placement would move
+  // the workspace and the status bar up a row each while the banner is hidden.
+  assert.match(css, /\.app-shell > \.workspace \{ grid-row: 4; \}/);
+  assert.match(css, /\.app-shell > \.status-bar \{ grid-row: 5; \}/);
+  // `[hidden]` is user-agent weight and loses to a class that sets `display`.
+  assert.match(css, /\.tool-button\[hidden\] \{ display: none; \}/);
+});
+
+test('the blank-workspace card reaches the editor instead of minting a workspace', () => {
+  // The catalogue is only on screen when this workspace is already empty, so
+  // creating another empty one changes the URL and leaves the screen looking
+  // identical — which is exactly what the card used to do, and why clicking it
+  // appeared to do nothing.
+  assert.match(javascript, /data-blank-editor aria-label="Blank workspace"/);
+  assert.doesNotMatch(javascript, /data-new-workspace/);
+  const handler = javascript.slice(javascript.indexOf("data-blank-editor]')"), javascript.indexOf("[data-workspace]')"));
+  assert.match(handler, /kickstartDismissed = true;/);
+  assert.match(handler, /editor\.focus\(\);/);
+  assert.doesNotMatch(handler, /newButton|createWorkspace/);
+  // Dismissal lasts the sitting, not the workspace: an empty workspace should
+  // offer help again when it is opened afresh.
+  assert.doesNotMatch(javascript, /kickstart\.dismissed/);
+  assert.match(javascript, /kickstartDismissed = false;/);
+});
+
+test('a read-only view shows the editor, never the catalogue', () => {
+  // Every card either types into this editor or makes a workspace, and a
+  // reader came here to do neither — a shared blank model is just a blank
+  // editor.
+  assert.match(javascript, /const hidden = !empty \|\| kickstartDismissed \|\| Boolean\(readOnlyToken\);/);
+  // `readOnlyToken` is read by `updateKickstart`, which is defined long before
+  // the read-only code; declaring it down there would be a dead-zone trap.
+  const declaration = javascript.indexOf('let readOnlyToken = null;');
+  assert.ok(declaration > 0 && declaration < javascript.indexOf('function updateKickstart'));
+});
+
+test('an empty editor is not offered a preview it cannot produce', () => {
+  assert.match(javascript, /\$\('#firstPreview'\)\.hidden = empty;/);
+  assert.match(javascript, /\$\('#emptyHint'\)\.hidden = empty;/);
+});
+
+test('one recent workspace is the same size as one of three', () => {
+  // `auto-fit` collapses the empty tracks, so a single card stretches the whole
+  // row — and with a fixed-aspect thumbnail a full-width card is a very tall one.
+  assert.match(css, /\.kickstart-grid \{ display: grid; grid-template-columns: repeat\(auto-fill,/);
+  assert.doesNotMatch(css, /\.kickstart-grid \{[^}]*auto-fit/);
 });
 
 test('intersection tolerance defaults to 0.2 mm, persists, and never coerces to zero', () => {
@@ -730,18 +894,15 @@ test('the first-use disclaimer states the terms it exists to state', () => {
   assert.match(dialog, /<b>no liability<\/b>/);
   assert.match(dialog, /<b>Workspaces are not private\.<\/b>/);
   assert.match(dialog, /the URL is the only key/);
-  // Retention must not promise a window the server cannot keep. The 14-day TTL
-  // and the workspace cap are conjunctive: above roughly MAX_WORKSPACES/14
-  // creations per day the cap always evicts first, so quoting "14 days" as a
-  // guarantee is false. The cap is also configurable per deployment
-  // (REOPENSCAD_MAX_WORKSPACES), so a hardcoded count in the HTML is wrong the
-  // moment it is raised. State the mechanism, not a number.
-  assert.match(dialog, /deleted automatically/);
-  assert.match(dialog, /sooner than that/);
+  // The retention paragraph is gone with the policy it described. Workspaces
+  // no longer expire on a clock, so a dialog still saying they are "deleted
+  // automatically after two weeks" would be warning about something that
+  // cannot happen — and a false warning is worse than none, because it is the
+  // one someone would act on.
+  assert.doesNotMatch(dialog, /deleted automatically/);
+  assert.doesNotMatch(dialog, /two weeks/);
+  assert.doesNotMatch(dialog, /does not keep it alive/);
   assert.doesNotMatch(dialog, /only the \d+ most recent are kept/);
-  // Using a workspace does not preserve it: only an edit refreshes updated_at,
-  // which is the single most surprising thing about the retention policy.
-  assert.match(dialog, /does not keep it alive; only editing does/);
   assert.match(dialog, /Verify it before you print or manufacture/);
 });
 
@@ -973,10 +1134,13 @@ test('the whole view frames on the panned target, not the model centre', () => {
 });
 
 test('pan uses the bindings CAD users already have, and orbit keeps the plain drag', () => {
-  // Middle or right drag pans; Shift + middle orbits. Shift + left is deliberately
-  // absent — it orbits in Fusion, and binding it to pan here would make one chord
-  // mean two things depending on which package the user came from.
-  assert.match(javascript, /function isPanGesture\(event\) \{[\s\S]*?\(event\.button === 1 && !event\.shiftKey\) \|\| event\.button === 2/);
+  // Middle or right drag pans, and so does Alt + left — without that last one
+  // there is no pan at all on a laptop trackpad, which has neither a middle
+  // nor a comfortable right button. Shift + middle orbits, as in Fusion 360,
+  // which is why Shift is not the pan modifier: one chord, one meaning.
+  assert.match(javascript, /function isPanGesture\(event\) \{[\s\S]*?\(event\.button === 0 && event\.altKey\)/);
+  assert.match(javascript, /function isPanGesture\(event\) \{[\s\S]*?\(event\.button === 1 && !event\.shiftKey\)/);
+  assert.match(javascript, /function isPanGesture\(event\) \{[\s\S]*?event\.button === 2/);
   assert.doesNotMatch(javascript, /function isPanGesture\(event\) \{[\s\S]*?event\.button === 0 && event\.shiftKey/);
   const pointer = javascript.slice(javascript.indexOf("renderCanvas.addEventListener('pointerdown'"), javascript.indexOf("$('#customizerButton').addEventListener"));
   // One press can only ever mean one gesture, and a second pointer cannot hijack a live one.
@@ -1007,7 +1171,7 @@ test('pan uses the bindings CAD users already have, and orbit keeps the plain dr
   const viewHint = html.slice(html.indexOf('<div class="view-hint">'), html.indexOf('<div class="viewport-fab">'));
   // The hint names every binding the handlers actually accept, and no others.
   assert.match(viewHint, /<span>DRAG \/ SHIFT\+MIDDLE<\/span> orbit/);
-  assert.match(viewHint, /<span>MIDDLE \/ RIGHT \/ SHIFT\+SCROLL<\/span> pan <span>SCROLL<\/span> zoom/);
+  assert.match(viewHint, /<span>ALT\+DRAG \/ MIDDLE \/ RIGHT<\/span> pan <span>SCROLL<\/span> zoom/);
   // One line would run under the scale badge and the zoom cluster at the pane's width.
   assert.match(css, /\.view-hint \{[^}]*display: grid;/);
   assert.match(css, /\.render-canvas\.panning[^{]*\{ cursor: grabbing; \}/);

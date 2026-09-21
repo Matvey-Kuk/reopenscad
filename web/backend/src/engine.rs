@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod builtins;
+mod font;
 
 #[derive(Debug, Clone)]
 pub struct EngineError {
@@ -418,7 +419,11 @@ fn resolve_file_directives(
         // forever; OpenSCAD's own behavior here is to not re-enter. The key is
         // the same spelling `load` matches on, so `x` and `./x` cannot slip
         // past each other into a cycle.
-        let key = path.trim().strip_prefix("./").unwrap_or(path.trim()).to_string();
+        let key = path
+            .trim()
+            .strip_prefix("./")
+            .unwrap_or(path.trim())
+            .to_string();
         if active.contains(&key) {
             continue;
         }
@@ -445,8 +450,8 @@ fn resolve_file_directives(
         let expanded = resolve_file_directives(parsed, loader, active, loaded)?;
         active.pop();
         match mode {
-            FileDirectiveMode::Include => resolved.extend(expanded.into_iter().map(
-                |statement| match statement {
+            FileDirectiveMode::Include => {
+                resolved.extend(expanded.into_iter().map(|statement| match statement {
                     // Marking the origin keeps an included default from
                     // tripping the "assigned more than once" warning when the
                     // including file overrides it.
@@ -458,15 +463,11 @@ fn resolve_file_directives(
                         from_include: true,
                     },
                     statement => statement,
-                },
-            )),
-            FileDirectiveMode::Use => resolved.extend(
-                expanded
-                    .into_iter()
-                    .filter(|statement| {
-                        matches!(statement, Stmt::Function { .. } | Stmt::Module { .. })
-                    }),
-            ),
+                }))
+            }
+            FileDirectiveMode::Use => resolved.extend(expanded.into_iter().filter(|statement| {
+                matches!(statement, Stmt::Function { .. } | Stmt::Module { .. })
+            })),
         }
     }
     Ok(resolved)
@@ -1294,7 +1295,14 @@ fn surface_samples(mesh: &Mesh, target_edge: f64, output: &mut Vec<Vec3>) {
     }
 }
 
-fn subdivide_samples(a: Vec3, b: Vec3, c: Vec3, target_edge: f64, depth: usize, output: &mut Vec<Vec3>) {
+fn subdivide_samples(
+    a: Vec3,
+    b: Vec3,
+    c: Vec3,
+    target_edge: f64,
+    depth: usize,
+    output: &mut Vec<Vec3>,
+) {
     if output.len() >= MAX_CLEARANCE_SAMPLES {
         return;
     }
@@ -1435,6 +1443,11 @@ enum Token {
     Percent,
     AndAnd,
     OrOr,
+    Amp,
+    Pipe,
+    Tilde,
+    ShiftLeft,
+    ShiftRight,
     Colon,
     Dot,
     Question,
@@ -1493,13 +1506,20 @@ impl<'a> Lexer<'a> {
                     self.double(&mut tokens, Token::BangEqual)
                 }
                 b'!' => self.single(&mut tokens, Token::Bang),
-                b'<' if matches!(tokens.last(), Some(Token::Ident(name)) if matches!(name.as_str(), "include" | "use")) => {
+                b'<' if matches!(tokens.last(), Some(Token::Ident(name)) if matches!(name.as_str(), "include" | "use")) =>
+                {
                     tokens.push(self.file_path()?);
+                }
+                b'<' if self.peek_next() == Some(b'<') => {
+                    self.double(&mut tokens, Token::ShiftLeft)
                 }
                 b'<' if self.peek_next() == Some(b'=') => {
                     self.double(&mut tokens, Token::LessEqual)
                 }
                 b'<' => self.single(&mut tokens, Token::Less),
+                b'>' if self.peek_next() == Some(b'>') => {
+                    self.double(&mut tokens, Token::ShiftRight)
+                }
                 b'>' if self.peek_next() == Some(b'=') => {
                     self.double(&mut tokens, Token::GreaterEqual)
                 }
@@ -1510,7 +1530,10 @@ impl<'a> Lexer<'a> {
                 b'/' => self.single(&mut tokens, Token::Slash),
                 b'%' => self.single(&mut tokens, Token::Percent),
                 b'&' if self.peek_next() == Some(b'&') => self.double(&mut tokens, Token::AndAnd),
+                b'&' => self.single(&mut tokens, Token::Amp),
                 b'|' if self.peek_next() == Some(b'|') => self.double(&mut tokens, Token::OrOr),
+                b'|' => self.single(&mut tokens, Token::Pipe),
+                b'~' => self.single(&mut tokens, Token::Tilde),
                 b':' => self.single(&mut tokens, Token::Colon),
                 b'.' => self.single(&mut tokens, Token::Dot),
                 b'?' => self.single(&mut tokens, Token::Question),
@@ -1571,6 +1594,33 @@ impl<'a> Lexer<'a> {
 
     fn number(&mut self) -> Result<Token, EngineError> {
         let start = self.cursor;
+        // `0x1f` is a hexadecimal integer. OpenSCAD's lexer only accepts the
+        // lowercase prefix and needs at least one digit after it: `0XaB` and a
+        // bare `0x` are read as (deprecated) identifiers starting with a
+        // digit, not as numbers. Falling through to the decimal scan below
+        // reproduces the "not a number" half of that without carrying the
+        // deprecated identifier spelling into this grammar.
+        if self.peek() == Some(b'0')
+            && self.peek_next() == Some(b'x')
+            && self
+                .source
+                .get(self.cursor + 2)
+                .is_some_and(u8::is_ascii_hexdigit)
+        {
+            self.cursor += 2;
+            // Accumulated in f64 rather than u64 because that is the type the
+            // value ends up in anyway, and OpenSCAD likewise loses precision
+            // past 2^53 (it warns and keeps the rounded double).
+            let mut value = 0.0_f64;
+            while let Some(byte) = self.peek() {
+                let Some(digit) = (byte as char).to_digit(16) else {
+                    break;
+                };
+                value = value * 16.0 + f64::from(digit);
+                self.cursor += 1;
+            }
+            return Ok(Token::Number(value));
+        }
         let mut seen_dot = false;
         while let Some(byte) = self.peek() {
             if byte == b'.' && !seen_dot {
@@ -1779,12 +1829,17 @@ enum BinaryOp {
     Divide,
     Modulo,
     Power,
+    BitAnd,
+    BitOr,
+    ShiftLeft,
+    ShiftRight,
 }
 
 #[derive(Clone, Copy, Debug)]
 enum UnaryOp {
     Negate,
     Not,
+    BitNot,
 }
 
 #[derive(Clone, Debug)]
@@ -1849,6 +1904,13 @@ enum FileDirectiveMode {
     Include,
     Use,
 }
+
+/// Binding power of `^`.
+///
+/// Named because it is referenced twice: once as the binary level, and once as
+/// the level a unary operator parses its operand at, which is what makes `^`
+/// bind tighter than unary minus.
+const POWER_PRECEDENCE: u8 = 11;
 
 struct Parser {
     tokens: Vec<Token>,
@@ -2162,12 +2224,23 @@ impl Parser {
     }
 
     fn expression_inner(&mut self, minimum_precedence: u8) -> Result<Expr, EngineError> {
+        // A unary operator's operand is parsed at the *exponent* level, not
+        // above it. OpenSCAD's grammar reads `unary: '-' unary` and `exponent:
+        // call '^' unary`, so `^` binds tighter than unary minus and `-2^2` is
+        // `-(2^2) = -4`. Parsing the operand above `^` would give `(-2)^2 = 4`
+        // — a different number with no diagnostic, which is the worst kind of
+        // divergence there is.
         let mut left = if self.consume(&Token::Minus) {
-            Expr::Unary(UnaryOp::Negate, Box::new(self.expression(9)?))
+            Expr::Unary(
+                UnaryOp::Negate,
+                Box::new(self.expression(POWER_PRECEDENCE)?),
+            )
         } else if self.consume(&Token::Plus) {
-            self.expression(9)?
+            self.expression(POWER_PRECEDENCE)?
         } else if self.consume(&Token::Bang) {
-            Expr::Unary(UnaryOp::Not, Box::new(self.expression(9)?))
+            Expr::Unary(UnaryOp::Not, Box::new(self.expression(POWER_PRECEDENCE)?))
+        } else if self.consume(&Token::Tilde) {
+            Expr::Unary(UnaryOp::BitNot, Box::new(self.expression(POWER_PRECEDENCE)?))
         } else {
             self.postfix()?
         };
@@ -2181,12 +2254,22 @@ impl Parser {
                 Some(Token::LessEqual) => (BinaryOp::LessEqual, 5),
                 Some(Token::Greater) => (BinaryOp::Greater, 5),
                 Some(Token::GreaterEqual) => (BinaryOp::GreaterEqual, 5),
-                Some(Token::Plus) => (BinaryOp::Add, 6),
-                Some(Token::Minus) => (BinaryOp::Subtract, 6),
-                Some(Token::Star) => (BinaryOp::Multiply, 7),
-                Some(Token::Slash) => (BinaryOp::Divide, 7),
-                Some(Token::Percent) => (BinaryOp::Modulo, 7),
-                Some(Token::Caret) => (BinaryOp::Power, 8),
+                // OpenSCAD puts the whole bitwise group *above* the
+                // comparisons rather than below them as C does, so
+                // `3 & 1 == 1` is `(3 & 1) == 1` (true) and not C's
+                // `3 & (1 == 1)`. Probed against the binary: `1 | 2 == 2` is
+                // false, `1 & 2 | 4` is 4, `1 | 2 << 2` is 9, `1 << 2 + 1` is
+                // 8 — which fixes `|` under `&` under the shifts under `+`.
+                Some(Token::Pipe) => (BinaryOp::BitOr, 6),
+                Some(Token::Amp) => (BinaryOp::BitAnd, 7),
+                Some(Token::ShiftLeft) => (BinaryOp::ShiftLeft, 8),
+                Some(Token::ShiftRight) => (BinaryOp::ShiftRight, 8),
+                Some(Token::Plus) => (BinaryOp::Add, 9),
+                Some(Token::Minus) => (BinaryOp::Subtract, 9),
+                Some(Token::Star) => (BinaryOp::Multiply, 10),
+                Some(Token::Slash) => (BinaryOp::Divide, 10),
+                Some(Token::Percent) => (BinaryOp::Modulo, 10),
+                Some(Token::Caret) => (BinaryOp::Power, POWER_PRECEDENCE),
                 _ => break,
             };
             if precedence < minimum_precedence {
@@ -2974,6 +3057,51 @@ thread_local! {
     static FUNCTION_CALL_DEPTH: RefCell<usize> = const { RefCell::new(0) };
 }
 
+/// How many values a range expands to, or `None` if it expands to none.
+///
+/// A range this engine will not walk is *empty*, never an error. OpenSCAD
+/// treats a zero step as a range of 4294967295 elements, warns `Bad range
+/// parameter in for statement`, produces nothing and carries on — probed with
+/// `step = 0; for (i = [0:step:3]) ...; cube(9);`, which still renders the
+/// cube. A step that computes to zero or NaN for one iteration used to cost
+/// the author the whole model.
+///
+/// The count is derived rather than reached by stepping, so a hostile
+/// `[0:1e-300:1]` is rejected instead of being materialised.
+fn range_length(start: f64, step: f64, end: f64) -> Option<usize> {
+    if step == 0.0 || !step.is_finite() || !start.is_finite() || !end.is_finite() {
+        expression_warning(
+            "Bad range parameter in for statement: the step must be a non-zero finite \
+             number; the range is empty.",
+        );
+        return None;
+    }
+    let span = (end - start) / step;
+    if span < 0.0 {
+        return None;
+    }
+    let length = (span + 1e-9).floor() + 1.0;
+    if length > MAX_FOR_ITERATIONS as f64 {
+        expression_warning(format!(
+            "Bad range parameter in for statement: too many elements ({length:.0}); the \
+             range is empty."
+        ));
+        return None;
+    }
+    Some(length as usize)
+}
+
+/// The address of a local in the caller's frame, as a stand-in for the stack
+/// pointer.
+///
+/// `black_box` keeps the local from being optimised into a register, which
+/// would make the address meaningless.
+#[inline(never)]
+fn current_stack_address() -> usize {
+    let probe = 0u8;
+    std::hint::black_box(&probe) as *const u8 as usize
+}
+
 fn expression_warning(message: impl Into<String>) {
     EXPRESSION_WARNINGS.with(|warnings| {
         let message = format!("WARNING: {}", message.into());
@@ -3074,6 +3202,9 @@ struct Evaluator<'a> {
     /// Set as soon as a `!` is entered, before its subtree is walked, so the
     /// outermost `!` — not the first one reached — owns the root.
     root_claimed: bool,
+    /// Address of a local in the frame evaluation started in, or 0 before it
+    /// has been taken. Recursion is measured against this rather than counted.
+    stack_origin: usize,
 }
 
 impl Default for Evaluator<'_> {
@@ -3091,14 +3222,50 @@ impl Default for Evaluator<'_> {
             background_shapes: Vec::new(),
             root_shapes: None,
             root_claimed: false,
+            stack_origin: 0,
         }
     }
 }
 
-// Module evaluation clones lexical environments and module tables per frame,
-// so keep this below the smallest stack used by Rust's test/runtime threads.
-const MAX_MODULE_RECURSION_DEPTH: usize = 16;
-const MAX_FOR_ITERATIONS: usize = 10_000;
+/// How deep a user module may call itself.
+///
+/// Recursion is an ordinary SCAD idiom — trees, spirals, subdivision — and
+/// OpenSCAD renders hundreds of levels without complaint (probed: a 120-deep
+/// `tower()` gives 964 facets, and it only refuses around a million). The old
+/// ceiling of 16 rejected the idiom outright.
+///
+/// What actually bounds this engine is native stack, not the count: one level
+/// of `module -> statements -> module` retains about 10 KB of frame, measured
+/// by probing the stack pointer at each level of a release build, and a
+/// recursive call nested inside transforms costs two to three times that. The
+/// server runs every compile on a `thread::Builder` default stack of 2 MiB, so
+/// the count alone cannot be a safe guard — 256 cheap levels fit, 256
+/// expensive ones do not. `MAX_EVALUATION_STACK_BYTES` below is the real
+/// limit; this one is the cheap ceiling that keeps a recursion which somehow
+/// consumes no stack from running forever, and the number the error names.
+const MAX_MODULE_RECURSION_DEPTH: usize = 256;
+
+/// Stack bytes one evaluation may consume before recursion is refused.
+///
+/// Measured from the evaluation's entry frame, so it adapts to what the model
+/// actually costs rather than guessing a per-level price. 1.5 MB of the 2 MiB
+/// a connection thread gets leaves ~570 KB for the deepest non-recursive
+/// subtree under the guard (the heaviest measured is about 9 KB) and for
+/// everything the mesher does after evaluation returns.
+///
+/// The trade-off is deliberate: this is a public server, so an unbounded
+/// recursion has to die as a rejected model rather than as a stack overflow,
+/// which aborts the whole process and takes every other in-flight render with
+/// it. A model that needs more than this is refused with a diagnostic.
+const MAX_EVALUATION_STACK_BYTES: usize = 1_500_000;
+
+/// How many elements a `for` may walk.
+///
+/// OpenSCAD's own range cap: it warns `too many elements` and produces nothing
+/// at 1000000, which was probed directly. The real protection against a
+/// hostile loop is `MAX_EVALUATION_WORK_STEPS`, which is charged per iteration
+/// *and* per element a range expands to, so a loop this long cannot finish.
+const MAX_FOR_ITERATIONS: usize = 1_000_000;
 const MAX_EVALUATION_WORK_STEPS: usize = 1_000_000;
 const MAX_HULL_CACHE_ENTRIES: usize = 1_024;
 const MAX_CURVE_FRAGMENTS: usize = 100_000;
@@ -3113,6 +3280,7 @@ impl Evaluator<'_> {
 
     fn evaluate_objects(&mut self, statements: &[Stmt]) -> Result<Vec<Shape>, EngineError> {
         take_expression_warnings();
+        self.stack_origin = current_stack_address();
         let mut environment = Environment::new();
         environment.extend([
             ("$fn".into(), Value::Number(0.0)),
@@ -3432,6 +3600,13 @@ impl Evaluator<'_> {
         let (name, expression) = &bindings[binding_index];
         let iterable = evaluate_expression(expression, environment)?;
         self.note_value(&iterable);
+        // A range is charged for its whole expansion *before* it is built: it
+        // is that many values in memory whether or not the body ever runs, and
+        // nesting such loops is how you would try to exhaust this process. A
+        // vector costs nothing extra — it already exists — so only ranges pay.
+        if let Value::Range { start, step, end } = iterable {
+            self.consume_work(range_length(start, step, end).unwrap_or(0))?;
+        }
         let values = Self::iterable_values(iterable)?;
         let mut shapes = Vec::new();
         // The loop variable is the only binding that changes between
@@ -3451,6 +3626,27 @@ impl Evaluator<'_> {
         Ok(shapes)
     }
 
+    /// Refuses one more level of module recursion when either budget is spent.
+    ///
+    /// The byte budget is what protects the process; the depth count is the
+    /// ceiling the message names, because "recursion depth" is the thing an
+    /// author can act on.
+    fn check_recursion_budget(&mut self) -> Result<(), EngineError> {
+        let here = current_stack_address();
+        if self.stack_origin == 0 {
+            self.stack_origin = here;
+        }
+        if self.module_depth < MAX_MODULE_RECURSION_DEPTH
+            && self.stack_origin.abs_diff(here) <= MAX_EVALUATION_STACK_BYTES
+        {
+            return Ok(());
+        }
+        Err(EngineError::new(format!(
+            "Module recursion depth exceeded the limit of {MAX_MODULE_RECURSION_DEPTH} levels \
+             or {MAX_EVALUATION_STACK_BYTES} bytes of evaluation stack."
+        )))
+    }
+
     fn consume_work(&mut self, amount: usize) -> Result<(), EngineError> {
         check_cancelled(self.cancellation)?;
         self.work_steps = self.work_steps.saturating_add(amount);
@@ -3463,13 +3659,21 @@ impl Evaluator<'_> {
         }
     }
 
+    /// Expands a range, vector or string into the values a loop walks.
+    ///
+    /// A range this engine will not walk is *empty*, never an error. OpenSCAD
+    /// treats a zero step as a range of 4294967295 elements, warns `Bad range
+    /// parameter in for statement`, produces nothing and carries on — probed
+    /// with `step = 0; for (i = [0:step:3]) ...; cube(9);`, which still
+    /// renders the cube. A step that computes to zero or NaN for one
+    /// iteration used to cost the author the whole model.
     fn iterable_values(value: Value) -> Result<Vec<Value>, EngineError> {
         match value {
             Value::Range { start, step, end } => {
-                if step == 0.0 {
-                    return Err(EngineError::new("for() range step cannot be zero."));
-                }
-                let mut values = Vec::new();
+                let Some(length) = range_length(start, step, end) else {
+                    return Ok(Vec::new());
+                };
+                let mut values = Vec::with_capacity(length);
                 let mut value = start;
                 while if step > 0.0 {
                     value <= end + 1e-9
@@ -3477,9 +3681,7 @@ impl Evaluator<'_> {
                     value >= end - 1e-9
                 } {
                     if values.len() >= MAX_FOR_ITERATIONS {
-                        return Err(EngineError::new(format!(
-                            "for() exceeds the {MAX_FOR_ITERATIONS} iteration limit."
-                        )));
+                        break;
                     }
                     values.push(Value::Number(value));
                     value += step;
@@ -3487,7 +3689,15 @@ impl Evaluator<'_> {
                 Ok(values)
             }
             Value::Vector(values) => Ok(values),
-            _ => Err(EngineError::new("for() expects a range or vector.")),
+            // A string iterates over its characters, counted by codepoint like
+            // every other string operation here.
+            Value::String(text) => Ok(text
+                .chars()
+                .map(|character| Value::String(character.to_string()))
+                .collect()),
+            _ => Err(EngineError::new(
+                "for() expects a range, vector, or string.",
+            )),
         }
     }
 
@@ -3704,25 +3914,25 @@ impl Evaluator<'_> {
             }
             "union" => {
                 let shapes = self.child_shapes(children, environment)?;
-                self.require_same_dimension("union", &shapes)?;
+                let shapes = self.keep_same_dimension(shapes);
                 Ok(Shape::union(shapes))
             }
             "difference" => {
-                let mut shapes = self.child_shapes(children, environment)?;
+                let shapes = self.child_shapes(children, environment)?;
+                let mut shapes = self.keep_same_dimension(shapes);
                 if shapes.is_empty() {
                     Ok(None)
                 } else {
-                    self.require_same_dimension("difference", &shapes)?;
                     let first = shapes.remove(0);
                     Ok(Some(Shape::difference(first, shapes)))
                 }
             }
             "intersection" => {
                 let shapes = self.child_shapes(children, environment)?;
+                let shapes = self.keep_same_dimension(shapes);
                 if shapes.is_empty() {
                     Ok(None)
                 } else {
-                    self.require_same_dimension("intersection", &shapes)?;
                     Ok(Some(Shape::Intersection(shapes)))
                 }
             }
@@ -3731,11 +3941,11 @@ impl Evaluator<'_> {
                     let value = evaluate_expression(convexity, environment)?;
                     self.note_value(&value);
                 }
-                let mut shapes = self.child_shapes(children, environment)?;
+                let shapes = self.child_shapes(children, environment)?;
+                let mut shapes = self.keep_same_dimension(shapes);
                 if shapes.is_empty() {
                     return Ok(None);
                 }
-                self.require_same_dimension("minkowski", &shapes)?;
                 let mut result = shapes.remove(0);
                 for kernel in shapes {
                     let bounds = kernel.bounds();
@@ -3772,20 +3982,198 @@ impl Evaluator<'_> {
                 }
                 Ok(Some(result))
             }
+            // `fill()` closes every hole in the union of its children. Like the
+            // 2D branch of `hull()` it is evaluated here rather than carried as
+            // a node: the result is a set of closed contours, which is exactly
+            // what `polygon()` already is, so both kernels can render it and no
+            // new `Shape` variant has to teach the sampled path a distance
+            // field it cannot express.
+            "fill" => {
+                let shapes = self.child_shapes(children, environment)?;
+                let shapes = self.keep_planar_children(shapes);
+                let Some(shape) = Shape::union(shapes) else {
+                    return Ok(None);
+                };
+                let region = exact::shape_to_region(&shape, self.cancellation)?;
+                let filled = crate::csg::planar::fill(&region);
+                if filled.is_empty() {
+                    self.ignore_geometry("fill", "children do not enclose a 2D area");
+                    return Ok(None);
+                }
+                Ok(Some(Shape::Polygon2d {
+                    contours: filled.contours,
+                }))
+            }
             "hull" => {
                 let shapes = self.child_shapes(children, environment)?;
                 if shapes.is_empty() {
                     return Ok(None);
                 }
+                // OpenSCAD reads the dimension off the first child and drops
+                // the others with a warning rather than refusing the model, so
+                // `hull() { cube(5); circle(10); }` hulls the cube.
+                let dimension = shapes[0].dimension();
+                let kept = self.keep_same_dimension(shapes);
+                match dimension {
+                    ShapeDimension::Solid => self.cached_convex_hull(&kept).map(Some),
+                    // The 2D hull is one convex contour, which is a polygon —
+                    // so it is emitted as one instead of as a node only the
+                    // exact kernel could evaluate. This is
+                    // `csg::planar::hull`'s computation, minus the round trip
+                    // through `Region2d` that the polygon shape already does.
+                    ShapeDimension::Planar => {
+                        let points = hull_points_2d(&kept, self.cancellation)?;
+                        let contour = crate::csg::hull::convex_hull_2d(&points);
+                        if contour.len() < 3 {
+                            self.ignore_geometry(
+                                "hull",
+                                "child outlines do not span a 2D area",
+                            );
+                            return Ok(None);
+                        }
+                        Ok(Some(Shape::Polygon2d {
+                            contours: vec![contour],
+                        }))
+                    }
+                }
+            }
+            // `render()` forces OpenSCAD's CGAL cache and `group()` is what
+            // its parser wraps a brace block in. Neither changes the solid,
+            // and this kernel has no lazier mode to force, so both are exactly
+            // `union()` — which matters because hard-erroring on them rejects
+            // a whole file over a no-op.
+            "render" | "group" => {
+                if let Some(convexity) = argument(arguments, "convexity", 0) {
+                    let value = evaluate_expression(convexity, environment)?;
+                    self.note_value(&value);
+                }
+                let shapes = self.child_shapes(children, environment)?;
+                let shapes = self.keep_same_dimension(shapes);
+                Ok(Shape::union(shapes))
+            }
+            "polyhedron" => {
+                let points = argument_points3(arguments, "points", 0, environment);
+                let Some(points) = self.geometry_argument("polyhedron", points) else {
+                    return Ok(None);
+                };
+                // `triangles` is the pre-2014 spelling of `faces`. OpenSCAD
+                // has since dropped it, but files written against it are still
+                // in circulation and the meaning is unambiguous.
+                let name = if named_argument(arguments, "faces").is_none()
+                    && named_argument(arguments, "triangles").is_some()
+                {
+                    self.diagnostics.push(
+                        "WARNING: polyhedron(triangles = ...) is deprecated; use faces = ... instead."
+                            .to_string(),
+                    );
+                    "triangles"
+                } else {
+                    "faces"
+                };
+                let faces = argument_index_paths(arguments, name, 1, environment, points.len());
+                let Some(faces) = self.geometry_argument("polyhedron", faces) else {
+                    return Ok(None);
+                };
+                // `convexity` is a preview-only depth hint; this engine meshes
+                // the boundary directly, so it is accepted and ignored.
+                if let Some(convexity) = argument(arguments, "convexity", 2) {
+                    let value = evaluate_expression(convexity, environment)?;
+                    self.note_value(&value);
+                }
+                let faces = faces
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|face| face.len() >= 3)
+                    .collect::<Vec<_>>();
+                if points.len() < 4 || faces.len() < 4 {
+                    self.ignore_geometry(
+                        "polyhedron",
+                        "needs at least 4 points and 4 faces of 3 or more vertices",
+                    );
+                    return Ok(None);
+                }
+                Ok(Some(Shape::Polyhedron { points, faces }))
+            }
+            "resize" => {
+                let newsize =
+                    argument_vector(arguments, "newsize", 0, environment, vec![0.0, 0.0, 0.0]);
+                let Some(newsize) = self.geometry_argument("resize", newsize) else {
+                    return Ok(None);
+                };
+                // A short vector leaves the axes it omits alone, which is what
+                // a zero component already means.
+                let newsize = Vec3::new(
+                    newsize.first().copied().unwrap_or(0.0),
+                    newsize.get(1).copied().unwrap_or(0.0),
+                    newsize.get(2).copied().unwrap_or(0.0),
+                );
+                if !vec3_is_finite(newsize) {
+                    self.ignore_geometry("resize", "components must be finite");
+                    return Ok(None);
+                }
+                // `auto` is either one boolean for every axis or one per axis.
+                let auto = match argument(arguments, "auto", 1) {
+                    None => [false; 3],
+                    Some(expression) => match evaluate_expression(expression, environment)? {
+                        Value::Vector(values) => {
+                            let mut flags = [false; 3];
+                            for (flag, value) in flags.iter_mut().zip(&values) {
+                                *flag = truthy(value);
+                            }
+                            flags
+                        }
+                        value => [truthy(&value); 3],
+                    },
+                };
+                if let Some(convexity) = argument(arguments, "convexity", 2) {
+                    let value = evaluate_expression(convexity, environment)?;
+                    self.note_value(&value);
+                }
+                Ok(
+                    Shape::union(self.child_shapes(children, environment)?).map(|shape| {
+                        Shape::Resize {
+                            shape: Box::new(shape),
+                            newsize,
+                            auto,
+                        }
+                    }),
+                )
+            }
+            "multmatrix" => {
+                let matrix = argument_matrix4(arguments, "m", 0, environment);
+                let Some(matrix) = self.geometry_argument("multmatrix", matrix) else {
+                    return Ok(None);
+                };
+                let Some(transform) = Transform::from_matrix(matrix) else {
+                    self.ignore_geometry(
+                        "multmatrix",
+                        "matrix must be finite and invertible",
+                    );
+                    return Ok(None);
+                };
+                self.transform_children(children, environment, transform)
+            }
+            "projection" => {
+                let cut = argument_bool(arguments, "cut", 0, environment, false);
+                let Some(cut) = self.geometry_argument("projection", cut) else {
+                    return Ok(None);
+                };
+                if let Some(convexity) = argument(arguments, "convexity", 1) {
+                    let value = evaluate_expression(convexity, environment)?;
+                    self.note_value(&value);
+                }
+                let shapes = self.child_shapes(children, environment)?;
                 if shapes
                     .iter()
                     .any(|shape| shape.dimension() != ShapeDimension::Solid)
                 {
-                    return Err(EngineError::new(
-                        "hull() currently expects only 3D child geometry.",
-                    ));
+                    self.ignore_geometry("projection", "children must be 3D geometry");
+                    return Ok(None);
                 }
-                self.cached_convex_hull(&shapes).map(Some)
+                Ok(Shape::union(shapes).map(|shape| Shape::Projection {
+                    shape: Box::new(shape),
+                    cut,
+                }))
             }
             "translate" => {
                 let vector = vec3_argument(arguments, 0, environment, Vec3::default());
@@ -3978,7 +4366,7 @@ impl Evaluator<'_> {
                 }
                 let fragments = fragment_count(delta.abs(), environment);
                 let shapes = self.child_shapes(children, environment)?;
-                self.require_planar_children("offset", &shapes)?;
+                let shapes = self.keep_planar_children(shapes);
                 Ok(Shape::union(shapes).map(|shape| Shape::Offset2d {
                     shape: Box::new(shape),
                     delta,
@@ -4030,7 +4418,7 @@ impl Evaluator<'_> {
                     return Ok(None);
                 };
                 let shapes = self.child_shapes(children, environment)?;
-                self.require_planar_children("linear_extrude", &shapes)?;
+                let shapes = self.keep_planar_children(shapes);
                 if !self.exact && (twist != 0.0 || scale != [1.0, 1.0]) {
                     self.diagnostics.push(
                         "WARNING: linear_extrude() twist and scale are not represented by the \
@@ -4071,6 +4459,109 @@ impl Evaluator<'_> {
                         scale,
                         slices,
                     }
+                }))
+            }
+            "text" => {
+                let Some(expression) = argument(arguments, "text", 0) else {
+                    self.ignore_geometry("text", "no string to set");
+                    return Ok(None);
+                };
+                let string = match evaluate_expression(expression, environment)? {
+                    Value::String(value) => value,
+                    // OpenSCAD stringifies whatever it is handed, and a label
+                    // built from a computed number is the common case:
+                    // `text(str(count))` and `text(count)` should agree.
+                    other => display_value(&other),
+                };
+                let size = argument_number(arguments, "size", 1, environment, 10.0);
+                let Some(size) = self.geometry_argument("text", size) else {
+                    return Ok(None);
+                };
+                if !size.is_finite() || size <= 0.0 {
+                    self.ignore_geometry("text", "size must be finite and positive");
+                    return Ok(None);
+                }
+                let spacing = argument_number(arguments, "spacing", usize::MAX, environment, 1.0);
+                let Some(spacing) = self.geometry_argument("text", spacing) else {
+                    return Ok(None);
+                };
+                if !spacing.is_finite() || spacing <= 0.0 {
+                    self.ignore_geometry("text", "spacing must be finite and positive");
+                    return Ok(None);
+                }
+                let halign = argument_text(arguments, "halign", usize::MAX, environment)?
+                    .unwrap_or_else(|| "left".to_string());
+                let valign = argument_text(arguments, "valign", usize::MAX, environment)?
+                    .unwrap_or_else(|| "baseline".to_string());
+                // `font`, `direction`, `language` and `script` select a face and
+                // a shaper this engine does not have. Accepted so a source
+                // written for OpenSCAD still parses, and reported once, because
+                // silently drawing a different face than the one asked for is
+                // the kind of difference that only shows up on the printed part.
+                for named in ["font", "direction", "language", "script"] {
+                    if let Some(expression) = argument(arguments, named, usize::MAX) {
+                        let value = evaluate_expression(expression, environment)?;
+                        self.note_value(&value);
+                        self.diagnostics.push(format!(
+                            "WARNING: text() ignores {named}; this engine has one built-in \
+                             single-stroke font and cannot load others."
+                        ));
+                    }
+                }
+                let fragments = fragment_count(size * 0.35, environment);
+                Ok(self.stroke_text(&string, size, spacing, &halign, &valign, fragments))
+            }
+            "rotate_extrude" => {
+                // OpenSCAD's own default, and the reason `angle` is not simply
+                // required: the overwhelmingly common call is the bare one.
+                let angle = argument_number(arguments, "angle", 0, environment, 360.0);
+                let Some(angle) = self.geometry_argument("rotate_extrude", angle) else {
+                    return Ok(None);
+                };
+                if !angle.is_finite() || angle == 0.0 {
+                    self.ignore_geometry("rotate_extrude", "angle must be finite and non-zero");
+                    return Ok(None);
+                }
+                // Carried for parity and ignored for the same reason as in
+                // `linear_extrude`: it orders a preview, and this engine
+                // meshes the final solid.
+                if let Some(convexity) = argument(arguments, "convexity", usize::MAX) {
+                    let value = evaluate_expression(convexity, environment)?;
+                    self.note_value(&value);
+                }
+                let shapes = self.child_shapes(children, environment)?;
+                let shapes = self.keep_planar_children(shapes);
+                Ok(Shape::union(shapes).and_then(|shape| {
+                    // A profile crossing the axis would sweep through itself.
+                    // OpenSCAD refuses outright; so does this, because the
+                    // alternative is a self-intersecting solid that every
+                    // later boolean then has to cope with.
+                    let bounds = shape.bounds();
+                    if bounds.min.x < -crate::csg::mesh::EPSILON {
+                        self.ignore_geometry(
+                            "rotate_extrude",
+                            "the profile reaches x < 0, which would sweep through the axis",
+                        );
+                        return None;
+                    }
+                    // Facets follow the *outermost* radius, which is what the
+                    // sweep actually has to approximate — sizing them by the
+                    // profile's own extent would under-facet a small profile
+                    // held far out from the axis, which is exactly what a
+                    // thread or an O-ring groove is.
+                    let fragments = fragment_count(bounds.max.x.abs(), environment);
+                    if !self.exact && angle.abs() < 360.0 {
+                        self.diagnostics.push(
+                            "WARNING: rotate_extrude() angle is not represented by the sampled \
+                             kernel; it sweeps the full turn."
+                                .to_string(),
+                        );
+                    }
+                    Some(Shape::RotateExtrude {
+                        shape: Box::new(shape),
+                        angle,
+                        fragments,
+                    })
                 }))
             }
             "color" => {
@@ -4158,11 +4649,7 @@ impl Evaluator<'_> {
             }
             "children" => self.selected_children(arguments, environment),
             module_name if self.modules.contains_key(module_name) => {
-                if self.module_depth >= MAX_MODULE_RECURSION_DEPTH {
-                    return Err(EngineError::new(format!(
-                        "Module recursion depth exceeded the limit of {MAX_MODULE_RECURSION_DEPTH}."
-                    )));
-                }
+                self.check_recursion_budget()?;
                 let module = self.modules.get(module_name).cloned().unwrap();
                 let mut local = Environment::layered_on(&module.environment);
                 for (name, value) in environment.special_variables() {
@@ -4231,9 +4718,20 @@ impl Evaluator<'_> {
                 self.module_depth -= 1;
                 result.map(Shape::union)
             }
-            unsupported => Err(EngineError::new(format!(
-                "Unsupported module {unsupported}(). The native engine currently supports square, circle, polygon, cube, sphere, cylinder, transforms, modules, loops, union, difference, and intersection."
-            ))),
+            // A module this engine does not implement — a typo, an `import()`,
+            // or anything else — contributes no geometry and is otherwise
+            // ignored, exactly as OpenSCAD does: probing the binary with
+            // `notamodule(); cube(5);` gives `WARNING: Ignoring unknown module
+            // 'notamodule'`, six facets and exit 0. Erroring here used to cost
+            // the author their entire model over one unrecognised name.
+            //
+            // The arguments and the children are left unevaluated, which is
+            // also what the binary does: `notamodule() { echo("x"); }` prints
+            // nothing.
+            unsupported => {
+                self.warn_once(&format!("WARNING: Ignoring unknown module '{unsupported}'."));
+                Ok(None)
+            }
         }
     }
 
@@ -4324,36 +4822,211 @@ impl Evaluator<'_> {
         }
     }
 
-    fn require_same_dimension(&self, module: &str, shapes: &[Shape]) -> Result<(), EngineError> {
-        if shapes.first().is_some_and(|first| {
-            shapes
-                .iter()
-                .any(|shape| shape.dimension() != first.dimension())
-        }) {
-            Err(EngineError::new(format!(
-                "{module}() cannot mix 2D and 3D geometry."
-            )))
-        } else {
-            Ok(())
+    /// Drops the children whose dimension disagrees with the first child's.
+    ///
+    /// OpenSCAD takes the operation's dimension from its first child and
+    /// ignores the rest with a warning rather than refusing the file: probing
+    /// the binary with `union(){cube(5); square(3);}` gives `Mixing 2D and 3D
+    /// objects is not supported`, `Ignoring 2D child object for 3D operation`,
+    /// and a six-facet cube. Order matters — `union(){square(3); cube(5);}`
+    /// ignores the *3D* child and leaves a 2D result.
+    fn keep_same_dimension(&mut self, shapes: Vec<Shape>) -> Vec<Shape> {
+        let Some(dimension) = shapes.first().map(Shape::dimension) else {
+            return shapes;
+        };
+        if shapes.iter().all(|shape| shape.dimension() == dimension) {
+            return shapes;
+        }
+        let mut kept = shapes;
+        kept.retain(|shape| shape.dimension() == dimension);
+        let (child, operation) = match dimension {
+            ShapeDimension::Solid => ("2D", "3D"),
+            ShapeDimension::Planar => ("3D", "2D"),
+        };
+        self.warn_once("WARNING: Mixing 2D and 3D objects is not supported.");
+        self.warn_once(&format!(
+            "WARNING: Ignoring {child} child object for {operation} operation."
+        ));
+        kept
+    }
+
+    /// Pushes a diagnostic unless it is already there.
+    ///
+    /// A warning inside a loop body would otherwise repeat once per iteration
+    /// and bury everything else in the console.
+    fn warn_once(&mut self, message: &str) {
+        if !self.diagnostics.iter().any(|existing| existing == message) {
+            self.diagnostics.push(message.to_string());
         }
     }
 
-    fn require_planar_children(&self, module: &str, shapes: &[Shape]) -> Result<(), EngineError> {
-        self.require_same_dimension(module, shapes)?;
+    /// Lays a string out in the built-in font and returns it as one 2D shape.
+    ///
+    /// Each glyph is a set of centrelines, so the shape is built by sweeping a
+    /// square pen along them: one quad per segment, plus one square at every
+    /// joint so a corner is filled rather than notched. The pieces overlap, on
+    /// purpose — they are unioned, and a union is the only operation that gets
+    /// a stroked corner right without mitre arithmetic that would have to cope
+    /// with the near-180-degree joints an arc is made of.
+    fn stroke_text(
+        &mut self,
+        string: &str,
+        size: f64,
+        spacing: f64,
+        halign: &str,
+        valign: &str,
+        fragments: usize,
+    ) -> Option<Shape> {
+        let half = font::STROKE_WIDTH * size / 2.0;
+        // Lay the pen out first, so the alignment shift is known before any
+        // geometry is placed and nothing has to be transformed twice.
+        let mut placed: Vec<(f64, &'static font::Glyph)> = Vec::new();
+        let mut pen = 0.0;
+        let mut missing: Vec<char> = Vec::new();
+        for character in string.chars() {
+            match font::glyph(character) {
+                Some(glyph) => {
+                    placed.push((pen, glyph));
+                    pen += glyph.advance * size * spacing;
+                }
+                None => {
+                    if !missing.contains(&character) {
+                        missing.push(character);
+                    }
+                }
+            }
+        }
+        if !missing.is_empty() {
+            // Named rather than counted: the author has to know *which*
+            // character vanished to fix the label.
+            let list: Vec<String> = missing.iter().map(|value| format!("{value:?}")).collect();
+            self.diagnostics.push(format!(
+                "WARNING: text() has no glyph for {} and left {} out; the built-in font covers \
+                 printable ASCII only.",
+                list.join(", "),
+                if missing.len() == 1 { "it" } else { "them" }
+            ));
+        }
+        if placed.is_empty() {
+            self.ignore_geometry("text", "nothing in the string has a glyph");
+            return None;
+        }
+        let width = pen;
+        let shift_x = match halign {
+            "center" => -width / 2.0,
+            "right" => -width,
+            _ => 0.0,
+        };
+        let shift_y = match valign {
+            "center" => -font::CAP_HEIGHT * size / 2.0,
+            "top" => -font::CAP_HEIGHT * size,
+            "bottom" => -font::DESCENDER * size,
+            _ => 0.0,
+        };
+
+        let mut pieces: Vec<Shape> = Vec::new();
+        // The pen is *round*, and that is not a style choice. A square nib is
+        // axis-aligned however the stroke runs, so its corners — at `half` *
+        // sqrt(2) from the centre — stick out past the stroke's own edge
+        // wherever the stroke is not axis-aligned. On a curve, where the
+        // direction changes at every point, that is a spike at every point:
+        // the `S` of a 40 mm "BASIL" came out visibly serrated.
+        //
+        // A regular polygon *inscribed* in the pen circle can never do that.
+        // Every one of its vertices is exactly `half` from the centre, which
+        // is the stroke's own half-width, so however coarse it is it stays
+        // inside the quads it joins and only ever fills the wedge between
+        // them. Sixteen sides is smooth to a twentieth of a nozzle width on a
+        // 12 mm letter; more is wasted on geometry this small, and every side
+        // is a polygon the union has to carry.
+        let nib_sides = fragments.clamp(8, 16);
+        let nib = |x: f64, y: f64, pieces: &mut Vec<Shape>| {
+            let ring = (0..nib_sides)
+                .map(|step| {
+                    let angle =
+                        std::f64::consts::TAU * step as f64 / nib_sides as f64;
+                    [x + half * angle.cos(), y + half * angle.sin()]
+                })
+                .collect();
+            pieces.push(Shape::Polygon2d {
+                contours: vec![ring],
+            });
+        };
+        for (origin, glyph) in placed {
+            for polyline in font::polylines(glyph, fragments) {
+                let points: Vec<[f64; 2]> = polyline
+                    .into_iter()
+                    .map(|(x, y)| [origin + x * size + shift_x, y * size + shift_y])
+                    .collect();
+                for window in points.windows(2) {
+                    let (from, to) = (window[0], window[1]);
+                    let (dx, dy) = (to[0] - from[0], to[1] - from[1]);
+                    let length = dx.hypot(dy);
+                    if length <= f64::EPSILON {
+                        continue;
+                    }
+                    // Normal to the segment, scaled to half the pen.
+                    let (nx, ny) = (-dy / length * half, dx / length * half);
+                    pieces.push(Shape::Polygon2d {
+                        contours: vec![vec![
+                            [from[0] + nx, from[1] + ny],
+                            [to[0] + nx, to[1] + ny],
+                            [to[0] - nx, to[1] - ny],
+                            [from[0] - nx, from[1] - ny],
+                        ]],
+                    });
+                }
+                // A nib fills the wedge left between two quads that meet at
+                // an angle, so it belongs at the joints — and only there. A
+                // free end gets none: the quad already stops exactly on the
+                // last point, which is a butt cap, which is what makes `I`
+                // exactly one cap-height tall instead of a stroke taller. A
+                // closed run (a full circle, the `O`) has no free end, and its
+                // repeated first point is the joint that closes it.
+                let closed = points.len() > 2
+                    && (points[0][0] - points[points.len() - 1][0]).abs() < f64::EPSILON
+                    && (points[0][1] - points[points.len() - 1][1]).abs() < f64::EPSILON;
+                let joints = if closed {
+                    &points[..points.len() - 1]
+                } else if points.len() > 2 {
+                    &points[1..points.len() - 1]
+                } else {
+                    &points[..0]
+                };
+                for point in joints {
+                    nib(point[0], point[1], &mut pieces);
+                }
+                // A run with nothing to join is a dot — and a dot is its nib.
+                if points.len() == 1 {
+                    nib(points[0][0], points[0][1], &mut pieces);
+                }
+            }
+        }
+        Shape::union(pieces)
+    }
+
+    /// Drops the 3D children of an operation that only has a 2D meaning.
+    ///
+    /// `linear_extrude`, `rotate_extrude` and `offset` all take a profile.
+    /// Handed a solid, OpenSCAD warns `Ignoring 3D child object for 2D
+    /// operation` and extrudes whatever 2D children are left — verified
+    /// against the binary — so a stray `cube()` under an extrude costs that
+    /// child and nothing more.
+    fn keep_planar_children(&mut self, shapes: Vec<Shape>) -> Vec<Shape> {
         if shapes
             .iter()
-            .any(|shape| shape.dimension() != ShapeDimension::Planar)
+            .all(|shape| shape.dimension() == ShapeDimension::Planar)
         {
-            Err(EngineError::new(format!(
-                "{module}() expects only 2D child geometry."
-            )))
-        } else {
-            Ok(())
+            return shapes;
         }
+        let mut kept = shapes;
+        kept.retain(|shape| shape.dimension() == ShapeDimension::Planar);
+        self.warn_once("WARNING: Ignoring 3D child object for 2D operation.");
+        kept
     }
 
     fn cached_convex_hull(&mut self, shapes: &[Shape]) -> Result<Shape, EngineError> {
-        let points = Shape::hull_vertices(shapes)?;
+        let points = Shape::hull_vertices(shapes, self.cancellation)?;
         let key = points
             .iter()
             .map(|point| [point.x.to_bits(), point.y.to_bits(), point.z.to_bits()])
@@ -4361,7 +5034,7 @@ impl Evaluator<'_> {
         if let Some(shape) = self.hull_cache.get(&key) {
             return Ok(shape.clone());
         }
-        let shape = Shape::convex_hull_from_points(&points)?;
+        let shape = Shape::convex_hull_from_points(points)?;
         if self.hull_cache.len() < MAX_HULL_CACHE_ENTRIES {
             self.hull_cache.insert(key, shape.clone());
         }
@@ -4411,9 +5084,166 @@ impl Evaluator<'_> {
     }
 }
 
+/// Significant digits OpenSCAD prints a number with, from `DC_PRECISION_REQUESTED`.
+const NUMBER_PRECISION: usize = 6;
+
+/// Largest run of leading zeroes OpenSCAD prints before switching to an
+/// exponent, from `DC_MAX_LEADING_ZEROES`.
+const MAX_LEADING_ZEROES: i32 = 5;
+
+/// Formats a number the way OpenSCAD's `str()` and `echo` print it.
+///
+/// This is not cosmetic. `text(str(width))` on a dimension label renders the
+/// *string*, so a number printed as `0.3333333333333333` instead of
+/// `0.333333` is a different solid. OpenSCAD asks the double-conversion
+/// library for six significant digits with a positive exponent sign, a
+/// five-leading-zero and zero-trailing-zero budget before it switches to
+/// exponential notation, and then trims trailing zeroes (`Value.cc:76`,
+/// `:165`); the arithmetic below is that policy, which is why it is expressed
+/// in terms of `decimal_point` — the position of the point relative to the
+/// digit string — rather than as a format string.
+fn format_openscad_number(value: f64) -> String {
+    if value.is_nan() {
+        return "nan".into();
+    }
+    if value.is_infinite() {
+        return if value < 0.0 { "-inf" } else { "inf" }.into();
+    }
+    // `UNIQUE_ZERO` means negative zero prints without its sign.
+    if value == 0.0 {
+        return "0".into();
+    }
+    // Rust's `{:e}` is correctly rounded, so asking for `precision - 1` digits
+    // after the point is exactly "round to `precision` significant digits".
+    let scientific = format!("{:.*e}", NUMBER_PRECISION - 1, value);
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .expect("Rust always emits an exponent for {:e}");
+    let exponent: i32 = exponent
+        .parse()
+        .expect("Rust always emits a decimal exponent for {:e}");
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let digits = digits.trim_end_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    let sign = if mantissa.starts_with('-') { "-" } else { "" };
+    // `value = 0.<digits> * 10^decimal_point`.
+    let decimal_point = exponent + 1;
+
+    let needs_exponent =
+        1 - decimal_point > MAX_LEADING_ZEROES || decimal_point > NUMBER_PRECISION as i32;
+    if needs_exponent {
+        let mut output = format!("{sign}{}", &digits[..1]);
+        if digits.len() > 1 {
+            output.push('.');
+            output.push_str(&digits[1..]);
+        }
+        // `EMIT_POSITIVE_EXPONENT_SIGN`: `1e+6`, never `1e6`.
+        output.push('e');
+        output.push(if exponent < 0 { '-' } else { '+' });
+        output.push_str(&exponent.abs().to_string());
+        return output;
+    }
+    if decimal_point <= 0 {
+        return format!("{sign}0.{}{digits}", "0".repeat((-decimal_point) as usize));
+    }
+    let decimal_point = decimal_point as usize;
+    if decimal_point >= digits.len() {
+        return format!("{sign}{digits}{}", "0".repeat(decimal_point - digits.len()));
+    }
+    format!(
+        "{sign}{}.{}",
+        &digits[..decimal_point],
+        &digits[decimal_point..]
+    )
+}
+
+/// The word OpenSCAD uses for a value's type in its `undefined operation`
+/// warnings, so ours read the same way.
+fn value_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Number(_) => "number",
+        Value::Bool(_) => "bool",
+        Value::String(_) => "string",
+        Value::Vector(_) => "vector",
+        Value::Range { .. } => "range",
+        Value::Function(_) => "function",
+        Value::Undefined => "undefined",
+    }
+}
+
+/// The 64-bit integer a bitwise operator sees.
+///
+/// OpenSCAD casts the double straight to `int64_t`, so the fractional part is
+/// truncated toward zero and the pattern is two's complement: probing the
+/// binary gives `5.7 & 3 == 1`, `-3.5 & 7 == 5`, `~2.7 == -3`. Out-of-range
+/// and non-finite inputs saturate (`1e20 & 1 == 1`, `(1/0) & 1 == 1`) and NaN
+/// becomes zero (`(0/0) & 1 == 0`) — which is exactly what Rust's `as i64`
+/// does, so the cast needs no help.
+fn to_integer(value: f64) -> i64 {
+    value as i64
+}
+
+/// The shift distance, or `None` if OpenSCAD would refuse it.
+///
+/// The binary warns `negative shift` below zero and `shift too large` at 64 or
+/// more, returning undef either way; `1 << 63` is still allowed and wraps to
+/// `i64::MIN`, which is what it echoes.
+fn shift_amount(value: f64) -> Option<u32> {
+    let amount = to_integer(value);
+    if amount < 0 {
+        expression_warning("negative shift");
+        return None;
+    }
+    if amount >= 64 {
+        expression_warning("shift too large");
+        return None;
+    }
+    Some(amount as u32)
+}
+
+/// `&`, `|`, `<<`, `>>` over two values.
+///
+/// Every one of them is integer-only in OpenSCAD: anything but a pair of
+/// numbers warns `undefined operation (string & number)` and yields undef,
+/// rather than the coercion the arithmetic operators do.
+fn bitwise_values(left: Value, right: Value, operator: BinaryOp) -> Value {
+    let symbol = match operator {
+        BinaryOp::BitAnd => "&",
+        BinaryOp::BitOr => "|",
+        BinaryOp::ShiftLeft => "<<",
+        BinaryOp::ShiftRight => ">>",
+        _ => unreachable!("bitwise_values received {operator:?}"),
+    };
+    let (Value::Number(left), Value::Number(right)) = (&left, &right) else {
+        expression_warning(format!(
+            "undefined operation ({} {symbol} {})",
+            value_type_name(&left),
+            value_type_name(&right)
+        ));
+        return Value::Undefined;
+    };
+    let (left, right) = (*left, *right);
+    let result = match operator {
+        BinaryOp::BitAnd => to_integer(left) & to_integer(right),
+        BinaryOp::BitOr => to_integer(left) | to_integer(right),
+        BinaryOp::ShiftLeft => match shift_amount(right) {
+            Some(amount) => to_integer(left).wrapping_shl(amount),
+            None => return Value::Undefined,
+        },
+        BinaryOp::ShiftRight => match shift_amount(right) {
+            // Arithmetic, not logical: the binary echoes `-8 >> 1` as -4 and
+            // `-1 >> 1` as -1, so the sign bit is replicated.
+            Some(amount) => to_integer(left).wrapping_shr(amount),
+            None => return Value::Undefined,
+        },
+        _ => unreachable!("bitwise_values received {operator:?}"),
+    };
+    Value::Number(result as f64)
+}
+
 fn display_value(value: &Value) -> String {
     match value {
-        Value::Number(value) => value.to_string(),
+        Value::Number(value) => format_openscad_number(*value),
         Value::Bool(value) => value.to_string(),
         Value::String(value) => format!("{value:?}"),
         Value::Vector(values) => format!(
@@ -4424,7 +5254,12 @@ fn display_value(value: &Value) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        Value::Range { start, step, end } => format!("[{start}:{step}:{end}]"),
+        Value::Range { start, step, end } => format!(
+            "[{}:{}:{}]",
+            format_openscad_number(*start),
+            format_openscad_number(*step),
+            format_openscad_number(*end)
+        ),
         Value::Function(_) => "<function>".into(),
         Value::Undefined => "undef".into(),
     }
@@ -4471,6 +5306,16 @@ fn evaluate_expression(expression: &Expr, environment: &Environment) -> Result<V
                 }
                 UnaryOp::Negate => Ok(negate_value(value)),
                 UnaryOp::Not => Ok(Value::Bool(!truthy(&value))),
+                UnaryOp::BitNot => match value {
+                    Value::Number(value) => Ok(Value::Number(!to_integer(value) as f64)),
+                    other => {
+                        expression_warning(format!(
+                            "undefined operation (~ {})",
+                            value_type_name(&other)
+                        ));
+                        Ok(Value::Undefined)
+                    }
+                },
             }
         }
         Expr::Binary(left, operator, right) => {
@@ -4510,6 +5355,10 @@ fn evaluate_expression(expression: &Expr, environment: &Environment) -> Result<V
                     }
                     Ok(arithmetic_values(left, right, *operator))
                 }
+                BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::ShiftLeft
+                | BinaryOp::ShiftRight => Ok(bitwise_values(left, right, *operator)),
             }
         }
         Expr::Conditional(condition, then_value, else_value) => {
@@ -4693,8 +5542,13 @@ fn evaluate_list_element(
         ListElement::Each(value) => {
             let values = match evaluate_expression(value, environment)? {
                 Value::Vector(values) => values,
-                Value::Range { start, step, end } => {
-                    Evaluator::iterable_values(Value::Range { start, step, end })?
+                // A range and a string both splice their elements; everything
+                // else splices as a single element.
+                value @ (Value::Range { .. } | Value::String(_)) => {
+                    if let Value::Range { start, step, end } = value {
+                        budget.consume_amount(range_length(start, step, end).unwrap_or(0))?;
+                    }
+                    Evaluator::iterable_values(value)?
                 }
                 value => vec![value],
             };
@@ -4765,7 +5619,12 @@ fn evaluate_comprehension_bindings(
         return evaluate_list_element(body, environment, budget, output);
     }
     let (name, iterable) = &bindings[binding_index];
-    let values = Evaluator::iterable_values(evaluate_expression(iterable, environment)?)?;
+    let iterable = evaluate_expression(iterable, environment)?;
+    // Charged up front for the same reason as `for_iteration_shapes`.
+    if let Value::Range { start, step, end } = iterable {
+        budget.consume_amount(range_length(start, step, end).unwrap_or(0))?;
+    }
+    let values = Evaluator::iterable_values(iterable)?;
     // As in `for_iteration_shapes`, only the loop variable differs between
     // iterations and nothing downstream writes to `local`.
     let mut local = environment.clone();
@@ -5060,19 +5919,17 @@ fn arithmetic_values(left: Value, right: Value, operator: BinaryOp) -> Value {
                 _ => unreachable!(),
             }))
         }
+        // OpenSCAD adds the common prefix and drops the rest, so
+        // `[1,2] + [1,2,3]` is `[2,4]` rather than undef.
         (Value::Vector(left), Value::Vector(right), BinaryOp::Add)
         | (Value::Vector(left), Value::Vector(right), BinaryOp::Subtract) => {
-            if left.len() != right.len() {
-                None
-            } else {
-                let values = left
-                    .into_iter()
-                    .zip(right)
-                    .map(|(left, right)| arithmetic_values(left, right, operator))
-                    .collect::<Vec<_>>();
-                (!values.iter().any(|value| matches!(value, Value::Undefined)))
-                    .then_some(Value::Vector(values))
-            }
+            let values = left
+                .into_iter()
+                .zip(right)
+                .map(|(left, right)| arithmetic_values(left, right, operator))
+                .collect::<Vec<_>>();
+            (!values.iter().any(|value| matches!(value, Value::Undefined)))
+                .then_some(Value::Vector(values))
         }
         (Value::Number(scalar), Value::Vector(values), BinaryOp::Multiply) => {
             scale_vector(values, scalar, false)
@@ -5209,6 +6066,25 @@ fn truthy(value: &Value) -> bool {
     }
 }
 
+/// Orders two vectors lexicographically, or reports that they cannot be
+/// ordered because some element pair cannot be.
+fn compare_vectors(left: &[Value], right: &[Value]) -> (bool, Option<std::cmp::Ordering>) {
+    for (left, right) in left.iter().zip(right) {
+        let (supported, less) = compare_values(left, right, BinaryOp::Less);
+        if !supported {
+            return (false, None);
+        }
+        if less {
+            return (true, Some(std::cmp::Ordering::Less));
+        }
+        let (_, greater) = compare_values(left, right, BinaryOp::Greater);
+        if greater {
+            return (true, Some(std::cmp::Ordering::Greater));
+        }
+    }
+    (true, Some(left.len().cmp(&right.len())))
+}
+
 fn compare_values(left: &Value, right: &Value, operator: BinaryOp) -> (bool, bool) {
     let (supported, ordering) = match (left, right) {
         (Value::Number(left), Value::Number(right)) => (true, left.partial_cmp(right)),
@@ -5222,6 +6098,11 @@ fn compare_values(left: &Value, right: &Value, operator: BinaryOp) -> (bool, boo
         (Value::Number(left), Value::Bool(right)) => {
             (true, left.partial_cmp(&(*right as u8 as f64)))
         }
+        // Lexicographic, element by element, with a shorter prefix ordering
+        // before its extension: `[1,2] < [1,3]` and `[1,2] < [1,2,3]` are both
+        // true. SCAD sorting helpers are written against this, so returning
+        // `false` for every pair silently mis-sorts them.
+        (Value::Vector(left), Value::Vector(right)) => compare_vectors(left, right),
         _ => (false, None),
     };
     let result = match (operator, ordering) {
@@ -5384,6 +6265,24 @@ fn argument_number_optional(
         .transpose()
 }
 
+/// A string-valued argument, for the handful of OpenSCAD modules that take
+/// one. Absent is `None`; present but not a string is an error, because
+/// `halign = 1` is a mistake worth naming rather than a silent default.
+fn argument_text(
+    arguments: &[Argument],
+    name: &str,
+    index: usize,
+    environment: &Environment,
+) -> Result<Option<String>, EngineError> {
+    let Some(expression) = argument(arguments, name, index) else {
+        return Ok(None);
+    };
+    match evaluate_expression(expression, environment)? {
+        Value::String(value) => Ok(Some(value)),
+        _ => Err(EngineError::new(format!("Expected a string for {name}."))),
+    }
+}
+
 fn argument_bool(
     arguments: &[Argument],
     name: &str,
@@ -5423,6 +6322,95 @@ fn argument_vector(
         Value::Number(value) => Ok(vec![value]),
         _ => Err(EngineError::new(format!("Expected a vector for {name}."))),
     }
+}
+
+/// Read `polyhedron(points = ...)`: a list of 3D vertices.
+///
+/// A 2-element point is padded to `z = 0`, matching `getVec3(..., 0.0)` in the
+/// reference: `polyhedron` with flat input is a legitimate (if empty) solid,
+/// not a type error.
+fn argument_points3(
+    arguments: &[Argument],
+    name: &str,
+    index: usize,
+    environment: &Environment,
+) -> Result<Vec<Vec3>, EngineError> {
+    let expression = argument(arguments, name, index)
+        .ok_or_else(|| EngineError::new(format!("Expected {name}.")))?;
+    let Value::Vector(points) = evaluate_expression(expression, environment)? else {
+        return Err(EngineError::new(format!(
+            "Expected a vector of 3D points for {name}."
+        )));
+    };
+    points
+        .into_iter()
+        .map(|point| {
+            let Value::Vector(components) = point else {
+                return Err(EngineError::new(format!(
+                    "Expected a vector of 3D points for {name}."
+                )));
+            };
+            let mut coordinates = [0.0; 3];
+            if components.len() < 2 || components.len() > 3 {
+                return Err(EngineError::new(format!(
+                    "Expected 2 or 3 components per point for {name}."
+                )));
+            }
+            for (coordinate, value) in coordinates.iter_mut().zip(&components) {
+                let Some(value) = numeric_value(value).filter(|value| value.is_finite()) else {
+                    return Err(EngineError::new(format!(
+                        "Expected finite numeric point components for {name}."
+                    )));
+                };
+                *coordinate = value;
+            }
+            Ok(Vec3::new(coordinates[0], coordinates[1], coordinates[2]))
+        })
+        .collect()
+}
+
+/// Read `multmatrix(m = ...)`.
+///
+/// OpenSCAD starts from the identity and copies in whatever rows and columns
+/// the caller supplied, up to four of each — so a 3x4, a 4x4 and a ragged list
+/// of short rows are all accepted, and the missing cells keep their identity
+/// values. A final `w` other than 1 divides the whole matrix, which is how a
+/// projective matrix is normalised.
+fn argument_matrix4(
+    arguments: &[Argument],
+    name: &str,
+    index: usize,
+    environment: &Environment,
+) -> Result<[[f64; 4]; 4], EngineError> {
+    let expression = argument(arguments, name, index)
+        .ok_or_else(|| EngineError::new(format!("Expected {name}.")))?;
+    let Value::Vector(rows) = evaluate_expression(expression, environment)? else {
+        return Err(EngineError::new(format!("Expected a matrix for {name}.")));
+    };
+    let mut matrix = identity();
+    for (row, values) in matrix.iter_mut().zip(&rows) {
+        let Value::Vector(values) = values else {
+            return Err(EngineError::new(format!(
+                "Expected a vector of rows for {name}."
+            )));
+        };
+        for (cell, value) in row.iter_mut().zip(values) {
+            // A non-numeric cell keeps its identity value, as it does in the
+            // reference, rather than failing the whole transform.
+            if let Some(value) = numeric_value(value) {
+                *cell = value;
+            }
+        }
+    }
+    let w = matrix[3][3];
+    if w != 1.0 {
+        for row in matrix.iter_mut() {
+            for cell in row.iter_mut() {
+                *cell /= w;
+            }
+        }
+    }
+    Ok(matrix)
 }
 
 fn argument_points2(
@@ -5978,6 +6966,49 @@ impl Transform {
         })
     }
 
+    /// `multmatrix(m)`: an arbitrary affine transform.
+    ///
+    /// Unlike the constructors above there is no closed form for the inverse
+    /// or for how far the map can shrink a distance, so both are computed.
+    /// `distance_scale` has to be a *lower* bound on the smallest singular
+    /// value of the linear part; `1 / ||A^-1||` is one, and the Frobenius norm
+    /// bounds the spectral norm from above, so `1 / ||A^-1||_F` is safe and
+    /// costs no eigenvalue work.
+    ///
+    /// `None` for a singular matrix: the sampled path cannot evaluate a
+    /// transform it cannot invert, and a flattened solid is not renderable
+    /// anyway.
+    fn from_matrix(forward: [[f64; 4]; 4]) -> Option<Self> {
+        if forward.iter().flatten().any(|cell| !cell.is_finite()) {
+            return None;
+        }
+        let inverse = invert_matrix(forward)?;
+        let frobenius = (0..3)
+            .flat_map(|row| (0..3).map(move |column| (row, column)))
+            .map(|(row, column)| inverse[row][column] * inverse[row][column])
+            .sum::<f64>()
+            .sqrt();
+        if !frobenius.is_finite() || frobenius <= 0.0 {
+            return None;
+        }
+        // Orthogonal linear part: rotations, mirrors and their products keep
+        // Euclidean distance exactly, which the pruning bound can exploit.
+        let mut orthogonal = true;
+        for row in 0..3 {
+            for column in 0..3 {
+                let product: f64 = (0..3).map(|k| forward[row][k] * forward[column][k]).sum();
+                let expected = if row == column { 1.0 } else { 0.0 };
+                orthogonal &= (product - expected).abs() <= 1e-12;
+            }
+        }
+        Some(Self {
+            forward,
+            inverse,
+            distance_scale: if orthogonal { 1.0 } else { 1.0 / frobenius },
+            preserves_euclidean_distance: orthogonal,
+        })
+    }
+
     fn point(matrix: [[f64; 4]; 4], point: Vec3) -> Vec3 {
         Vec3::new(
             matrix[0][0] * point.x + matrix[0][1] * point.y + matrix[0][2] * point.z + matrix[0][3],
@@ -6024,6 +7055,52 @@ fn rotation_z(angle: f64) -> [[f64; 4]; 4] {
         [0.0, 0.0, 1.0, 0.0],
         [0.0, 0.0, 0.0, 1.0],
     ]
+}
+
+/// Gauss-Jordan inverse of a 4x4, or `None` when the matrix is singular.
+///
+/// Full pivoting is not needed — partial pivoting on the largest remaining
+/// element in the column is enough for the well-scaled matrices a
+/// `multmatrix()` carries — but pivoting at all is, because the common
+/// shear and projection matrices have zeroes on the diagonal.
+fn invert_matrix(matrix: [[f64; 4]; 4]) -> Option<[[f64; 4]; 4]> {
+    let mut work = matrix;
+    let mut inverse = identity();
+    for column in 0..4 {
+        let pivot = (column..4).max_by(|left, right| {
+            work[*left][column]
+                .abs()
+                .total_cmp(&work[*right][column].abs())
+        })?;
+        if work[pivot][column].abs() <= 1e-12 {
+            return None;
+        }
+        work.swap(column, pivot);
+        inverse.swap(column, pivot);
+        let scale = 1.0 / work[column][column];
+        for cell in 0..4 {
+            work[column][cell] *= scale;
+            inverse[column][cell] *= scale;
+        }
+        for row in 0..4 {
+            if row == column {
+                continue;
+            }
+            let factor = work[row][column];
+            if factor == 0.0 {
+                continue;
+            }
+            for cell in 0..4 {
+                work[row][cell] -= factor * work[column][cell];
+                inverse[row][cell] -= factor * inverse[column][cell];
+            }
+        }
+    }
+    inverse
+        .iter()
+        .flatten()
+        .all(|cell| cell.is_finite())
+        .then_some(inverse)
 }
 
 fn matrix_multiply(left: [[f64; 4]; 4], right: [[f64; 4]; 4]) -> [[f64; 4]; 4] {
@@ -6351,6 +7428,19 @@ enum Shape {
         /// How many layers a twisted or tapered extrusion is built from.
         slices: usize,
     },
+    /// `rotate_extrude(angle)`: a planar profile revolved about the Z axis.
+    ///
+    /// The profile is read in the XY plane, as OpenSCAD reads it, with `x`
+    /// becoming the radius and `y` the height. Geometry at negative `x` is
+    /// the caller's error — OpenSCAD rejects it outright — and the kernel
+    /// clips it away rather than folding the solid through its own axis.
+    RotateExtrude {
+        shape: Box<Shape>,
+        /// Degrees swept. 360 closes the ring; anything less leaves two caps.
+        angle: f64,
+        /// Facets a full turn is cut into, from `$fn`/`$fa`/`$fs`.
+        fragments: usize,
+    },
     MinkowskiDilation {
         shape: Box<Shape>,
         /// Centre of the second operand's bounding box.
@@ -6367,7 +7457,44 @@ enum Shape {
         /// evaluation time. `None` only where no operand was recorded.
         kernel: Option<Box<Shape>>,
     },
+    /// `polyhedron(points, faces)`: an explicit boundary representation.
+    ///
+    /// Faces are kept exactly as written — OpenSCAD winds them clockwise seen
+    /// from outside, and the kernel reverses them on the way in — because a
+    /// caller who got the winding wrong should see the same inside-out solid
+    /// here as there rather than a silently corrected one.
+    Polyhedron {
+        points: Vec<Vec3>,
+        faces: Vec<Vec<usize>>,
+    },
+    /// `resize(newsize, auto)`: a scale whose factors are not known until the
+    /// child's bounding box is.
+    ///
+    /// Kept as a node rather than folded into a `Transform` at evaluation
+    /// time because the exact kernel knows the child's *true* box, while
+    /// `Shape::bounds` only promises an enclosing one — they differ for a
+    /// difference, and `resize()` of a difference has to use the real one.
+    Resize {
+        shape: Box<Shape>,
+        newsize: Vec3,
+        auto: [bool; 3],
+    },
+    /// `projection(cut)`: a 3D child flattened to a 2D region, either as its
+    /// silhouette or as its slice through `z = 0`.
+    Projection {
+        shape: Box<Shape>,
+        cut: bool,
+    },
+    /// The convex hull of the children, carried as the point cloud they
+    /// contribute.
+    ///
+    /// The cloud is the primary representation: the exact kernel runs its own
+    /// hull over it, which is what makes `hull()` work for curved and CSG
+    /// children. `planes` is that same hull's face planes, kept because the
+    /// sampled path evaluates a hull as `max(n_i·p - o_i)` and has nothing
+    /// else to evaluate.
     Hull {
+        points: Vec<Vec3>,
         planes: Vec<HullPlane>,
         bounds: Bounds,
         bounds_distance_scale: f64,
@@ -6438,9 +7565,12 @@ impl Shape {
 
     /// Build `difference()`: `base` minus every shape in `subtract`.
     fn difference(base: Shape, subtract: Vec<Shape>) -> Shape {
-        let subtract = subtract.into_iter().map(BoundedChild::new).collect::<Vec<_>>();
-        let bvh = (subtract.len() >= BVH_CHILD_THRESHOLD)
-            .then(|| Box::new(ChildBvh::build(&subtract)));
+        let subtract = subtract
+            .into_iter()
+            .map(BoundedChild::new)
+            .collect::<Vec<_>>();
+        let bvh =
+            (subtract.len() >= BVH_CHILD_THRESHOLD).then(|| Box::new(ChildBvh::build(&subtract)));
         Shape::Difference {
             base: Box::new(base),
             subtract,
@@ -6459,6 +7589,7 @@ impl Shape {
             Shape::Transform { shape, .. }
             | Shape::Offset2d { shape, .. }
             | Shape::LinearExtrude { shape, .. }
+            | Shape::RotateExtrude { shape, .. }
             | Shape::MinkowskiDilation { shape, .. } => shape.stated_color(),
             Shape::Difference { base, .. } => base.stated_color(),
             _ => None,
@@ -6473,6 +7604,12 @@ impl Shape {
             | Shape::Circle2d { .. }
             | Shape::Box { .. } => 1.0,
             Shape::Sphere { .. } => 0.0,
+            // `polyhedron_distance` measures the true Euclidean distance to
+            // the surface, so outside the body it is never an underestimate.
+            Shape::Polyhedron { .. } => 1.0,
+            // A resize scales each axis differently and a projection collapses
+            // one, so neither can promise anything about its child's bound.
+            Shape::Resize { .. } | Shape::Projection { .. } => 0.0,
             Shape::Cylinder {
                 radius1, radius2, ..
             } => {
@@ -6493,6 +7630,9 @@ impl Shape {
             | Shape::LinearExtrude { shape, .. }
             | Shape::Color { shape, .. }
             | Shape::MinkowskiDilation { shape, .. } => shape.bounds_distance_scale(),
+            // Revolving is an isometry in the plane containing the axis, so a
+            // profile's own scale carries over unchanged.
+            Shape::RotateExtrude { shape, .. } => shape.bounds_distance_scale(),
             // A hull reports `max(n_i·p - o_i)`, which underestimates the true
             // distance near edges and corners. `Shape::convex_hull_from_points`
             // derives how far it can fall short.
@@ -6525,11 +7665,15 @@ impl Shape {
             | Shape::Polygon2d { .. }
             | Shape::Circle2d { .. }
             | Shape::Offset2d { .. } => ShapeDimension::Planar,
+            Shape::Projection { .. } => ShapeDimension::Planar,
             Shape::Sphere { .. }
             | Shape::Box { .. }
             | Shape::Cylinder { .. }
             | Shape::LinearExtrude { .. }
+            | Shape::RotateExtrude { .. }
+            | Shape::Polyhedron { .. }
             | Shape::Hull { .. } => ShapeDimension::Solid,
+            Shape::Resize { shape, .. } => shape.dimension(),
             Shape::Transform { shape, .. }
             | Shape::Color { shape, .. }
             | Shape::MinkowskiDilation { shape, .. } => shape.dimension(),
@@ -6622,12 +7766,43 @@ impl Shape {
                 let outside = planar.max(0.0).hypot(slab.max(0.0));
                 outside + planar.max(slab).min(0.0)
             }
+            // Revolving about Z is exact in a distance field, and uniquely so
+            // among the sweeps here: the solid is the profile evaluated in
+            // cylindrical coordinates, so `(x, y) -> (hypot(x, y), 0)` is all
+            // it takes. A partial sweep is not — the two caps would need half
+            // -space clipping — so it is meshed as the full ring and said out
+            // loud where the shape is built.
+            Shape::RotateExtrude { shape, .. } => {
+                shape.distance(Vec3::new(point.x.hypot(point.y), point.z, 0.0))
+            }
             Shape::MinkowskiDilation {
                 shape,
                 offset,
                 radius,
                 ..
             } => shape.distance(point.sub(*offset)) - radius,
+            Shape::Polyhedron { points, faces } => polyhedron_distance(points, faces, point),
+            Shape::Resize {
+                shape,
+                newsize,
+                auto,
+            } => {
+                let bounds = shape.bounds();
+                let factors = resize_factors(bounds.max.sub(bounds.min), *newsize, *auto);
+                let local = Vec3::new(
+                    point.x / factors.x,
+                    point.y / factors.y,
+                    point.z / factors.z,
+                );
+                shape.distance(local) * factors.x.abs().min(factors.y.abs()).min(factors.z.abs())
+            }
+            // A distance field has no way to flatten a solid: the silhouette
+            // of a body is not a function of the body's distance at any one
+            // point. The slice through `z = 0` is, and it is a subset of the
+            // silhouette, so the sampled path reports that for both and the
+            // exact kernel — which does compute the real projection — is what
+            // `projection()` is evaluated by in practice.
+            Shape::Projection { shape, .. } => shape.distance(Vec3::new(point.x, point.y, 0.0)),
             Shape::Hull { planes, .. } => planes
                 .iter()
                 .map(|plane| plane.normal.dot(point) - plane.offset)
@@ -6791,6 +7966,19 @@ impl Shape {
                     max: Vec3::new(max_x, max_y, minimum_z + height),
                 }
             }
+            // The swept solid reaches the profile's largest radius in every
+            // direction it turns through, and keeps the profile's own `y` as
+            // its height. Bounding a partial sweep by the full ring is loose
+            // but never wrong, and the pruning this feeds only needs an upper
+            // bound.
+            Shape::RotateExtrude { shape, .. } => {
+                let bounds = shape.bounds();
+                let radius = bounds.min.x.abs().max(bounds.max.x.abs());
+                Bounds {
+                    min: Vec3::new(-radius, -radius, bounds.min.y),
+                    max: Vec3::new(radius, radius, bounds.max.y),
+                }
+            }
             Shape::MinkowskiDilation {
                 shape,
                 offset,
@@ -6809,6 +7997,38 @@ impl Shape {
                     max: bounds.max.add(*offset).add(expansion),
                 }
             }
+            Shape::Polyhedron { points, .. } => point_bounds(points).unwrap_or(Bounds {
+                min: Vec3::default(),
+                max: Vec3::default(),
+            }),
+            Shape::Resize {
+                shape,
+                newsize,
+                auto,
+            } => {
+                let bounds = shape.bounds();
+                let factors = resize_factors(bounds.max.sub(bounds.min), *newsize, *auto);
+                let scale = |point: Vec3| {
+                    Vec3::new(
+                        point.x * factors.x,
+                        point.y * factors.y,
+                        point.z * factors.z,
+                    )
+                };
+                Bounds {
+                    min: scale(bounds.min),
+                    max: scale(bounds.max),
+                }
+            }
+            // Both the silhouette and the slice live inside the child's own
+            // footprint, so its box flattened onto `z = 0` encloses either.
+            Shape::Projection { shape, .. } => {
+                let bounds = shape.bounds();
+                Bounds {
+                    min: Vec3::new(bounds.min.x, bounds.min.y, 0.0),
+                    max: Vec3::new(bounds.max.x, bounds.max.y, 0.0),
+                }
+            }
             Shape::Hull { bounds, .. } => *bounds,
             Shape::Union { bounds, .. } => *bounds,
             Shape::Difference { base, .. } => base.bounds(),
@@ -6821,58 +8041,141 @@ impl Shape {
         }
     }
 
-    fn hull_vertices(shapes: &[Shape]) -> Result<Vec<Vec3>, EngineError> {
+    fn hull_vertices(
+        shapes: &[Shape],
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<Vec<Vec3>, EngineError> {
         let mut points = Vec::new();
         for shape in shapes {
-            shape.append_hull_vertices(&mut points)?;
+            shape.append_hull_vertices(&mut points, cancellation)?;
         }
         deduplicate_points(&mut points);
         Ok(points)
     }
 
-    fn convex_hull_from_points(points: &[Vec3]) -> Result<Shape, EngineError> {
-        let bounds = point_bounds(points)
+    fn convex_hull_from_points(points: Vec<Vec3>) -> Result<Shape, EngineError> {
+        let bounds = point_bounds(&points)
             .ok_or_else(|| EngineError::new("hull() requires at least one supported 3D child."))?;
-        let planes = convex_support_planes(points);
-        if planes.len() < 4 {
+        // The kernel's own hull — the one `csg::primitives::hull` runs — so
+        // the planes the sampled path evaluates describe exactly the polytope
+        // the exact path builds, instead of a second enumeration that could
+        // disagree with it.
+        let faces = crate::csg::hull::convex_hull(
+            &points
+                .iter()
+                .map(|point| crate::csg::Vec3::new(point.x, point.y, point.z))
+                .collect::<Vec<_>>(),
+        );
+        // A polytope enclosing a volume has at least four faces; fewer means
+        // the cloud is empty, collinear or coplanar.
+        if faces.len() < 4 {
             return Err(EngineError::new(
                 "hull() child vertices do not span a 3D volume.",
             ));
         }
-        let bounds_distance_scale = hull_bounds_distance_scale(&planes, points);
+        let planes = faces
+            .iter()
+            .map(|face| HullPlane {
+                normal: Vec3::new(
+                    face.plane.normal.x,
+                    face.plane.normal.y,
+                    face.plane.normal.z,
+                ),
+                offset: face.plane.offset,
+            })
+            .collect::<Vec<_>>();
+        let bounds_distance_scale = hull_bounds_distance_scale(&planes, &points);
         Ok(Shape::Hull {
+            points,
             planes,
             bounds,
             bounds_distance_scale,
         })
     }
 
-    fn append_hull_vertices(&self, output: &mut Vec<Vec3>) -> Result<(), EngineError> {
+    /// Collects the points a `hull()` should be taken over.
+    ///
+    /// OpenSCAD hulls the *tessellated* children, so the answer for a sphere
+    /// is its facet vertices and for a boolean it is the vertices of the
+    /// solid that boolean produced. The shapes with a closed-form vertex set
+    /// are enumerated directly; everything else is lowered through the exact
+    /// kernel, which yields precisely the cloud `csg::primitives::hull` would
+    /// have collected from the same children.
+    fn append_hull_vertices(
+        &self,
+        output: &mut Vec<Vec3>,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<(), EngineError> {
         match self {
             Shape::Box { .. } => output.extend(self.bounds().corners()),
             Shape::Transform { shape, transform } => {
                 let mut local = Vec::new();
-                shape.append_hull_vertices(&mut local)?;
+                shape.append_hull_vertices(&mut local, cancellation)?;
                 output.extend(
                     local
                         .into_iter()
                         .map(|point| Transform::point(transform.forward, point)),
                 );
             }
+            // A union contributes each child's cloud: hulling the union of
+            // several bodies is hulling all of their points together, and
+            // going through the kernel would pay for a boolean the hull then
+            // discards.
             Shape::Union { children, .. } => {
                 for child in children {
-                    child.shape.append_hull_vertices(output)?;
+                    child.shape.append_hull_vertices(output, cancellation)?;
                 }
             }
-            Shape::Color { shape, .. } => shape.append_hull_vertices(output)?,
-            _ => {
-                return Err(EngineError::new(
-                    "hull() currently supports cubes and unions/transforms of cubes.",
-                ));
+            Shape::Color { shape, .. } => shape.append_hull_vertices(output, cancellation)?,
+            // A nested `hull()` is already a point cloud, and the hull of a
+            // hull is the hull of its points.
+            Shape::Hull { points, .. } | Shape::Polyhedron { points, .. } => {
+                output.extend(points.iter().copied());
+            }
+            other => {
+                let solid = exact::shape_to_solid(other, cancellation)?;
+                for polygon in &solid.polygons {
+                    output.extend(
+                        polygon
+                            .vertices
+                            .iter()
+                            .map(|point| Vec3::new(point.x, point.y, point.z)),
+                    );
+                }
             }
         }
         Ok(())
     }
+}
+
+/// Collects the outline points a 2D `hull()` should be taken over.
+///
+/// OpenSCAD's `applyHull2D` gathers every vertex of every outline of every 2D
+/// child into one cloud, so disjoint children are bridged into a single convex
+/// region rather than hulled separately.
+fn hull_points_2d(
+    shapes: &[Shape],
+    cancellation: Option<&AtomicBool>,
+) -> Result<Vec<[f64; 2]>, EngineError> {
+    let mut points = Vec::new();
+    for shape in shapes {
+        let region = exact::shape_to_region(shape, cancellation)?;
+        for contour in &region.contours {
+            points.extend(contour.iter().copied());
+        }
+    }
+    Ok(points)
+}
+
+/// The per-axis factors `resize(newsize, auto)` applies to a body of extent
+/// `size`, in the evaluator's own vector type.
+fn resize_factors(size: Vec3, newsize: Vec3, auto: [bool; 3]) -> Vec3 {
+    let factors = crate::csg::primitives::resize_factors(
+        crate::csg::Vec3::new(size.x, size.y, size.z),
+        crate::csg::Vec3::new(newsize.x, newsize.y, newsize.z),
+        auto,
+    );
+    Vec3::new(factors.x, factors.y, factors.z)
 }
 
 fn point_bounds(points: &[Vec3]) -> Option<Bounds> {
@@ -6891,26 +8194,25 @@ fn point_bounds(points: &[Vec3]) -> Option<Bounds> {
     ))
 }
 
+/// Drops exact duplicates from a hull cloud.
+///
+/// Sorted rather than compared pairwise: a hull over curved children arrives
+/// with thousands of points, and the quadratic scan this replaced was
+/// affordable only while a cloud was a handful of box corners. Near-duplicates
+/// are left to `csg::hull::convex_hull`, which has its own relative tolerance
+/// and is the thing that actually has to be robust against them.
 fn deduplicate_points(points: &mut Vec<Vec3>) {
-    let Some(bounds) = point_bounds(points) else {
-        return;
-    };
-    let span = bounds.max.sub(bounds.min);
-    let tolerance = span.x.max(span.y).max(span.z).max(1.0) * 1e-10;
-    let mut unique = Vec::with_capacity(points.len());
-    for point in points.drain(..) {
-        if unique
-            .iter()
-            .all(|existing: &Vec3| existing.sub(point).length() > tolerance)
-        {
-            unique.push(point);
-        }
-    }
-    *points = unique;
+    points.sort_unstable_by(|left, right| {
+        left.x
+            .total_cmp(&right.x)
+            .then(left.y.total_cmp(&right.y))
+            .then(left.z.total_cmp(&right.z))
+    });
+    points.dedup_by(|left, right| left.x == right.x && left.y == right.y && left.z == right.z);
 }
 
-/// Safety margin absorbing the `side_tolerance` slack that
-/// [`convex_support_planes`] allows in each plane offset.
+/// Safety margin absorbing the tolerance the kernel's hull allows in each face
+/// plane's offset.
 const HULL_SCALE_SAFETY: f64 = 1.0 - 1e-6;
 
 /// How far `Shape::Hull`'s max-over-planes value can fall below the distance to
@@ -6949,54 +8251,65 @@ fn hull_bounds_distance_scale(planes: &[HullPlane], points: &[Vec3]) -> f64 {
     (inradius / circumradius * HULL_SCALE_SAFETY).clamp(0.0, 1.0)
 }
 
-fn convex_support_planes(points: &[Vec3]) -> Vec<HullPlane> {
-    let Some(bounds) = point_bounds(points) else {
-        return Vec::new();
-    };
-    let span = bounds.max.sub(bounds.min);
-    let scale = span.x.max(span.y).max(span.z).max(1.0);
-    let side_tolerance = scale * 1e-9;
-    let area_tolerance = scale * scale * 1e-12;
-    let mut planes: Vec<HullPlane> = Vec::new();
-
-    for first in 0..points.len() {
-        for second in first + 1..points.len() {
-            for third in second + 1..points.len() {
-                let cross = points[second]
-                    .sub(points[first])
-                    .cross(points[third].sub(points[first]));
-                let length = cross.length();
-                if length <= area_tolerance {
-                    continue;
-                }
-                let mut normal = cross.mul(1.0 / length);
-                let mut offset = normal.dot(points[first]);
-                let (minimum, maximum) = points.iter().fold(
-                    (f64::INFINITY, f64::NEG_INFINITY),
-                    |(minimum, maximum), point| {
-                        let distance = normal.dot(*point) - offset;
-                        (minimum.min(distance), maximum.max(distance))
-                    },
-                );
-                if maximum <= side_tolerance {
-                    // `normal` already points away from the other vertices.
-                } else if minimum >= -side_tolerance {
-                    normal = normal.mul(-1.0);
-                    offset = -offset;
-                } else {
-                    continue;
-                }
-                if planes.iter().any(|plane| {
-                    plane.normal.dot(normal) > 1.0 - 1e-9
-                        && (plane.offset - offset).abs() <= side_tolerance
-                }) {
-                    continue;
-                }
-                planes.push(HullPlane { normal, offset });
+/// Signed distance to a `polyhedron()`, for the sampled path.
+///
+/// Magnitude is the exact distance to the nearest triangle of the fan
+/// triangulation of each face; the sign comes from counting how many triangles
+/// a ray along `+X` crosses. Ray parity is the only classifier available for a
+/// face soup that carries no plane arithmetic, and it is exact for a closed
+/// surface except where the ray grazes an edge — a measure-zero set that the
+/// exact kernel, which is what actually meshes a polyhedron, never consults.
+fn polyhedron_distance(points: &[Vec3], faces: &[Vec<usize>], point: Vec3) -> f64 {
+    let mut distance = f64::INFINITY;
+    let mut crossings = 0usize;
+    for face in faces {
+        for corner in 1..face.len().saturating_sub(1) {
+            let (Some(a), Some(b), Some(c)) = (
+                points.get(face[0]),
+                points.get(face[corner]),
+                points.get(face[corner + 1]),
+            ) else {
+                continue;
+            };
+            distance = distance.min(point_triangle_distance(point, *a, *b, *c));
+            if ray_crosses_triangle(point, *a, *b, *c) {
+                crossings += 1;
             }
         }
     }
-    planes
+    if !distance.is_finite() {
+        return f64::INFINITY;
+    }
+    if crossings % 2 == 1 {
+        -distance
+    } else {
+        distance
+    }
+}
+
+/// Whether the ray from `origin` along `+X` crosses the triangle.
+fn ray_crosses_triangle(origin: Vec3, a: Vec3, b: Vec3, c: Vec3) -> bool {
+    const PARALLEL: f64 = 1e-12;
+    let direction = Vec3::new(1.0, 0.0, 0.0);
+    let edge1 = b.sub(a);
+    let edge2 = c.sub(a);
+    let pitch = direction.cross(edge2);
+    let determinant = edge1.dot(pitch);
+    if determinant.abs() < PARALLEL {
+        return false;
+    }
+    let inverse = 1.0 / determinant;
+    let offset = origin.sub(a);
+    let u = offset.dot(pitch) * inverse;
+    if !(0.0..=1.0).contains(&u) {
+        return false;
+    }
+    let cross = offset.cross(edge1);
+    let v = direction.dot(cross) * inverse;
+    if v < 0.0 || u + v > 1.0 {
+        return false;
+    }
+    edge2.dot(cross) * inverse > PARALLEL
 }
 
 fn rectangle_distance(x: f64, y: f64, half_width: f64, half_height: f64) -> f64 {
@@ -7513,7 +8826,10 @@ mod tests {
     #[test]
     fn a_kernel_budget_abort_becomes_the_error_it_describes() {
         let caught: Result<(), EngineError> = catch_geometry_panic(|| {
-            panic!("{}Too complex: budget of 7 nodes.", crate::csg::bsp::BUDGET_PANIC_PREFIX)
+            panic!(
+                "{}Too complex: budget of 7 nodes.",
+                crate::csg::bsp::BUDGET_PANIC_PREFIX
+            )
         });
         let message = caught.expect_err("the panic must not escape").to_string();
         assert_eq!(message, "Too complex: budget of 7 nodes.");
@@ -7584,7 +8900,11 @@ mod tests {
         // +X spun 45 deg about Z.
         assert_close(
             rotated_point("rotate([0,0,45]) cube(1);", Vec3::new(1.0, 0.0, 0.0)),
-            Vec3::new(std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2, 0.0),
+            Vec3::new(
+                std::f64::consts::FRAC_1_SQRT_2,
+                std::f64::consts::FRAC_1_SQRT_2,
+                0.0,
+            ),
         );
     }
 
@@ -7627,7 +8947,10 @@ mod tests {
         );
         // A non-axis-aligned axis: 120 deg about [1,1,1] cycles X -> Y -> Z.
         assert_close(
-            rotated_point("rotate(a=120, v=[1,1,1]) cube(1);", Vec3::new(1.0, 0.0, 0.0)),
+            rotated_point(
+                "rotate(a=120, v=[1,1,1]) cube(1);",
+                Vec3::new(1.0, 0.0, 0.0),
+            ),
             Vec3::new(0.0, 1.0, 0.0),
         );
         // The axis need not be normalized.
@@ -7705,10 +9028,9 @@ mod tests {
     #[test]
     fn polygon_rejects_out_of_range_path_indices() {
         let mut evaluator = Evaluator::default();
-        let statements = parse_resolved_program(
-            "polygon(points=[[0,0],[1,0],[1,1]], paths=[[0,1,9]]);",
-        )
-        .expect("parse");
+        let statements =
+            parse_resolved_program("polygon(points=[[0,0],[1,0],[1,1]], paths=[[0,1,9]]);")
+                .expect("parse");
         evaluator.evaluate_objects(&statements).expect("evaluate");
         assert!(evaluator
             .diagnostics
@@ -7721,27 +9043,35 @@ mod tests {
         let names: Vec<&str> = NAMED_COLORS.iter().map(|(name, _)| *name).collect();
         let mut sorted = names.clone();
         sorted.sort_unstable();
-        assert_eq!(names, sorted, "NAMED_COLORS must stay sorted for binary search");
+        assert_eq!(
+            names, sorted,
+            "NAMED_COLORS must stay sorted for binary search"
+        );
         for name in names {
-            parse_color_name(name)
-                .unwrap_or_else(|error| panic!("{name} should resolve: {error}"));
+            parse_color_name(name).unwrap_or_else(|error| panic!("{name} should resolve: {error}"));
         }
         // Spot-check a few against their CSS definitions, including the
         // British spellings and case insensitivity.
-        assert_eq!(parse_color_name("Gold").unwrap(), [1.0, 215.0 / 255.0, 0.0, 1.0]);
+        assert_eq!(
+            parse_color_name("Gold").unwrap(),
+            [1.0, 215.0 / 255.0, 0.0, 1.0]
+        );
         assert_eq!(
             parse_color_name("darkgrey").unwrap(),
             parse_color_name("darkgray").unwrap()
         );
-        assert_eq!(parse_color_name("transparent").unwrap(), [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(
+            parse_color_name("transparent").unwrap(),
+            [0.0, 0.0, 0.0, 0.0]
+        );
         assert!(parse_color_name("#gg0000").is_err());
         assert!(parse_color_name("#12345").is_err());
     }
 
     #[test]
     fn color_reaches_the_compiled_part() {
-        let output = compile_parts("color(\"red\") cube(2);", Quality::Preview, None)
-            .expect("compile");
+        let output =
+            compile_parts("color(\"red\") cube(2);", Quality::Preview, None).expect("compile");
         assert_eq!(output.parts[0].color, Some([1.0, 0.0, 0.0, 1.0]));
     }
 
@@ -7760,14 +9090,17 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{prefix} should evaluate: {error}"));
             assert_eq!(shape.stated_color(), Some(expected), "for {prefix}");
             // Color must never change the solid.
-            assert!(shape.distance(Vec3::new(1.0, 1.0, 1.0)) < 0.0, "for {prefix}");
+            assert!(
+                shape.distance(Vec3::new(1.0, 1.0, 1.0)) < 0.0,
+                "for {prefix}"
+            );
         }
     }
 
     #[test]
     fn color_survives_transforms_and_warns_on_unknown_names() {
-        let shape = evaluate_source("color(\"blue\") translate([5,0,0]) cube(2);")
-            .expect("evaluate");
+        let shape =
+            evaluate_source("color(\"blue\") translate([5,0,0]) cube(2);").expect("evaluate");
         assert_eq!(shape.stated_color(), Some([0.0, 0.0, 1.0, 1.0]));
 
         let statements = parse_resolved_program("color(\"nosuchcolor\") cube(2);").expect("parse");
@@ -7862,7 +9195,16 @@ mod tests {
         assert!(validate("module reusable(size=1) { cube(size); }").is_ok());
         assert!(validate("cube([1, 2, 3]);").is_ok());
         assert!(validate("cube([1, 2, 3]").is_err());
-        assert!(validate("unsupported_geometry();").is_err());
+        // An unknown module is reported, but as a warning: validation that
+        // rejected the file would hide every other problem in it.
+        let unknown = validate("unsupported_geometry();").expect("unknown modules are warnings");
+        assert!(
+            unknown
+                .iter()
+                .any(|message| message
+                    == "WARNING: Ignoring unknown module 'unsupported_geometry'."),
+            "expected the unknown module to be named, got {unknown:?}"
+        );
     }
 
     #[test]
@@ -8138,8 +9480,16 @@ mod tests {
         let output = compile(source, Quality::Preview, None).unwrap();
         // Six holes through a faceted cylinder: enough facets to be the real
         // shape, few enough to show the mesh is exact rather than sampled.
-        assert!(output.mesh.triangles.len() > 100, "{}", output.mesh.triangles.len());
-        assert!(output.mesh.triangles.len() < 2000, "{}", output.mesh.triangles.len());
+        assert!(
+            output.mesh.triangles.len() > 100,
+            "{}",
+            output.mesh.triangles.len()
+        );
+        assert!(
+            output.mesh.triangles.len() < 2000,
+            "{}",
+            output.mesh.triangles.len()
+        );
     }
 
     #[test]
@@ -8376,8 +9726,9 @@ mod tests {
             );
         }
         // `washer` delegates to `tube`, so it inherits the fix.
-        let shape = evaluate_source("include <shapes.scad>\nwasher(thickness=4, outer=8, inner=3);")
-            .expect("washer should evaluate");
+        let shape =
+            evaluate_source("include <shapes.scad>\nwasher(thickness=4, outer=8, inner=3);")
+                .expect("washer should evaluate");
         assert!(shape.distance(Vec3::new(0.0, 0.0, 3.5)) > 0.0);
         assert!(shape.distance(Vec3::new(5.5, 0.0, 3.5)) < 0.0);
     }
@@ -8400,8 +9751,9 @@ mod tests {
 
     #[test]
     fn the_first_of_two_sibling_root_modifiers_wins() {
-        let shape = evaluate_source("!cube(2, center=true); !translate([10,0,0]) cube(2, center=true);")
-            .expect("sibling roots should parse");
+        let shape =
+            evaluate_source("!cube(2, center=true); !translate([10,0,0]) cube(2, center=true);")
+                .expect("sibling roots should parse");
         assert!(shape.distance(Vec3::default()) < 0.0);
         assert!(shape.distance(Vec3::new(10.0, 0.0, 0.0)) > 0.0);
     }
@@ -8476,16 +9828,17 @@ mod tests {
     #[test]
     fn background_modifier_removes_its_subtree_from_the_csg_result() {
         // The `%` sphere would swallow the cube if it were unioned in.
-        let shape = evaluate_source("cube(2, center=true); %sphere(20);")
-            .expect("background should parse");
+        let shape =
+            evaluate_source("cube(2, center=true); %sphere(20);").expect("background should parse");
         assert!(shape.distance(Vec3::default()) < 0.0);
         assert!(
             shape.distance(Vec3::new(10.0, 0.0, 0.0)) > 0.0,
             "a %-modified sphere must not contribute geometry"
         );
         // And it must not resurface through a difference either.
-        let shape = evaluate_source("difference() { cube(10, center=true); %cube(30, center=true); }")
-            .expect("background should parse");
+        let shape =
+            evaluate_source("difference() { cube(10, center=true); %cube(30, center=true); }")
+                .expect("background should parse");
         assert!(shape.distance(Vec3::default()) < 0.0);
     }
 
@@ -8623,10 +9976,28 @@ mod tests {
         assert!(shape.distance(Vec3::new(9.0, 3.0, 0.0)) > 0.0);
     }
 
+    /// A module this engine does not implement is a warning, not the end of
+    /// the compile — the rest of the model still has to come out. OpenSCAD
+    /// renders `notamodule(); cube(5);` as a six-facet cube with one warning,
+    /// and so does this.
     #[test]
-    fn reports_unsupported_modules() {
-        let error = compile("torus(10);", Quality::Preview, None).unwrap_err();
-        assert!(error.to_string().contains("Unsupported module torus"));
+    fn reports_unsupported_modules_as_warnings_and_keeps_compiling() {
+        let output = compile("torus(10); cube([12, 8, 4]);", Quality::Preview, None)
+            .expect("an unknown module must not abort the compile");
+        assert!(
+            output
+                .messages
+                .iter()
+                .any(|message| message == "WARNING: Ignoring unknown module 'torus'."),
+            "the unknown module should be named in a warning, got {:?}",
+            output.messages
+        );
+        assert_eq!(output.mesh.triangles.len(), 12);
+
+        // With nothing else in the file there is no geometry left, which is a
+        // different complaint from "unsupported module".
+        let empty = compile("torus(10);", Quality::Preview, None).unwrap_err();
+        assert!(empty.to_string().contains("produced no geometry"));
     }
 
     #[test]
@@ -8758,13 +10129,36 @@ mod tests {
         assert!(shape.distance(Vec3::new(4.1, 0.0, 1.0)) > 0.0);
     }
 
+    /// Mixing dimensions is a warning and a dropped child, not a hard error:
+    /// OpenSCAD takes the operation's dimension from the *first* child, so
+    /// `union(){square(5); cube(5);}` keeps the square and ignores the cube.
+    /// Only the absence of any 3D geometry at the end is fatal.
     #[test]
-    fn rejects_unextruded_planar_output_and_mixed_dimension_csg() {
+    fn rejects_unextruded_planar_output_and_drops_mixed_dimension_children() {
         let planar = compile("square(5);", Quality::Preview, None).unwrap_err();
         assert!(planar.to_string().contains("no 3D geometry"));
 
-        let mixed = evaluate_source("union() { square(5); cube(5); }").unwrap_err();
-        assert!(mixed.to_string().contains("cannot mix 2D and 3D"));
+        let planar_first = evaluate_source("union() { square(5); cube(5); }")
+            .expect("the 3D child is ignored, not fatal");
+        assert_eq!(planar_first.dimension(), ShapeDimension::Planar);
+
+        let solid_first = compile(
+            "union() { cube([10, 10, 5]); square(4); }",
+            Quality::Preview,
+            None,
+        )
+        .expect("the 2D child is ignored, not fatal");
+        assert_eq!(solid_first.mesh.triangles.len(), 12);
+        for expected in [
+            "WARNING: Mixing 2D and 3D objects is not supported.",
+            "WARNING: Ignoring 2D child object for 3D operation.",
+        ] {
+            assert!(
+                solid_first.messages.iter().any(|message| message == expected),
+                "expected {expected:?} among {:?}",
+                solid_first.messages
+            );
+        }
     }
 
     fn unpruned_union_distance(shape: &Shape, point: Vec3) -> f64 {
@@ -8966,13 +10360,43 @@ mod tests {
         assert_eq!(bounds.max, Vec3::new(3.0, 1.0, 3.04));
     }
 
+    /// `hull()` used to accept only boxes, which ruled out the capsule, the
+    /// rounded slot and the tapered bracket — the three idioms it exists for.
     #[test]
-    fn rejects_curved_hull_operands_until_they_are_implemented() {
-        let error = evaluate_source("hull() { cube(2); sphere(2); }")
-            .expect_err("curved hull operands must not silently produce incorrect geometry");
-        assert!(error
-            .to_string()
-            .contains("supports cubes and unions/transforms of cubes"));
+    fn hulls_curved_and_derived_operands() {
+        let shape = evaluate_source("hull() { cube(2); sphere(2); }")
+            .expect("a hull of a cube and a sphere should evaluate");
+        let bounds = shape.bounds();
+        // The sphere's own facets decide the extent, so the box reaches past
+        // the cube's corner at (2, 2, 2) on every axis.
+        assert!(bounds.min.x < -1.5 && bounds.max.x >= 2.0);
+        assert!(shape.distance(Vec3::new(0.0, 0.0, 0.0)) < 0.0);
+
+        // A single non-convex child is convexified rather than passed through.
+        let shape = evaluate_source(
+            "hull() difference() { cube(10, center=true); cube([20, 4, 4], center=true); }",
+        )
+        .expect("a hull of a difference should evaluate");
+        assert!(shape.distance(Vec3::new(0.0, 0.0, 0.0)) < 0.0);
+        assert_eq!(shape.bounds().max, Vec3::new(5.0, 5.0, 5.0));
+
+        // And a hull of hulls, which needs the nested cloud to survive.
+        evaluate_source(
+            "hull() { hull() { sphere(1); translate([4, 0, 0]) sphere(1); } cube(1); }",
+        )
+        .expect("a nested hull should evaluate");
+    }
+
+    /// A 2D `hull()` is one convex outline over every child's vertices, so
+    /// disjoint children are bridged rather than hulled separately.
+    #[test]
+    fn hulls_planar_children_into_one_region() {
+        let shape = evaluate_source("hull() { square(2); translate([20, 10]) square(2); }")
+            .expect("a 2D hull should evaluate");
+        assert_eq!(shape.dimension(), ShapeDimension::Planar);
+        let bounds = shape.bounds();
+        assert_eq!(bounds.min, Vec3::new(0.0, 0.0, 0.0));
+        assert_eq!(bounds.max, Vec3::new(22.0, 12.0, 0.0));
     }
 
     #[test]
@@ -9081,6 +10505,10 @@ mod spec_builtins;
 #[cfg(test)]
 #[path = "engine/spec_curved_primitives.rs"]
 mod spec_curved_primitives;
+
+#[cfg(test)]
+#[path = "engine/spec_text.rs"]
+mod spec_text;
 
 #[cfg(test)]
 #[path = "engine/spec_comprehensions.rs"]

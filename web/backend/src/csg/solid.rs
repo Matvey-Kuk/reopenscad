@@ -647,7 +647,7 @@ impl PlaneIndex {
 
 /// Orthonormal basis `(u, v)` of a plane with `u x v == normal`, so that a
 /// counter-clockwise loop around `normal` is counter-clockwise in `(u, v)`.
-fn plane_basis(plane: Plane) -> (Vec3, Vec3) {
+pub fn plane_basis(plane: Plane) -> (Vec3, Vec3) {
     let normal = plane.normal;
     let helper = if normal.x.abs() < 0.9 {
         Vec3::new(1.0, 0.0, 0.0)

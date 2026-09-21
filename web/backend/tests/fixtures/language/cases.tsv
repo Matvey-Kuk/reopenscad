@@ -1,0 +1,27 @@
+# case_id\tsource\tdefinitions\treference
+hull-spheres\thull-spheres.scad\t\thull-spheres.stl
+hull-cylinders\thull-cylinders.scad\t\thull-cylinders.stl
+hull-mixed\thull-mixed.scad\t\thull-mixed.stl
+hull-2d\thull-2d.scad\t\thull-2d.stl
+hull-nested\thull-nested.scad\t\thull-nested.stl
+hull-nonconvex-child\thull-nonconvex-child.scad\t\thull-nonconvex-child.stl
+polyhedron-tetra\tpolyhedron-tetra.scad\t\tpolyhedron-tetra.stl
+polyhedron-prism\tpolyhedron-prism.scad\t\tpolyhedron-prism.stl
+resize-explicit\tresize-explicit.scad\t\tresize-explicit.stl
+resize-auto\tresize-auto.scad\t\tresize-auto.stl
+multmatrix-shear\tmultmatrix-shear.scad\t\tmultmatrix-shear.stl
+projection-shadow\tprojection-shadow.scad\t\tprojection-shadow.stl
+projection-cut\tprojection-cut.scad\t\tprojection-cut.stl
+render-alias\trender-alias.scad\t\trender-alias.stl
+semantics-precedence\tsemantics-precedence.scad\t\tsemantics-precedence.stl
+semantics-str-precision\tsemantics-str-precision.scad\t\tsemantics-str-precision.stl
+semantics-vector-compare\tsemantics-vector-compare.scad\t\tsemantics-vector-compare.stl
+semantics-vector-add\tsemantics-vector-add.scad\t\tsemantics-vector-add.stl
+semantics-each-string\tsemantics-each-string.scad\t\tsemantics-each-string.stl
+recover-unknown-module\trecover-unknown-module.scad\t\trecover-unknown-module.stl
+recover-2d-in-3d\trecover-2d-in-3d.scad\t\trecover-2d-in-3d.stl
+recover-zero-range-step\trecover-zero-range-step.scad\t\trecover-zero-range-step.stl
+fill-ring\tfill-ring.scad\t\tfill-ring.stl
+minkowski-2d\tminkowski-2d.scad\t\tminkowski-2d.stl
+deep-recursion\tdeep-recursion.scad\t\tdeep-recursion.stl
+numeric-literals\tnumeric-literals.scad\t\tnumeric-literals.stl

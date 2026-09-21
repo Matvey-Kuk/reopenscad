@@ -245,7 +245,6 @@ pub(super) fn shapes_to_solids(
     })
 }
 
-
 /// Compiles `source` to a kernel solid, stopping short of triangulation.
 ///
 /// The export path in [`compile_exact`] cannot be taken apart from outside
@@ -374,24 +373,36 @@ pub(super) fn shape_to_solid(
                 &region, *height, *center, *twist, *scale, *slices,
             ))
         }
-        Shape::Hull { planes, bounds, .. } => {
-            // The evaluator has already reduced the hull to its support
-            // planes, so the polytope is the intersection of their back
-            // half-spaces. Clipping a bounding box face by face is exact and
-            // costs nothing like a BSP boolean per plane.
-            let kernel_bounds = csg::Bounds {
-                min: kernel_vec(bounds.min),
-                max: kernel_vec(bounds.max),
-            };
-            let mut faces = csg::solid::bounding_box_polygons(kernel_bounds, 0.5);
-            for plane in planes {
-                let plane = csg::Plane::new(kernel_vec(plane.normal), plane.offset);
-                faces = csg::solid::clip_convex(&faces, plane);
-                if faces.is_empty() {
-                    break;
-                }
-            }
-            Ok(csg::Solid { polygons: faces }.simplified())
+        Shape::RotateExtrude {
+            shape,
+            angle,
+            fragments,
+        } => {
+            let region = shape_to_region(shape, cancellation)?;
+            Ok(csg::primitives::rotate_extrude(&region, *angle, *fragments))
+        }
+        // The evaluator carries the hull as the cloud its children
+        // contributed, so this is `csg::primitives::hull`'s second half: run
+        // the kernel's quickhull over the points and keep its faces. Rebuilding
+        // the polytope by clipping a box with one half-space per face, which is
+        // what this did while a hull was only ever a few box corners, does not
+        // survive the several hundred faces a hull of two spheres has.
+        Shape::Hull { points, .. } => Ok(csg::Solid {
+            polygons: csg::hull::convex_hull(
+                &points.iter().copied().map(kernel_vec).collect::<Vec<_>>(),
+            ),
+        }),
+        Shape::Polyhedron { points, faces } => {
+            let points = points.iter().copied().map(kernel_vec).collect::<Vec<_>>();
+            csg::primitives::polyhedron(&points, faces).map_err(EngineError::new)
+        }
+        Shape::Resize {
+            shape,
+            newsize,
+            auto,
+        } => {
+            let solid = shape_to_solid(shape, cancellation)?;
+            Ok(csg::primitives::resize(&solid, kernel_vec(*newsize), *auto))
         }
         Shape::MinkowskiDilation {
             shape,
@@ -419,7 +430,10 @@ pub(super) fn shape_to_solid(
             // of hundreds. Converting and folding them concurrently is the
             // difference between minutes and seconds on such a model, and the
             // operand order is preserved so the solid is unchanged.
-            let shapes = children.iter().map(|child| &child.shape).collect::<Vec<_>>();
+            let shapes = children
+                .iter()
+                .map(|child| &child.shape)
+                .collect::<Vec<_>>();
             let mut solids = Vec::with_capacity(shapes.len());
             for solid in shapes_to_solids(&shapes, cancellation) {
                 solids.push(solid?);
@@ -448,7 +462,8 @@ pub(super) fn shape_to_solid(
         Shape::Square2d { .. }
         | Shape::Circle2d { .. }
         | Shape::Polygon2d { .. }
-        | Shape::Offset2d { .. } => Err(EngineError::new(
+        | Shape::Offset2d { .. }
+        | Shape::Projection { .. } => Err(EngineError::new(
             "2D geometry needs an extrusion before it can be rendered as a solid.",
         )),
     }
@@ -519,6 +534,60 @@ pub(super) fn shape_to_region(
                 regions.push(shape_to_region(child, cancellation)?);
             }
             Ok(csg::planar::intersection_all(&regions))
+        }
+        Shape::Projection { shape, cut } => {
+            let solid = shape_to_solid(shape, cancellation)?;
+            Ok(if *cut {
+                csg::planar::projection_cut(&solid)
+            } else {
+                csg::planar::projection_shadow(&solid)
+            })
+        }
+        // A 2D `resize()` scales the contours directly: lifting the region to
+        // a prism to reuse the 3D path would resize the prism's thickness too.
+        Shape::Resize {
+            shape,
+            newsize,
+            auto,
+        } => {
+            let region = shape_to_region(shape, cancellation)?;
+            let Some(bounds) = region.bounds() else {
+                return Ok(region);
+            };
+            let factors = csg::primitives::resize_factors(
+                csg::Vec3::new(bounds.1[0] - bounds.0[0], bounds.1[1] - bounds.0[1], 0.0),
+                kernel_vec(*newsize),
+                *auto,
+            );
+            let contours = region
+                .contours
+                .into_iter()
+                .map(|contour| {
+                    contour
+                        .into_iter()
+                        .map(|point| [point[0] * factors.x, point[1] * factors.y])
+                        .collect()
+                })
+                .collect();
+            let mut region = csg::Region2d::new(contours);
+            region.normalize();
+            Ok(region)
+        }
+        // The 2D sum. The evaluator builds the same `MinkowskiDilation` node
+        // for planar children as for solid ones — `offset`/`radius` there
+        // describe the disc the *sampled* path dilates by — so all the exact
+        // kernel needs is the operand that node carried along. A node without
+        // one can only come from the sampled approximation, which never
+        // reaches here, so it falls through to the error below rather than
+        // being given a made-up disc.
+        Shape::MinkowskiDilation {
+            shape,
+            kernel: Some(kernel),
+            ..
+        } => {
+            let base = shape_to_region(shape, cancellation)?;
+            let tool = shape_to_region(kernel, cancellation)?;
+            csg::planar::minkowski(&base, &tool).map_err(EngineError::new)
         }
         _ => Err(EngineError::new(
             "This shape cannot be used where 2D geometry is expected.",
@@ -611,7 +680,11 @@ mod tests {
     #[test]
     fn a_difference_keeps_exact_coordinates() {
         let mesh = mesh_of("difference() { cube(10); translate([2,2,5]) cube(3); }");
-        assert!((volume(&mesh) - (1000.0 - 27.0)).abs() < 1e-9, "{}", volume(&mesh));
+        assert!(
+            (volume(&mesh) - (1000.0 - 27.0)).abs() < 1e-9,
+            "{}",
+            volume(&mesh)
+        );
     }
 
     #[test]
@@ -619,7 +692,11 @@ mod tests {
         let mesh = mesh_of(
             "linear_extrude(height=2) polygon(points=[[0,0],[10,0],[10,10],[0,10],[4,4],[6,4],[6,6],[4,6]], paths=[[0,1,2,3],[4,5,6,7]]);",
         );
-        assert!((volume(&mesh) - (100.0 - 4.0) * 2.0).abs() < 1e-9, "{}", volume(&mesh));
+        assert!(
+            (volume(&mesh) - (100.0 - 4.0) * 2.0).abs() < 1e-9,
+            "{}",
+            volume(&mesh)
+        );
     }
 
     #[test]
