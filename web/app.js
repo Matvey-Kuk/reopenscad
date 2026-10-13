@@ -355,6 +355,7 @@ const PRINTER_PLATES = [
     { id: 'bambu-x2d', name: 'X2D', size: [256, 256, 260] },
     { id: 'bambu-h2c', name: 'H2C', size: [305, 320, 325] },
     { id: 'bambu-h2d', name: 'H2D', size: [325, 320, 325] },
+    { id: 'bambu-a2l', name: 'A2L', size: [330, 320, 325] },
     { id: 'bambu-h2s', name: 'H2S', size: [340, 320, 340] },
   ] },
   { brand: 'Creality', models: [
