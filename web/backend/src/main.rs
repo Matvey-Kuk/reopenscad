@@ -16,7 +16,7 @@ mod threemf;
 use mcpapp::base64_encode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -31,6 +31,11 @@ use std::{os::unix::fs::OpenOptionsExt, os::unix::fs::PermissionsExt};
 
 const MAX_BODY: usize = 2 * 1024 * 1024;
 const MAX_OUTPUT: usize = 64 * 1024 * 1024;
+/// Companion + entry sources a workspace may hold. Matches the engine's
+/// include/use file ceiling so a project cannot store more than it can pull in.
+const MAX_WORKSPACE_FILES: usize = 32;
+/// Default entry filename for single-file (and newly created) workspaces.
+const DEFAULT_ENTRY: &str = "main.scad";
 /// Compute jobs that may run at the same time. One permit is one *request*,
 /// not one core: if the engine fans a single compile out across worker threads
 /// the permit still covers all of them, so this number times the engine's
@@ -166,7 +171,7 @@ const MCP_UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 const MCP_STATIC_CACHE_TTL_MS: u64 = 3_600_000;
 /// Shared by legacy `initialize` and modern `server/discover` so the two eras
 /// describe the server identically.
-const MCP_INSTRUCTIONS: &str = "Create and edit single-file SCAD workspaces, then render or export them. Workspaces do not expire, but a deployment holds a bounded number of them and evicts the least recently touched when it is full, so keep the authoritative copy of the source in a local .scad file and treat the workspace as a surface you can recreate. Workspace URLs are access capabilities: anyone holding the link has full read/write, so do not post them anywhere public. A workspace can also carry a separate read-only link, minted in the browser under Share; that link cannot be turned back into the editable one, and there is no MCP tool that creates or resolves one. Read ui://reopenscad/workspace/{workspaceId} for an embedded 3D preview app with STL and 3MF downloads.";
+const MCP_INSTRUCTIONS: &str = "Create and edit SCAD workspaces (one entry file plus optional companions for include/use), then render or export them. include <file.scad> and use <file.scad> resolve against the workspace file map first, then bundled libraries (units.scad, shapes.scad). Use list_workspace_files, get_workspace_code (path), and update_workspace_code (path/files/entry/deletePaths) for multi-file projects. Workspaces do not expire, but a deployment holds a bounded number of them and evicts the least recently touched when it is full, so keep the authoritative copy of the source in local .scad files and treat the workspace as a surface you can recreate. Workspace URLs are access capabilities: anyone holding the link has full read/write, so do not post them anywhere public. A workspace can also carry a separate read-only link, minted in the browser under Share; that link cannot be turned back into the editable one, and there is no MCP tool that creates or resolves one. Read ui://reopenscad/workspace/{workspaceId} for an embedded 3D preview app with STL and 3MF downloads.";
 
 #[derive(Clone)]
 struct AppState {
@@ -222,7 +227,14 @@ struct Workspace {
     id: String,
     #[serde(default = "default_workspace_name")]
     name: String,
+    /// Mirror of `files[entry]`. Kept for older clients and as the compile root.
     code: String,
+    /// Virtual path of the file that compiles / previews.
+    #[serde(default = "default_entry")]
+    entry: String,
+    /// All project sources, including the entry file. Exact virtual paths only.
+    #[serde(default)]
+    files: BTreeMap<String, String>,
     revision: u64,
     created_at: u64,
     updated_at: u64,
@@ -271,16 +283,28 @@ struct WorkspaceEvent {
     workspace_id: String,
     revision: u64,
     source: String,
+    /// Virtual path the edit applied to. Empty on legacy events (= entry).
+    #[serde(default)]
+    path: String,
     start: usize,
     end: usize,
     inserted_length: usize,
     timestamp: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspaceUpdate {
     code: Option<String>,
+    /// Target file for `code` or a range patch. Defaults to the current entry.
+    path: Option<String>,
+    /// Merge these paths into the workspace map (replace on key collision).
+    files: Option<BTreeMap<String, String>>,
+    /// Paths to remove. Ignored for the current entry unless a new entry is set
+    /// in the same update and the replacement content is present.
+    delete_paths: Option<Vec<String>>,
+    /// Switch which file compiles. Must exist in `files` after the update.
+    entry: Option<String>,
     name: Option<String>,
     start: Option<usize>,
     end: Option<usize>,
@@ -293,6 +317,10 @@ struct WorkspaceUpdate {
     tolerance: Option<f64>,
     #[serde(default = "default_edit_source")]
     source: String,
+}
+
+fn default_entry() -> String {
+    DEFAULT_ENTRY.into()
 }
 
 #[derive(Debug)]
@@ -549,7 +577,7 @@ impl WorkspaceStore {
             Err(error) => return Err(format!("Workspace could not be read: {error}")),
         };
         let workspace = match serde_json::from_slice::<Workspace>(&bytes) {
-            Ok(workspace) if workspace.id == id => workspace,
+            Ok(workspace) if workspace.id == id => normalize_workspace_document(workspace),
             _ => {
                 self.forget(inner, id);
                 return Ok(None);
@@ -563,22 +591,22 @@ impl WorkspaceStore {
     /// reaches this through [`Store::create`].
     #[cfg(test)]
     fn create(&self, code: String, name: Option<String>) -> Result<Workspace, String> {
-        self.create_with_settings(code, name, None, None)
+        self.create_with_settings(code, name, None, None, None, None)
     }
 
     /// `plate`/`tolerance` let a caller seed the viewer settings at creation
     /// time, which is how the browser carries the user's last plate choice into
-    /// a brand new workspace.
+    /// a brand new workspace. `files`/`entry` seed a multi-file project.
     fn create_with_settings(
         &self,
         code: String,
         name: Option<String>,
         plate: Option<String>,
         tolerance: Option<f64>,
+        files: Option<BTreeMap<String, String>>,
+        entry: Option<String>,
     ) -> Result<Workspace, String> {
-        if code.len() > MAX_BODY {
-            return Err("Workspace code exceeds the 2 MiB limit.".into());
-        }
+        let (files, entry, code) = assemble_workspace_files(code, files, entry)?;
         let now = unix_millis();
         let mut inner = self
             .inner
@@ -597,6 +625,8 @@ impl WorkspaceStore {
             id: id.clone(),
             name: sanitize_name(name),
             code,
+            entry,
+            files,
             revision: 1,
             created_at: now,
             updated_at: now,
@@ -645,38 +675,7 @@ impl WorkspaceStore {
         if expected != current.revision {
             return Err(UpdateError::Conflict(current));
         }
-        let (code, start, end, inserted_length) = if let Some(code) = update.code {
-            let old_len = current.code.len();
-            let new_len = code.len();
-            (code, 0, old_len, new_len)
-        } else {
-            let start = update.start.ok_or_else(|| {
-                UpdateError::Invalid("Provide code or a start/end/text edit.".into())
-            })?;
-            let end = update.end.ok_or_else(|| {
-                UpdateError::Invalid("Provide code or a start/end/text edit.".into())
-            })?;
-            let text = update.text.unwrap_or_default();
-            if start > end
-                || end > current.code.len()
-                || !current.code.is_char_boundary(start)
-                || !current.code.is_char_boundary(end)
-            {
-                return Err(UpdateError::Invalid(
-                    "Edit range must use valid UTF-8 byte offsets within the document.".into(),
-                ));
-            }
-            let mut code = current.code.clone();
-            code.replace_range(start..end, &text);
-            let inserted_length = text.len();
-            (code, start, end, inserted_length)
-        };
-        if code.len() > MAX_BODY {
-            return Err(UpdateError::Invalid(
-                "Workspace code exceeds the 2 MiB limit.".into(),
-            ));
-        }
-        validate_source(&code).map_err(UpdateError::Validation)?;
+        let prepared = prepare_workspace_edit(&current, &update)?;
         let mut inner = self
             .inner
             .lock()
@@ -693,13 +692,16 @@ impl WorkspaceStore {
             workspace_id: id.to_string(),
             revision: current.revision + 1,
             source: normalize_source(&update.source),
-            start,
-            end,
-            inserted_length,
+            path: prepared.path.clone(),
+            start: prepared.start,
+            end: prepared.end,
+            inserted_length: prepared.inserted_length,
             timestamp: now,
         };
         let mut workspace = latest;
-        workspace.code = code;
+        workspace.code = prepared.code;
+        workspace.entry = prepared.entry;
+        workspace.files = prepared.files;
         if let Some(name) = update.name {
             workspace.name = sanitize_name(Some(name));
         }
@@ -797,7 +799,14 @@ impl WorkspaceStore {
             file.write_all(&bytes)?;
             file.sync_all()?;
             fs::rename(&temporary_path, &final_path)?;
-            fs::File::open(&self.root)?.sync_all()
+            // Durability for the directory entry. Windows often returns
+            // ERROR_ACCESS_DENIED (os error 5) when syncing a directory handle;
+            // the rename already succeeded, so treat that as best-effort.
+            #[cfg(unix)]
+            fs::File::open(&self.root)?.sync_all()?;
+            #[cfg(not(unix))]
+            let _ = fs::File::open(&self.root).and_then(|dir| dir.sync_all());
+            Ok(())
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary_path);
@@ -865,7 +874,7 @@ enum Store {
 
 impl Store {
     fn create(&self, code: String, name: Option<String>) -> Result<Workspace, String> {
-        self.create_with_settings(code, name, None, None)
+        self.create_with_settings(code, name, None, None, None, None)
     }
 
     fn create_with_settings(
@@ -874,11 +883,17 @@ impl Store {
         name: Option<String>,
         plate: Option<String>,
         tolerance: Option<f64>,
+        files: Option<BTreeMap<String, String>>,
+        entry: Option<String>,
     ) -> Result<Workspace, String> {
         match self {
-            Self::Filesystem(store) => store.create_with_settings(code, name, plate, tolerance),
+            Self::Filesystem(store) => {
+                store.create_with_settings(code, name, plate, tolerance, files, entry)
+            }
             #[cfg(feature = "postgres")]
-            Self::Postgres(store) => store.create_with_settings(code, name, plate, tolerance),
+            Self::Postgres(store) => {
+                store.create_with_settings(code, name, plate, tolerance, files, entry)
+            }
         }
     }
 
@@ -1038,10 +1053,227 @@ fn valid_workspace_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
+#[allow(dead_code)] // kept for single-file callers and older tests
 fn validate_source(source: &str) -> Result<(), String> {
     engine::validate(source)
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+fn check_files_budget(files: &BTreeMap<String, String>) -> Result<(), String> {
+    if files.len() > MAX_WORKSPACE_FILES {
+        return Err(format!(
+            "A workspace may hold at most {MAX_WORKSPACE_FILES} files."
+        ));
+    }
+    let total: usize = files.values().map(String::len).sum();
+    if total > MAX_BODY {
+        return Err("Workspace files exceed the 2 MiB limit.".into());
+    }
+    Ok(())
+}
+
+/// Bring a deserialized workspace up to the multi-file shape. Legacy documents
+/// only have `code`; newer ones keep `code` as a mirror of `files[entry]`.
+fn normalize_workspace_document(mut workspace: Workspace) -> Workspace {
+    if workspace.entry.trim().is_empty() {
+        workspace.entry = DEFAULT_ENTRY.to_string();
+    } else if let Ok(normalized) = engine::normalize_virtual_path(&workspace.entry) {
+        workspace.entry = normalized;
+    } else {
+        workspace.entry = DEFAULT_ENTRY.to_string();
+    }
+    if workspace.files.is_empty() {
+        workspace
+            .files
+            .insert(workspace.entry.clone(), workspace.code.clone());
+    } else {
+        let mut normalized = BTreeMap::new();
+        for (path, source) in std::mem::take(&mut workspace.files) {
+            if let Ok(key) = engine::normalize_virtual_path(&path) {
+                normalized.insert(key, source);
+            }
+        }
+        workspace.files = normalized;
+        if !workspace.files.contains_key(&workspace.entry) {
+            workspace
+                .files
+                .insert(workspace.entry.clone(), workspace.code.clone());
+        }
+        workspace.code = workspace
+            .files
+            .get(&workspace.entry)
+            .cloned()
+            .unwrap_or_default();
+    }
+    workspace
+}
+
+fn assemble_workspace_files(
+    code: String,
+    files: Option<BTreeMap<String, String>>,
+    entry: Option<String>,
+) -> Result<(BTreeMap<String, String>, String, String), String> {
+    let entry = match entry {
+        Some(value) => engine::normalize_virtual_path(&value)?,
+        None => DEFAULT_ENTRY.to_string(),
+    };
+    let mut map = BTreeMap::new();
+    if let Some(files) = files {
+        for (path, source) in files {
+            let key = engine::normalize_virtual_path(&path)?;
+            map.insert(key, source);
+        }
+    }
+    map.insert(entry.clone(), code);
+    check_files_budget(&map)?;
+    let code = map
+        .get(&entry)
+        .cloned()
+        .ok_or_else(|| format!("Entry file {entry:?} is missing."))?;
+    Ok((map, entry, code))
+}
+
+fn workspace_source_loader(
+    files: &BTreeMap<String, String>,
+) -> Result<engine::WorkspaceFiles, String> {
+    engine::WorkspaceFiles::from_map(files.clone())
+}
+
+fn validate_workspace_files(
+    files: &BTreeMap<String, String>,
+    entry: &str,
+) -> Result<(), String> {
+    check_files_budget(files)?;
+    let entry_source = files
+        .get(entry)
+        .ok_or_else(|| format!("Entry file {entry:?} is missing."))?;
+    let workspace_files = workspace_source_loader(files)?;
+    let loader = engine::CompositeLoader {
+        workspace: &workspace_files,
+    };
+    engine::validate_with_loader(entry_source, &loader)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+struct PreparedEdit {
+    files: BTreeMap<String, String>,
+    entry: String,
+    code: String,
+    path: String,
+    start: usize,
+    end: usize,
+    inserted_length: usize,
+}
+
+fn prepare_workspace_edit(
+    current: &Workspace,
+    update: &WorkspaceUpdate,
+) -> Result<PreparedEdit, UpdateError> {
+    let mut files = current.files.clone();
+    let mut entry = current.entry.clone();
+
+    if let Some(ref incoming) = update.files {
+        for (path, source) in incoming {
+            let key = engine::normalize_virtual_path(path).map_err(UpdateError::Invalid)?;
+            files.insert(key, source.clone());
+        }
+    }
+
+    if let Some(ref new_entry) = update.entry {
+        entry = engine::normalize_virtual_path(new_entry).map_err(UpdateError::Invalid)?;
+    }
+
+    let path = match update.path.as_deref() {
+        Some(value) => engine::normalize_virtual_path(value).map_err(UpdateError::Invalid)?,
+        None => entry.clone(),
+    };
+
+    let has_content_edit = update.code.is_some()
+        || update.start.is_some()
+        || update.end.is_some()
+        || update.text.is_some();
+    let has_project_edit = update.files.is_some()
+        || update.delete_paths.is_some()
+        || update.entry.is_some();
+    if !has_content_edit && !has_project_edit {
+        return Err(UpdateError::Invalid(
+            "Provide code, a start/end/text edit, files, entry, or deletePaths.".into(),
+        ));
+    }
+
+    let (start, end, inserted_length) = if let Some(ref code) = update.code {
+        let old_len = files.get(&path).map(String::len).unwrap_or(0);
+        let inserted_length = code.len();
+        files.insert(path.clone(), code.clone());
+        (0, old_len, inserted_length)
+    } else if update.start.is_some() || update.end.is_some() || update.text.is_some() {
+        let start = update.start.ok_or_else(|| {
+            UpdateError::Invalid("Provide code or a start/end/text edit.".into())
+        })?;
+        let end = update.end.ok_or_else(|| {
+            UpdateError::Invalid("Provide code or a start/end/text edit.".into())
+        })?;
+        let text = update.text.clone().unwrap_or_default();
+        let current_content = files.get(&path).cloned().unwrap_or_default();
+        if start > end
+            || end > current_content.len()
+            || !current_content.is_char_boundary(start)
+            || !current_content.is_char_boundary(end)
+        {
+            return Err(UpdateError::Invalid(
+                "Edit range must use valid UTF-8 byte offsets within the file.".into(),
+            ));
+        }
+        let mut next = current_content;
+        next.replace_range(start..end, &text);
+        let inserted_length = text.len();
+        files.insert(path.clone(), next);
+        (start, end, inserted_length)
+    } else {
+        let len = files.get(&entry).map(String::len).unwrap_or(0);
+        (0, len, len)
+    };
+
+    if let Some(ref delete_paths) = update.delete_paths {
+        for value in delete_paths {
+            let key = engine::normalize_virtual_path(value).map_err(UpdateError::Invalid)?;
+            if key == entry {
+                return Err(UpdateError::Invalid(
+                    "Cannot delete the entry file; switch entry first.".into(),
+                ));
+            }
+            files.remove(&key);
+        }
+    }
+
+    if files.is_empty() {
+        return Err(UpdateError::Invalid(
+            "A workspace must keep at least one file.".into(),
+        ));
+    }
+    if !files.contains_key(&entry) {
+        return Err(UpdateError::Invalid(format!(
+            "Entry file {entry:?} is missing from the workspace."
+        )));
+    }
+
+    let code = files
+        .get(&entry)
+        .cloned()
+        .ok_or_else(|| UpdateError::Invalid(format!("Entry file {entry:?} is missing.")))?;
+    validate_workspace_files(&files, &entry).map_err(UpdateError::Validation)?;
+
+    Ok(PreparedEdit {
+        files,
+        entry,
+        code,
+        path,
+        start,
+        end,
+        inserted_length,
+    })
 }
 
 struct CompiledMesh {
@@ -2049,9 +2281,17 @@ fn compile_guarded(
     source: &str,
     quality: engine::Quality,
 ) -> Result<Arc<engine::CompileOutput>, String> {
+    compile_guarded_with_loader(source, quality, engine::bundled_library())
+}
+
+fn compile_guarded_with_loader(
+    source: &str,
+    quality: engine::Quality,
+    loader: &dyn engine::SourceLoader,
+) -> Result<Arc<engine::CompileOutput>, String> {
     let cancellation = Arc::new(AtomicBool::new(false));
     let deadline = RenderDeadline::start(&cancellation, deadline_for(quality));
-    engine::compile_shared(source, quality, Some(&cancellation))
+    engine::compile_shared_with_loader(source, quality, Some(&cancellation), loader)
         .map_err(|error| deadline.explain(error.to_string()))
 }
 
@@ -2060,10 +2300,40 @@ fn compile_parts_guarded(
     source: &str,
     quality: engine::Quality,
 ) -> Result<Arc<engine::MultipartCompileOutput>, String> {
+    compile_parts_guarded_with_loader(source, quality, engine::bundled_library())
+}
+
+fn compile_parts_guarded_with_loader(
+    source: &str,
+    quality: engine::Quality,
+    loader: &dyn engine::SourceLoader,
+) -> Result<Arc<engine::MultipartCompileOutput>, String> {
     let cancellation = Arc::new(AtomicBool::new(false));
     let deadline = RenderDeadline::start(&cancellation, deadline_for(quality));
-    engine::compile_parts_shared(source, quality, Some(&cancellation))
+    engine::compile_parts_shared_with_loader(source, quality, Some(&cancellation), loader)
         .map_err(|error| deadline.explain(error.to_string()))
+}
+
+fn compile_workspace_parts(
+    workspace: &Workspace,
+    quality: engine::Quality,
+) -> Result<Arc<engine::MultipartCompileOutput>, String> {
+    let files = workspace_source_loader(&workspace.files)?;
+    let loader = engine::CompositeLoader {
+        workspace: &files,
+    };
+    compile_parts_guarded_with_loader(&workspace.code, quality, &loader)
+}
+
+fn compile_workspace_whole(
+    workspace: &Workspace,
+    quality: engine::Quality,
+) -> Result<Arc<engine::CompileOutput>, String> {
+    let files = workspace_source_loader(&workspace.files)?;
+    let loader = engine::CompositeLoader {
+        workspace: &files,
+    };
+    compile_guarded_with_loader(&workspace.code, quality, &loader)
 }
 
 fn main() -> io::Result<()> {
@@ -2815,7 +3085,19 @@ fn handle_create_workspace(
         .and_then(Value::as_str)
         .unwrap_or(DEFAULT_SOURCE)
         .to_string();
-    if let Err(error) = validate_source(&code) {
+    let files = match parse_files_object(input.get("files")) {
+        Ok(files) => files,
+        Err(error) => return respond_error(stream, 400, &error),
+    };
+    let entry = input
+        .get("entry")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let assembled = match assemble_workspace_files(code, files, entry) {
+        Ok(assembled) => assembled,
+        Err(error) => return respond_error(stream, 400, &error),
+    };
+    if let Err(error) = validate_workspace_files(&assembled.0, &assembled.1) {
         return respond_validation_error(stream, error);
     }
     let name = input
@@ -2829,13 +3111,34 @@ fn handle_create_workspace(
         .and_then(Value::as_str)
         .map(str::to_string);
     let tolerance = input.get("tolerance").and_then(Value::as_f64);
-    match state
-        .workspaces
-        .create_with_settings(code, name, plate, tolerance)
-    {
+    match state.workspaces.create_with_settings(
+        assembled.2,
+        name,
+        plate,
+        tolerance,
+        Some(assembled.0),
+        Some(assembled.1),
+    ) {
         Ok(workspace) => respond_workspace(stream, 201, state, request, &workspace, None),
         Err(error) => respond_error(stream, 500, &error),
     }
+}
+
+fn parse_files_object(value: Option<&Value>) -> Result<Option<BTreeMap<String, String>>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| "files must be an object of path → source.".to_string())?;
+    let mut files = BTreeMap::new();
+    for (path, source) in object {
+        let source = source
+            .as_str()
+            .ok_or_else(|| format!("files[{path:?}] must be a string."))?;
+        files.insert(path.clone(), source.to_string());
+    }
+    Ok(Some(files))
 }
 
 fn handle_workspace_route(
@@ -2899,6 +3202,10 @@ fn handle_update_workspace(
         && update.start.is_none()
         && update.end.is_none()
         && update.text.is_none()
+        && update.files.is_none()
+        && update.delete_paths.is_none()
+        && update.entry.is_none()
+        && update.path.is_none()
         && (update.plate.is_some() || update.tolerance.is_some())
     {
         return match state
@@ -2957,9 +3264,14 @@ fn handle_query_workspace_code(
         Err(error) => return respond_error(stream, 500, &error),
     };
     let parameters = query_parameters(&request.query);
+    let path = parameters.get("path").map(String::as_str);
+    let source = match workspace_file_source(&workspace, path) {
+        Ok(source) => source,
+        Err(error) => return respond_error(stream, 400, &error),
+    };
     let start = query_usize(&parameters, "start").unwrap_or(0);
-    let end = query_usize(&parameters, "end").unwrap_or(workspace.code.len());
-    match workspace_code_slice(&workspace, start, end) {
+    let end = query_usize(&parameters, "end").unwrap_or(source.len());
+    match workspace_code_slice(&workspace, path, start, end) {
         Ok(payload) => respond_value(stream, 200, &payload),
         Err(error) => respond_error(stream, 400, &error),
     }
@@ -3111,25 +3423,55 @@ fn is_safe_preview_data_url(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
 }
 
+fn workspace_file_source<'a>(
+    workspace: &'a Workspace,
+    path: Option<&str>,
+) -> Result<&'a str, String> {
+    let key = match path {
+        Some(path) => engine::normalize_virtual_path(path)?,
+        None => workspace.entry.clone(),
+    };
+    workspace
+        .files
+        .get(&key)
+        .map(String::as_str)
+        .ok_or_else(|| format!("File {key:?} is not in this workspace."))
+}
+
 /// The partial-read payload shared by `GET /api/workspaces/{id}/code` and the
 /// `get_workspace_code` MCP tool, so the two can never disagree about which
 /// byte ranges are legal or what a slice reply looks like.
-fn workspace_code_slice(workspace: &Workspace, start: usize, end: usize) -> Result<Value, String> {
+fn workspace_code_slice(
+    workspace: &Workspace,
+    path: Option<&str>,
+    start: usize,
+    end: usize,
+) -> Result<Value, String> {
+    let key = match path {
+        Some(path) => engine::normalize_virtual_path(path)?,
+        None => workspace.entry.clone(),
+    };
+    let source = workspace
+        .files
+        .get(&key)
+        .ok_or_else(|| format!("File {key:?} is not in this workspace."))?;
     if start > end
-        || end > workspace.code.len()
-        || !workspace.code.is_char_boundary(start)
-        || !workspace.code.is_char_boundary(end)
+        || end > source.len()
+        || !source.is_char_boundary(start)
+        || !source.is_char_boundary(end)
     {
-        return Err("Range must use valid UTF-8 byte offsets within the document.".into());
+        return Err("Range must use valid UTF-8 byte offsets within the file.".into());
     }
     Ok(json!({
         "ok": true,
         "workspaceId": workspace.id,
         "revision": workspace.revision,
+        "path": key,
+        "entry": workspace.entry,
         "start": start,
         "end": end,
-        "totalLength": workspace.code.len(),
-        "code": &workspace.code[start..end]
+        "totalLength": source.len(),
+        "code": &source[start..end]
     }))
 }
 
@@ -3213,6 +3555,8 @@ fn workspace_events_payload(id: &str, workspace: &Workspace, since: u64) -> Valu
     });
     if changed {
         payload["code"] = json!(workspace.code);
+        payload["entry"] = json!(workspace.entry);
+        payload["files"] = json!(workspace.files);
     }
     payload
 }
@@ -3283,8 +3627,19 @@ fn handle_workspace_render(
     // is the difference between a queue and a slow rejection.
     let started = Instant::now();
     let deadline = RenderDeadline::start(&cancellation, deadline_for(quality));
-    let compiled = match engine::compile_parts_shared(&workspace.code, quality, Some(&cancellation))
-    {
+    let workspace_files = match workspace_source_loader(&workspace.files) {
+        Ok(files) => files,
+        Err(error) => return respond_error(stream, 422, &error),
+    };
+    let loader = engine::CompositeLoader {
+        workspace: &workspace_files,
+    };
+    let compiled = match engine::compile_parts_shared_with_loader(
+        &workspace.code,
+        quality,
+        Some(&cancellation),
+        &loader,
+    ) {
         Ok(compiled) => compiled,
         Err(error) if deadline.expired() => {
             return respond_error(stream, 422, &deadline.explain(error.to_string()))
@@ -3464,7 +3819,7 @@ fn handle_workspace_intersections(
         Ok(permit) => permit,
         Err(rejection) => return respond_queue_rejection(stream, rejection),
     };
-    let compiled = match compile_parts_guarded(&workspace.code, engine::Quality::Preview) {
+    let compiled = match compile_workspace_parts(&workspace, engine::Quality::Preview) {
         Ok(compiled) => compiled,
         Err(error) => return respond_error(stream, 422, &error),
     };
@@ -3659,7 +4014,7 @@ fn handle_workspace_export(
     if !is_supported_export_format(format.as_str()) {
         return respond_error(stream, 400, &supported_export_formats_sentence());
     }
-    let selected_mesh = match export_mesh(&workspace.code, object_ids.as_deref()) {
+    let selected_mesh = match export_workspace_mesh(&workspace, object_ids.as_deref()) {
         Ok(mesh) => mesh,
         Err(error) => return respond_error(stream, 422, &error),
     };
@@ -3748,6 +4103,18 @@ fn export_mesh(source: &str, object_ids: Option<&[String]>) -> Result<engine::Me
     selected_parts_mesh(&output, Some(object_ids), engine::Quality::Render, None)
 }
 
+fn export_workspace_mesh(
+    workspace: &Workspace,
+    object_ids: Option<&[String]>,
+) -> Result<engine::Mesh, String> {
+    let Some(object_ids) = object_ids else {
+        return compile_workspace_whole(workspace, engine::Quality::Render)
+            .map(|output| output.mesh.clone());
+    };
+    let output = compile_workspace_parts(workspace, engine::Quality::Render)?;
+    selected_parts_mesh(&output, Some(object_ids), engine::Quality::Render, None)
+}
+
 fn selected_parts_mesh(
     output: &engine::MultipartCompileOutput,
     object_ids: Option<&[String]>,
@@ -3807,6 +4174,8 @@ fn workspace_public(
         "id": workspace.id,
         "name": workspace.name,
         "code": workspace.code,
+        "entry": workspace.entry,
+        "files": workspace.files,
         "revision": workspace.revision,
         "createdAt": workspace.created_at,
         "updatedAt": workspace.updated_at,
@@ -4530,7 +4899,7 @@ fn mcp_read_resource(state: &AppState, request: &Request, uri: &str) -> Result<V
         .render_queue
         .acquire(current_client_key(), None, None)
         .map_err(QueueRejection::message)?;
-    let compiled = compile_parts_guarded(&workspace.code, engine::Quality::Preview)?;
+    let compiled = compile_workspace_parts(&workspace, engine::Quality::Preview)?;
     let preview = mcpapp::encode_preview(&compiled.mesh);
     let html = mcpapp::viewer_html(
         id,
@@ -4557,16 +4926,23 @@ fn mcp_tool_definitions() -> Vec<Value> {
     vec![
         mcp_tool(
             "create_workspace",
-            "Create a single-file SCAD workspace and return its browser URL. \
+            "Create a SCAD workspace (optionally multi-file) and return its browser URL. \
+             Pass files as a path→source map and entry as the compile root; code is the entry \
+             source (defaults to main.scad). include/use resolve against files then bundled libs. \
              The workspace does not expire, but a deployment holds a bounded number of them and \
-             evicts the least recently touched one when it is full, so save the SCAD source to a \
-             local .scad file (for example alongside the user's project) and treat that file as \
+             evicts the least recently touched one when it is full, so save sources locally as \
              the source of truth. The returned URL is an access capability: anyone with the link \
              can read and change the work, so share it deliberately and never post it publicly.",
             json!({
                 "type": "object",
                 "properties": {
-                    "code": {"type": "string", "description": "Initial SCAD source."},
+                    "code": {"type": "string", "description": "Initial SCAD source for the entry file."},
+                    "entry": {"type": "string", "description": "Virtual path of the compile entry (default main.scad)."},
+                    "files": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": "Companion (and entry) sources keyed by virtual path."
+                    },
                     "name": {"type": "string"}
                 }
             }),
@@ -4577,13 +4953,25 @@ fn mcp_tool_definitions() -> Vec<Value> {
             json!({"type": "object", "properties": {}}),
         ),
         mcp_tool(
+            "list_workspace_files",
+            "List virtual paths in a workspace, the compile entry, and each file's byte length.",
+            json!({
+                "type": "object",
+                "required": ["workspaceId"],
+                "properties": {
+                    "workspaceId": {"type": "string"}
+                }
+            }),
+        ),
+        mcp_tool(
             "get_workspace_code",
-            "Read all or a UTF-8 byte range of workspace source to minimize token usage.",
+            "Read all or a UTF-8 byte range of one workspace file (path defaults to entry).",
             json!({
                 "type": "object",
                 "required": ["workspaceId"],
                 "properties": {
                     "workspaceId": {"type": "string"},
+                    "path": {"type": "string", "description": "Virtual path; defaults to the entry file."},
                     "start": {"type": "integer", "minimum": 0},
                     "end": {"type": "integer", "minimum": 0}
                 }
@@ -4591,13 +4979,21 @@ fn mcp_tool_definitions() -> Vec<Value> {
         ),
         mcp_tool(
             "update_workspace_code",
-            "Validate and atomically replace source or apply one partial UTF-8 byte-range edit.",
+            "Validate and atomically replace a file, apply a UTF-8 byte-range edit, merge files, \
+             change entry, or deletePaths. path defaults to the current entry.",
             json!({
                 "type": "object",
                 "required": ["workspaceId", "expectedRevision"],
                 "properties": {
                     "workspaceId": {"type": "string"},
+                    "path": {"type": "string"},
                     "code": {"type": "string"},
+                    "files": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"}
+                    },
+                    "deletePaths": {"type": "array", "items": {"type": "string"}},
+                    "entry": {"type": "string"},
                     "start": {"type": "integer", "minimum": 0},
                     "end": {"type": "integer", "minimum": 0},
                     "text": {"type": "string"},
@@ -4736,6 +5132,7 @@ fn mcp_call_tool(state: &AppState, request: &Request, name: &str, arguments: Val
     let result = match name {
         "create_workspace" => mcp_create_workspace(state, request, &arguments),
         "get_supported_scad" => Ok(supported_scad_dictionary()),
+        "list_workspace_files" => mcp_list_workspace_files(state, &arguments),
         "get_workspace_code" => mcp_get_workspace_code(state, &arguments),
         "update_workspace_code" => mcp_update_workspace(state, request, arguments),
         "render_workspace" => mcp_render_workspace(state, request, &arguments),
@@ -4782,17 +5179,57 @@ fn mcp_create_workspace(
         .and_then(Value::as_str)
         .unwrap_or(DEFAULT_SOURCE)
         .to_string();
-    validate_source(&code).map_err(|error| format!("SCAD validation failed: {error}"))?;
+    let files = parse_files_object(arguments.get("files"))?;
+    let entry = arguments
+        .get("entry")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let (files_map, entry_path, code) = assemble_workspace_files(code, files, entry)?;
+    validate_workspace_files(&files_map, &entry_path)
+        .map_err(|error| format!("SCAD validation failed: {error}"))?;
     let name = arguments
         .get("name")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let workspace = state.workspaces.create(code, name)?;
-    let objects = workspace_object_summaries(&workspace.code);
+    let workspace = state.workspaces.create_with_settings(
+        code,
+        name,
+        None,
+        None,
+        Some(files_map),
+        Some(entry_path),
+    )?;
+    let objects = workspace_object_summaries_for(&workspace);
     Ok(json!({
         "ok": true,
         "workspace": workspace_public(&workspace, state, request, None, Some(objects)),
         "url": workspace_url(state, request, &workspace.id)
+    }))
+}
+
+fn mcp_list_workspace_files(state: &AppState, arguments: &Value) -> Result<Value, String> {
+    let id = argument_workspace_id(arguments)?;
+    let workspace = state
+        .workspaces
+        .get(id)?
+        .ok_or_else(|| "Workspace not found.".to_string())?;
+    let files: Vec<Value> = workspace
+        .files
+        .iter()
+        .map(|(path, source)| {
+            json!({
+                "path": path,
+                "bytes": source.len(),
+                "entry": path == &workspace.entry
+            })
+        })
+        .collect();
+    Ok(json!({
+        "ok": true,
+        "workspaceId": id,
+        "revision": workspace.revision,
+        "entry": workspace.entry,
+        "files": files
     }))
 }
 
@@ -4802,12 +5239,14 @@ fn mcp_get_workspace_code(state: &AppState, arguments: &Value) -> Result<Value, 
         .workspaces
         .get(id)?
         .ok_or_else(|| "Workspace not found.".to_string())?;
+    let path = arguments.get("path").and_then(Value::as_str);
+    let source = workspace_file_source(&workspace, path)?;
     let start = arguments.get("start").and_then(Value::as_u64).unwrap_or(0) as usize;
     let end = arguments
         .get("end")
         .and_then(Value::as_u64)
-        .unwrap_or(workspace.code.len() as u64) as usize;
-    workspace_code_slice(&workspace, start, end)
+        .unwrap_or(source.len() as u64) as usize;
+    workspace_code_slice(&workspace, path, start, end)
 }
 
 fn mcp_update_workspace(
@@ -4826,7 +5265,7 @@ fn mcp_update_workspace(
         serde_json::from_value(arguments).map_err(|error| format!("Invalid update: {error}"))?;
     match state.workspaces.update(&id, update) {
         Ok(result) => {
-            let objects = workspace_object_summaries(&result.workspace.code);
+            let objects = workspace_object_summaries_for(&result.workspace);
             Ok(json!({
                 "ok": true,
                 "valid": true,
@@ -4884,7 +5323,7 @@ fn mcp_render_workspace(
     }
     let object_ids = requested_object_ids(arguments, &HashMap::new())?;
     // Permit held by `mcp_call_tool`.
-    let output = compile_parts_guarded(&workspace.code, engine::Quality::Render)?;
+    let output = compile_workspace_parts(&workspace, engine::Quality::Render)?;
     if multipart_binary_size(&output).is_none_or(|size| size > MAX_OUTPUT) {
         return Err("Aggregate multipart mesh output exceeds the 64 MiB limit.".into());
     }
@@ -4944,6 +5383,12 @@ fn workspace_object_summaries(source: &str) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+fn workspace_object_summaries_for(workspace: &Workspace) -> Vec<Value> {
+    compile_workspace_parts(workspace, engine::Quality::Preview)
+        .map(|output| output.parts.iter().map(part_summary_public).collect())
+        .unwrap_or_default()
+}
+
 fn mcp_list_workspace_objects(state: &AppState, arguments: &Value) -> Result<Value, String> {
     let id = argument_workspace_id(arguments)?;
     let workspace = state
@@ -4959,11 +5404,13 @@ fn mcp_list_workspace_objects(state: &AppState, arguments: &Value) -> Result<Val
         }
     }
     // Permit held by `mcp_call_tool`.
-    let compiled = compile_parts_guarded(&workspace.code, engine::Quality::Preview)?;
+    let compiled = compile_workspace_parts(&workspace, engine::Quality::Preview)?;
     Ok(json!({
         "ok": true,
         "workspaceId": id,
         "revision": workspace.revision,
+        "entry": workspace.entry,
+        "files": workspace.files.keys().cloned().collect::<Vec<_>>(),
         "objects": compiled
             .parts
             .iter()
@@ -5001,7 +5448,7 @@ fn mcp_intersections(state: &AppState, arguments: &Value) -> Result<Value, Strin
         .and_then(Value::as_f64)
         .ok_or_else(|| "tolerance is required and must be a number.".to_string())?;
     // Permit held by `mcp_call_tool`.
-    let compiled = compile_parts_guarded(&workspace.code, engine::Quality::Preview)?;
+    let compiled = compile_workspace_parts(&workspace, engine::Quality::Preview)?;
     if multipart_binary_size(&compiled).is_none_or(|size| size > MAX_OUTPUT) {
         return Err("Aggregate multipart mesh output exceeds the 64 MiB limit.".into());
     }
@@ -5029,8 +5476,15 @@ fn supported_scad_dictionary() -> Value {
             "variables", "vectors", "ranges", "arithmetic", "comparison", "boolean operators",
             "bitwise operators (& | ~ << >>)", "hexadecimal literals (0x1f)",
             "ternary expressions", "if/else", "for", "intersection_for", "let", "assert",
-            "echo", "modules", "functions", "children", "recursive modules"
+            "echo", "modules", "functions", "children", "recursive modules",
+            "include <file.scad>", "use <file.scad>"
         ],
+        "include": {
+            "workspaceFiles": true,
+            "bundledLibraries": ["units.scad", "MCAD/units.scad", "shapes.scad", "MCAD/shapes.scad"],
+            "maxFiles": MAX_WORKSPACE_FILES,
+            "maxDepth": 8
+        },
         "functions": [
             "abs", "sign", "floor", "ceil", "round", "sqrt", "exp", "ln", "log", "sin",
             "cos", "tan", "asin", "acos", "atan", "pow", "min", "max", "norm", "cross",
@@ -5561,6 +6015,8 @@ mod tests {
                 None,
                 Some("prusa-mk4s".into()),
                 Some(0.35),
+                None,
+                None,
             )
             .unwrap();
         assert_eq!(created.plate, "prusa-mk4s");
@@ -5579,6 +6035,10 @@ mod tests {
                 &created.id,
                 WorkspaceUpdate {
                     code: Some("cube(2);".into()),
+                    path: None,
+                    files: None,
+                    delete_paths: None,
+                    entry: None,
                     name: None,
                     start: None,
                     end: None,
@@ -5608,10 +6068,12 @@ mod tests {
     /// looking at the workspace.
     #[test]
     fn events_payload_always_carries_the_viewer_settings() {
-        let workspace = Workspace {
+        let workspace = normalize_workspace_document(Workspace {
             id: "sunny-otter-0011223344556677".into(),
             name: "Untitled model".into(),
             code: "cube(10);".into(),
+            entry: String::new(),
+            files: BTreeMap::new(),
             revision: 7,
             created_at: 1,
             updated_at: 2,
@@ -5620,7 +6082,7 @@ mod tests {
             preview: String::new(),
             share_token: String::new(),
             events: Vec::new(),
-        };
+        });
         // Nothing changed: the settings still have to be there.
         let idle = workspace_events_payload(&workspace.id, &workspace, 7);
         assert_eq!(idle["changed"], json!(false));
@@ -6084,6 +6546,54 @@ mod tests {
     }
 
     #[test]
+    fn multi_file_include_validates_and_switches_entry() {
+        let mut files: BTreeMap<String, String> = BTreeMap::new();
+        files.insert("trf_common.scad".into(), "size = 6;\n".into());
+        files.insert(
+            "part.scad".into(),
+            "include <trf_common.scad>\ncube(size);\n".into(),
+        );
+        let (files, entry, code) = assemble_workspace_files(
+            files["part.scad"].clone(),
+            Some(files),
+            Some("part.scad".into()),
+        )
+        .unwrap();
+        assert_eq!(entry, "part.scad");
+        assert_eq!(files.len(), 2);
+        assert_eq!(code, files["part.scad"]);
+        validate_workspace_files(&files, &entry).unwrap();
+
+        let current = normalize_workspace_document(Workspace {
+            id: "sunny-otter-0011223344556677".into(),
+            name: "Untitled model".into(),
+            code,
+            entry,
+            files,
+            revision: 1,
+            created_at: 1,
+            updated_at: 1,
+            plate: String::new(),
+            tolerance: DEFAULT_TOLERANCE,
+            preview: String::new(),
+            share_token: String::new(),
+            events: Vec::new(),
+        });
+        let prepared = prepare_workspace_edit(
+            &current,
+            &WorkspaceUpdate {
+                entry: Some("trf_common.scad".into()),
+                expected_revision: Some(1),
+                source: "browser".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(prepared.entry, "trf_common.scad");
+        assert_eq!(prepared.code, "size = 6;\n");
+    }
+
+    #[test]
     fn range_updates_are_validated_atomic_and_revision_checked() {
         let (store, root) = temporary_store();
         let workspace = store.create("cube(1);".into(), None).unwrap();
@@ -6091,16 +6601,12 @@ mod tests {
             .update(
                 &workspace.id,
                 WorkspaceUpdate {
-                    code: None,
-                    name: None,
                     start: Some(5),
                     end: Some(6),
                     text: Some("12".into()),
                     expected_revision: Some(1),
-                    base_revision: None,
-                    plate: None,
-                    tolerance: None,
                     source: "ai".into(),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -6113,15 +6619,9 @@ mod tests {
                 &workspace.id,
                 WorkspaceUpdate {
                     code: Some("sphere(3);".into()),
-                    name: None,
-                    start: None,
-                    end: None,
-                    text: None,
                     expected_revision: Some(1),
-                    base_revision: None,
-                    plate: None,
-                    tolerance: None,
                     source: "browser".into(),
+                    ..Default::default()
                 }
             ),
             Err(UpdateError::Conflict(_))
@@ -6138,15 +6638,8 @@ mod tests {
             &workspace.id,
             WorkspaceUpdate {
                 code: Some("cube(2);".into()),
-                name: None,
-                start: None,
-                end: None,
-                text: None,
-                expected_revision: None,
-                base_revision: None,
-                plate: None,
-                tolerance: None,
                 source: "browser".into(),
+                ..Default::default()
             },
         );
         assert!(
@@ -6164,15 +6657,9 @@ mod tests {
             &workspace.id,
             WorkspaceUpdate {
                 code: Some("cube(;".into()),
-                name: None,
-                start: None,
-                end: None,
-                text: None,
                 expected_revision: Some(1),
-                base_revision: None,
-                plate: None,
-                tolerance: None,
                 source: "ai".into(),
+                ..Default::default()
             },
         );
         assert!(matches!(result, Err(UpdateError::Validation(_))));
@@ -6474,6 +6961,7 @@ mod tests {
             vec![
                 "create_workspace",
                 "get_supported_scad",
+                "list_workspace_files",
                 "get_workspace_code",
                 "update_workspace_code",
                 "render_workspace",
@@ -6933,10 +7421,12 @@ mod tests {
 
     #[test]
     fn events_payload_omits_source_when_nothing_changed() {
-        let workspace = Workspace {
+        let workspace = normalize_workspace_document(Workspace {
             id: "sunny-otter-0011223344556677".into(),
             name: "Untitled model".into(),
             code: "cube(10);".repeat(4096),
+            entry: String::new(),
+            files: BTreeMap::new(),
             revision: 7,
             created_at: 1,
             updated_at: 2,
@@ -6945,7 +7435,7 @@ mod tests {
             preview: String::new(),
             share_token: String::new(),
             events: Vec::new(),
-        };
+        });
         let idle = workspace_events_payload(&workspace.id, &workspace, 7);
         assert_eq!(idle["changed"], json!(false));
         assert!(

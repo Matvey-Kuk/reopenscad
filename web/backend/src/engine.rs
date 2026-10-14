@@ -4,7 +4,7 @@
 //! load OpenSCAD WASM, or shell out to any CAD engine.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -270,6 +270,181 @@ pub trait SourceLoader {
     fn library_paths(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Stable identity of every file this loader can serve, used to key the
+    /// compile cache so an edit to an included companion invalidates results.
+    /// Bundled-only loaders return an empty string.
+    fn cache_fingerprint(&self) -> String {
+        String::new()
+    }
+}
+
+/// Normalize a virtual include/use path the same way loaders match on.
+///
+/// Rejects traversal, absolute paths, backslashes and empty components so a
+/// workspace map can never be tricked into reading outside its keys.
+pub fn normalize_virtual_path(path: &str) -> Result<String, String> {
+    let trimmed = path.trim();
+    let requested = trimmed.strip_prefix("./").unwrap_or(trimmed);
+    if requested.is_empty() {
+        return Err("include/use path is empty".to_string());
+    }
+    if requested.contains('\\') || requested.contains('\0') {
+        return Err(format!(
+            "{requested:?} is not a valid virtual path (use forward slashes only)"
+        ));
+    }
+    if requested.starts_with('/') {
+        return Err(format!("{requested:?} is an absolute path, which is not allowed"));
+    }
+    let mut chars = requested.chars();
+    if chars.next().is_some_and(|c| c.is_ascii_alphabetic()) && chars.next() == Some(':') {
+        return Err(format!("{requested:?} is an absolute path, which is not allowed"));
+    }
+    for component in requested.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(format!(
+                "{requested:?} is not a valid virtual path (no '.' or '..' components)"
+            ));
+        }
+    }
+    Ok(requested.to_string())
+}
+
+/// Project-owned sources `include` / `use` can resolve, keyed by virtual path.
+///
+/// SECURITY POLICY: exact key match only after [`normalize_virtual_path`]. No
+/// host filesystem access.
+#[derive(Clone, Debug, Default)]
+pub struct WorkspaceFiles {
+    files: BTreeMap<String, String>,
+}
+
+impl WorkspaceFiles {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_map(files: BTreeMap<String, String>) -> Result<Self, String> {
+        let mut normalized = BTreeMap::new();
+        for (path, source) in files {
+            let key = normalize_virtual_path(&path)?;
+            if normalized.insert(key.clone(), source).is_some() {
+                return Err(format!("duplicate workspace file {key:?}"));
+            }
+        }
+        Ok(Self { files: normalized })
+    }
+
+    pub fn insert(&mut self, path: impl Into<String>, source: impl Into<String>) -> Result<(), String> {
+        let key = normalize_virtual_path(&path.into())?;
+        self.files.insert(key, source.into());
+        Ok(())
+    }
+
+    pub fn remove(&mut self, path: &str) -> Option<String> {
+        let Ok(key) = normalize_virtual_path(path) else {
+            return None;
+        };
+        self.files.remove(&key)
+    }
+
+    pub fn get(&self, path: &str) -> Option<&str> {
+        let Ok(key) = normalize_virtual_path(path) else {
+            return None;
+        };
+        self.files.get(&key).map(String::as_str)
+    }
+
+    pub fn contains(&self, path: &str) -> bool {
+        self.get(path).is_some()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.files.keys().map(String::as_str)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.files
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+    }
+
+    pub fn into_map(self) -> BTreeMap<String, String> {
+        self.files
+    }
+
+    pub fn as_map(&self) -> &BTreeMap<String, String> {
+        &self.files
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.files.values().map(String::len).sum()
+    }
+}
+
+impl SourceLoader for WorkspaceFiles {
+    fn load(&self, virtual_path: &str) -> Result<Option<String>, String> {
+        let key = normalize_virtual_path(virtual_path)?;
+        Ok(self.files.get(&key).cloned())
+    }
+
+    fn library_paths(&self) -> Vec<String> {
+        self.files.keys().cloned().collect()
+    }
+
+    fn cache_fingerprint(&self) -> String {
+        let mut out = String::new();
+        for (path, source) in &self.files {
+            out.push_str(path);
+            out.push('\0');
+            out.push_str(&source.len().to_string());
+            out.push('\0');
+            out.push_str(source);
+            out.push('\0');
+        }
+        out
+    }
+}
+
+/// Prefer workspace files, then the bundled allowlist (OpenSCAD: project then library).
+pub struct CompositeLoader<'a> {
+    pub workspace: &'a WorkspaceFiles,
+}
+
+impl SourceLoader for CompositeLoader<'_> {
+    fn load(&self, virtual_path: &str) -> Result<Option<String>, String> {
+        if let Some(source) = self.workspace.load(virtual_path)? {
+            return Ok(Some(source));
+        }
+        BUNDLED_LIBRARY.load(virtual_path)
+    }
+
+    fn library_paths(&self) -> Vec<String> {
+        let mut paths = self.workspace.library_paths();
+        paths.extend(BUNDLED_LIBRARY.library_paths());
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    fn cache_fingerprint(&self) -> String {
+        self.workspace.cache_fingerprint()
+    }
+}
+
+/// The bundled `units.scad` / `shapes.scad` allowlist used when no workspace
+/// files are supplied.
+pub fn bundled_library() -> &'static dyn SourceLoader {
+    &BUNDLED_LIBRARY
 }
 
 /// The complete set of sources `include <...>` / `use <...>` can reach.
@@ -432,9 +607,14 @@ fn resolve_file_directives(
             .map_err(|error| EngineError::new(format!("Line {line}: {error}")))?
         else {
             let available = loader.library_paths().join(", ");
+            let available = if available.is_empty() {
+                "(none)".to_string()
+            } else {
+                available
+            };
             return Err(EngineError::new(format!(
-                "Line {line}: {path:?} is not a bundled library. \
-                 This service has no user file system; available libraries are: {available}."
+                "Line {line}: {path:?} was not found. \
+                 Available files: {available}."
             )));
         };
         *loaded += 1;
@@ -473,12 +653,14 @@ fn resolve_file_directives(
     Ok(resolved)
 }
 
-/// Parse `source` and expand its `include`/`use` directives against the
-/// bundled library.
-fn parse_resolved_program(source: &str) -> Result<Vec<Stmt>, EngineError> {
+/// Parse `source` and expand its `include`/`use` directives against `loader`.
+fn parse_resolved_program(
+    source: &str,
+    loader: &dyn SourceLoader,
+) -> Result<Vec<Stmt>, EngineError> {
     let tokens = Lexer::new(source).tokenize()?;
     let statements = Parser::new(tokens).parse_program()?;
-    resolve_file_directives(statements, &BUNDLED_LIBRARY, &mut Vec::new(), &mut 0)
+    resolve_file_directives(statements, loader, &mut Vec::new(), &mut 0)
 }
 
 /// Tolerance-aware relationship between two visible objects.
@@ -601,15 +783,25 @@ pub fn compile(
     quality: Quality,
     cancellation: Option<&AtomicBool>,
 ) -> Result<CompileOutput, EngineError> {
-    catch_geometry_panic(|| compile_unguarded(source, quality, cancellation))
+    compile_with_loader(source, quality, cancellation, &BUNDLED_LIBRARY)
+}
+
+pub fn compile_with_loader(
+    source: &str,
+    quality: Quality,
+    cancellation: Option<&AtomicBool>,
+    loader: &dyn SourceLoader,
+) -> Result<CompileOutput, EngineError> {
+    catch_geometry_panic(|| compile_unguarded(source, quality, cancellation, loader))
 }
 
 fn compile_unguarded(
     source: &str,
     quality: Quality,
     cancellation: Option<&AtomicBool>,
+    loader: &dyn SourceLoader,
 ) -> Result<CompileOutput, EngineError> {
-    let statements = parse_resolved_program(source)?;
+    let statements = parse_resolved_program(source, loader)?;
     let mut evaluator = Evaluator {
         cancellation,
         preview: matches!(quality, Quality::Preview),
@@ -665,7 +857,16 @@ pub fn compile_sampled(
     quality: Quality,
     cancellation: Option<&AtomicBool>,
 ) -> Result<CompileOutput, EngineError> {
-    let statements = parse_resolved_program(source)?;
+    compile_sampled_with_loader(source, quality, cancellation, &BUNDLED_LIBRARY)
+}
+
+pub fn compile_sampled_with_loader(
+    source: &str,
+    quality: Quality,
+    cancellation: Option<&AtomicBool>,
+    loader: &dyn SourceLoader,
+) -> Result<CompileOutput, EngineError> {
+    let statements = parse_resolved_program(source, loader)?;
     let mut evaluator = Evaluator {
         cancellation,
         preview: matches!(quality, Quality::Preview),
@@ -699,7 +900,14 @@ pub fn compile_sampled(
 /// or definitions-only libraries. It still reports syntax, expression, module,
 /// assertion, and evaluation-limit errors.
 pub fn validate(source: &str) -> Result<Vec<String>, EngineError> {
-    let statements = parse_resolved_program(source)?;
+    validate_with_loader(source, &BUNDLED_LIBRARY)
+}
+
+pub fn validate_with_loader(
+    source: &str,
+    loader: &dyn SourceLoader,
+) -> Result<Vec<String>, EngineError> {
+    let statements = parse_resolved_program(source, loader)?;
     // Nothing is meshed here, so the kernel choice cannot change the answer —
     // but it does decide which approximation warnings are emitted, and the
     // approximations validation should describe are the default path's.
@@ -817,15 +1025,21 @@ const COMPILED_PARTS_CACHE_MAX_TRIANGLES: usize = 1_000_000;
 
 struct CompiledPartsEntry {
     source: String,
+    /// Fingerprint of companion sources from the loader (empty for bundled-only).
+    loader_key: String,
     quality: Quality,
     output: Arc<MultipartCompileOutput>,
 }
 
-fn cached_compiled_parts(source: &str, quality: Quality) -> Option<Arc<MultipartCompileOutput>> {
+fn cached_compiled_parts(
+    source: &str,
+    loader_key: &str,
+    quality: Quality,
+) -> Option<Arc<MultipartCompileOutput>> {
     let mut cache = COMPILED_PARTS.lock().ok()?;
-    let index = cache
-        .iter()
-        .position(|entry| entry.quality == quality && entry.source == source)?;
+    let index = cache.iter().position(|entry| {
+        entry.quality == quality && entry.source == source && entry.loader_key == loader_key
+    })?;
     // Most-recently-used first, so the eviction below drops the coldest entry.
     let entry = cache.remove(index);
     let output = Arc::clone(&entry.output);
@@ -833,7 +1047,12 @@ fn cached_compiled_parts(source: &str, quality: Quality) -> Option<Arc<Multipart
     Some(output)
 }
 
-fn remember_compiled_parts(source: &str, quality: Quality, output: &Arc<MultipartCompileOutput>) {
+fn remember_compiled_parts(
+    source: &str,
+    loader_key: &str,
+    quality: Quality,
+    output: &Arc<MultipartCompileOutput>,
+) {
     let triangles = output.mesh.triangles.len()
         + output
             .parts
@@ -847,11 +1066,14 @@ fn remember_compiled_parts(source: &str, quality: Quality, output: &Arc<Multipar
     let Ok(mut cache) = COMPILED_PARTS.lock() else {
         return;
     };
-    cache.retain(|entry| entry.quality != quality || entry.source != source);
+    cache.retain(|entry| {
+        entry.quality != quality || entry.source != source || entry.loader_key != loader_key
+    });
     cache.insert(
         0,
         CompiledPartsEntry {
             source: source.to_string(),
+            loader_key: loader_key.to_string(),
             quality,
             output: Arc::clone(output),
         },
@@ -869,11 +1091,26 @@ pub fn compile_parts_shared(
     quality: Quality,
     cancellation: Option<&AtomicBool>,
 ) -> Result<Arc<MultipartCompileOutput>, EngineError> {
-    if let Some(output) = cached_compiled_parts(source, quality) {
+    compile_parts_shared_with_loader(source, quality, cancellation, &BUNDLED_LIBRARY)
+}
+
+pub fn compile_parts_shared_with_loader(
+    source: &str,
+    quality: Quality,
+    cancellation: Option<&AtomicBool>,
+    loader: &dyn SourceLoader,
+) -> Result<Arc<MultipartCompileOutput>, EngineError> {
+    let loader_key = loader.cache_fingerprint();
+    if let Some(output) = cached_compiled_parts(source, &loader_key, quality) {
         return Ok(output);
     }
-    let output = Arc::new(compile_parts(source, quality, cancellation)?);
-    remember_compiled_parts(source, quality, &output);
+    let output = Arc::new(compile_parts_with_loader(
+        source,
+        quality,
+        cancellation,
+        loader,
+    )?);
+    remember_compiled_parts(source, &loader_key, quality, &output);
     Ok(output)
 }
 
@@ -886,6 +1123,7 @@ static COMPILED_WHOLE: Mutex<Vec<CompiledWholeEntry>> = Mutex::new(Vec::new());
 
 struct CompiledWholeEntry {
     source: String,
+    loader_key: String,
     quality: Quality,
     output: Arc<CompileOutput>,
 }
@@ -896,25 +1134,44 @@ pub fn compile_shared(
     quality: Quality,
     cancellation: Option<&AtomicBool>,
 ) -> Result<Arc<CompileOutput>, EngineError> {
+    compile_shared_with_loader(source, quality, cancellation, &BUNDLED_LIBRARY)
+}
+
+pub fn compile_shared_with_loader(
+    source: &str,
+    quality: Quality,
+    cancellation: Option<&AtomicBool>,
+    loader: &dyn SourceLoader,
+) -> Result<Arc<CompileOutput>, EngineError> {
+    let loader_key = loader.cache_fingerprint();
     if let Ok(mut cache) = COMPILED_WHOLE.lock() {
-        if let Some(index) = cache
-            .iter()
-            .position(|entry| entry.quality == quality && entry.source == source)
-        {
+        if let Some(index) = cache.iter().position(|entry| {
+            entry.quality == quality && entry.source == source && entry.loader_key == loader_key
+        }) {
             let entry = cache.remove(index);
             let output = Arc::clone(&entry.output);
             cache.insert(0, entry);
             return Ok(output);
         }
     }
-    let output = Arc::new(compile(source, quality, cancellation)?);
+    let output = Arc::new(compile_with_loader(
+        source,
+        quality,
+        cancellation,
+        loader,
+    )?);
     if output.mesh.triangles.len() <= COMPILED_PARTS_CACHE_MAX_TRIANGLES {
         if let Ok(mut cache) = COMPILED_WHOLE.lock() {
-            cache.retain(|entry| entry.quality != quality || entry.source != source);
+            cache.retain(|entry| {
+                entry.quality != quality
+                    || entry.source != source
+                    || entry.loader_key != loader_key
+            });
             cache.insert(
                 0,
                 CompiledWholeEntry {
                     source: source.to_string(),
+                    loader_key,
                     quality,
                     output: Arc::clone(&output),
                 },
@@ -935,15 +1192,25 @@ pub fn compile_parts(
     quality: Quality,
     cancellation: Option<&AtomicBool>,
 ) -> Result<MultipartCompileOutput, EngineError> {
-    catch_geometry_panic(|| compile_parts_unguarded(source, quality, cancellation))
+    compile_parts_with_loader(source, quality, cancellation, &BUNDLED_LIBRARY)
+}
+
+pub fn compile_parts_with_loader(
+    source: &str,
+    quality: Quality,
+    cancellation: Option<&AtomicBool>,
+    loader: &dyn SourceLoader,
+) -> Result<MultipartCompileOutput, EngineError> {
+    catch_geometry_panic(|| compile_parts_unguarded(source, quality, cancellation, loader))
 }
 
 fn compile_parts_unguarded(
     source: &str,
     quality: Quality,
     cancellation: Option<&AtomicBool>,
+    loader: &dyn SourceLoader,
 ) -> Result<MultipartCompileOutput, EngineError> {
-    let statements = parse_resolved_program(source)?;
+    let statements = parse_resolved_program(source, loader)?;
     let mut evaluator = Evaluator {
         cancellation,
         preview: matches!(quality, Quality::Preview),
@@ -8873,7 +9140,14 @@ mod tests {
     }
 
     fn evaluate_source(source: &str) -> Result<Shape, EngineError> {
-        let statements = parse_resolved_program(source)?;
+        evaluate_source_with_loader(source, &BUNDLED_LIBRARY)
+    }
+
+    fn evaluate_source_with_loader(
+        source: &str,
+        loader: &dyn SourceLoader,
+    ) -> Result<Shape, EngineError> {
+        let statements = parse_resolved_program(source, loader)?;
         Evaluator::default().evaluate(&statements)
     }
 
@@ -9029,7 +9303,10 @@ mod tests {
     fn polygon_rejects_out_of_range_path_indices() {
         let mut evaluator = Evaluator::default();
         let statements =
-            parse_resolved_program("polygon(points=[[0,0],[1,0],[1,1]], paths=[[0,1,9]]);")
+            parse_resolved_program(
+                "polygon(points=[[0,0],[1,0],[1,1]], paths=[[0,1,9]]);",
+                &BUNDLED_LIBRARY,
+            )
                 .expect("parse");
         evaluator.evaluate_objects(&statements).expect("evaluate");
         assert!(evaluator
@@ -9103,7 +9380,9 @@ mod tests {
             evaluate_source("color(\"blue\") translate([5,0,0]) cube(2);").expect("evaluate");
         assert_eq!(shape.stated_color(), Some([0.0, 0.0, 1.0, 1.0]));
 
-        let statements = parse_resolved_program("color(\"nosuchcolor\") cube(2);").expect("parse");
+        let statements =
+            parse_resolved_program("color(\"nosuchcolor\") cube(2);", &BUNDLED_LIBRARY)
+                .expect("parse");
         let mut evaluator = Evaluator::default();
         let shape = evaluator.evaluate(&statements).expect("evaluate");
         assert_eq!(shape.stated_color(), None);
@@ -9161,7 +9440,7 @@ mod tests {
                 .expect_err("only bundled libraries may be included")
                 .to_string();
             assert!(
-                error.contains("not a bundled library"),
+                error.contains("was not found") || error.contains("not a valid virtual path") || error.contains("absolute path"),
                 "unexpected error for {path}: {error}"
             );
         }
@@ -9177,6 +9456,72 @@ mod tests {
         .expect("include");
         assert!(shape.distance(Vec3::new(7.0, 0.0, 5.0)) < 0.0);
         assert!(shape.distance(Vec3::new(0.0, 0.0, 5.0)) > 0.0);
+    }
+
+    #[test]
+    fn include_resolves_workspace_files() {
+        let mut files = WorkspaceFiles::new();
+        files
+            .insert("trf_common.scad", "size = 8;\n")
+            .expect("insert common");
+        let loader = CompositeLoader {
+            workspace: &files,
+        };
+        let shape = evaluate_source_with_loader(
+            "include <trf_common.scad>\ncube(size);",
+            &loader,
+        )
+        .expect("workspace include");
+        assert!(shape.distance(Vec3::new(4.0, 4.0, 4.0)) < 0.0);
+        assert!(shape.distance(Vec3::new(10.0, 1.0, 1.0)) > 0.0);
+    }
+
+    #[test]
+    fn workspace_include_overrides_bundled_name() {
+        let mut files = WorkspaceFiles::new();
+        files
+            .insert("units.scad", "inch = 10;\n")
+            .expect("override units");
+        let loader = CompositeLoader {
+            workspace: &files,
+        };
+        let shape = evaluate_source_with_loader("include <units.scad>\ncube(inch);", &loader)
+            .expect("override");
+        // Workspace inch=10 wins over bundled inch=25.4.
+        assert!(shape.distance(Vec3::new(5.0, 5.0, 5.0)) < 0.0);
+        assert!(shape.distance(Vec3::new(20.0, 1.0, 1.0)) > 0.0);
+    }
+
+    #[test]
+    fn workspace_include_rejects_traversal_paths() {
+        let mut files = WorkspaceFiles::new();
+        files
+            .insert("safe.scad", "cube(1);")
+            .expect("insert");
+        assert!(files.insert("../secret.scad", "cube(99);").is_err());
+        assert!(normalize_virtual_path("/etc/passwd").is_err());
+        assert!(normalize_virtual_path("C:\\Windows\\a.scad").is_err());
+        let loader = CompositeLoader {
+            workspace: &files,
+        };
+        let error = evaluate_source_with_loader("include <../secret.scad>\ncube(1);", &loader)
+            .expect_err("traversal must fail")
+            .to_string();
+        assert!(
+            error.contains("not a valid virtual path") || error.contains("was not found"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn workspace_loader_falls_back_to_bundled() {
+        let files = WorkspaceFiles::new();
+        let loader = CompositeLoader {
+            workspace: &files,
+        };
+        let shape = evaluate_source_with_loader("include <units.scad>\ncube(inch);", &loader)
+            .expect("bundled fallback");
+        assert!(shape.distance(Vec3::new(25.0, 25.0, 25.0)) < 0.0);
     }
 
     #[test]
@@ -9779,7 +10124,8 @@ mod tests {
 
     #[test]
     fn color_alpha_without_a_color_is_reported_rather_than_dropped() {
-        let statements = parse_resolved_program("color(alpha=0.5) cube(2);").expect("parse");
+        let statements =
+            parse_resolved_program("color(alpha=0.5) cube(2);", &BUNDLED_LIBRARY).expect("parse");
         let mut evaluator = Evaluator::default();
         let shape = evaluator.evaluate(&statements).expect("evaluate");
         // Geometry is untouched either way.
@@ -9794,7 +10140,8 @@ mod tests {
     #[test]
     fn an_unusable_color_alpha_never_drops_the_children() {
         let statements =
-            parse_resolved_program("color(\"red\", alpha=\"opaque\") cube(2);").expect("parse");
+            parse_resolved_program("color(\"red\", alpha=\"opaque\") cube(2);", &BUNDLED_LIBRARY)
+                .expect("parse");
         let mut evaluator = Evaluator::default();
         let shape = evaluator.evaluate(&statements).expect("evaluate");
         assert!(shape.distance(Vec3::new(1.0, 1.0, 1.0)) < 0.0);
