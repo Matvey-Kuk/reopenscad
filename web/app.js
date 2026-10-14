@@ -2362,43 +2362,440 @@ async function exportModel(format, scope = 'visible') {
 // Set once the user opens the panel by hand, so an auto-hide never yanks it
 // back shut underneath them. Cleared when they close it again.
 let customizerPinned = false;
+// Rebuild signature: when only values change, patch inputs in place so a slider
+// drag or select focus is not destroyed by syncEditor's every-keystroke refresh.
+let customizerStructureKey = '';
+
+const CUSTOMIZER_STOP = /^(module|function)\b/;
+const CUSTOMIZER_GEOMETRY = /^(cube|sphere|cylinder|polyhedron|square|circle|polygon|text|import|surface|linear_extrude|rotate_extrude|resize|hull|minkowski|offset|projection|union|difference|intersection|intersection_for|translate|rotate|scale|mirror|multmatrix|color|render|group|children|for|intersection_for|if|let|assign)\s*(\(|$)/;
+
+function escapeCustomizerRe(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function parseCustomizerLiteral(text) {
+  const source = text.trim();
+  if (!source) return null;
+  if (source === 'true') return { kind: 'bool', value: true, raw: source };
+  if (source === 'false') return { kind: 'bool', value: false, raw: source };
+  if (source[0] === '"') {
+    let i = 1;
+    let out = '';
+    while (i < source.length) {
+      const ch = source[i];
+      if (ch === '\\' && i + 1 < source.length) {
+        out += source[i + 1];
+        i += 2;
+        continue;
+      }
+      if (ch === '"') {
+        if (source.slice(i + 1).trim()) return null;
+        return { kind: 'string', value: out, raw: source.slice(0, i + 1) };
+      }
+      out += ch;
+      i += 1;
+    }
+    return null;
+  }
+  if (source[0] === '[') {
+    const inner = source.slice(1, source.lastIndexOf(']'));
+    if (source[source.length - 1] !== ']' || /:/.test(inner)) return null;
+    const parts = [];
+    let depth = 0;
+    let start = 0;
+    for (let i = 0; i < inner.length; i += 1) {
+      const ch = inner[i];
+      if (ch === '[') depth += 1;
+      else if (ch === ']') depth -= 1;
+      else if (ch === ',' && depth === 0) {
+        parts.push(inner.slice(start, i));
+        start = i + 1;
+      }
+    }
+    parts.push(inner.slice(start));
+    const values = [];
+    for (const part of parts) {
+      const lit = parseCustomizerLiteral(part);
+      if (!lit || lit.kind === 'vector') return null;
+      if (lit.kind !== 'number' && lit.kind !== 'bool' && lit.kind !== 'string') return null;
+      values.push(lit.value);
+    }
+    if (!values.length) return null;
+    return { kind: 'vector', value: values, raw: source };
+  }
+  if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(source)) {
+    return { kind: 'number', value: Number(source), raw: source };
+  }
+  return null;
+}
+
+function parseCustomizerAnnotation(spec) {
+  const text = spec.trim();
+  if (!text) return { type: 'none' };
+  const rangeThree = text.match(/^([+-]?(?:\d+\.?\d*|\.\d+))\s*:\s*([+-]?(?:\d+\.?\d*|\.\d+))\s*:\s*([+-]?(?:\d+\.?\d*|\.\d+))$/);
+  if (rangeThree) {
+    return { type: 'range', min: Number(rangeThree[1]), step: Number(rangeThree[2]), max: Number(rangeThree[3]) };
+  }
+  const rangeTwo = text.match(/^([+-]?(?:\d+\.?\d*|\.\d+))\s*:\s*([+-]?(?:\d+\.?\d*|\.\d+))$/);
+  if (rangeTwo) {
+    return { type: 'range', min: Number(rangeTwo[1]), step: 1, max: Number(rangeTwo[2]) };
+  }
+  const options = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i <= text.length; i += 1) {
+    const ch = text[i];
+    if (ch === '(') depth += 1;
+    else if (ch === ')') depth -= 1;
+    if ((ch === ',' && depth === 0) || i === text.length) {
+      const piece = text.slice(start, i).trim();
+      start = i + 1;
+      if (!piece) continue;
+      const labeled = piece.match(/^([^:]+):(.*)$/);
+      if (labeled) {
+        const raw = labeled[1].trim();
+        const label = labeled[2].trim();
+        const asNum = Number(raw);
+        options.push({
+          value: Number.isFinite(asNum) && /^-?\d/.test(raw) ? asNum : raw,
+          label: label || raw,
+        });
+      } else {
+        const asNum = Number(piece);
+        options.push({
+          value: Number.isFinite(asNum) && /^-?\d/.test(piece) ? asNum : piece,
+          label: piece,
+        });
+      }
+    }
+  }
+  if (options.length > 1 || (options.length === 1 && text.includes(','))) {
+    return { type: 'enum', options };
+  }
+  if (options.length === 1 && !text.includes(':')) {
+    // A lone token inside [] is still an enum of one in OpenSCAD; treat as enum
+    // so labeled single-choice widgets stay consistent with multi-choice ones.
+    return { type: 'enum', options };
+  }
+  return { type: 'none' };
+}
+
+function splitCustomizerComment(comment) {
+  if (!comment) return { description: '', annotation: null, maxLength: null };
+  const bracket = comment.match(/\[([^\]]*)\]/);
+  if (bracket) {
+    const description = comment.slice(0, bracket.index).replace(/[,\s]+$/g, '').trim();
+    return { description, annotation: parseCustomizerAnnotation(bracket[1]), maxLength: null };
+  }
+  const maxOnly = comment.match(/^\s*(\d+)\s*$/);
+  if (maxOnly) return { description: '', annotation: null, maxLength: Number(maxOnly[1]) };
+  return { description: comment.trim(), annotation: null, maxLength: null };
+}
+
+function serializeCustomizerValue(kind, value) {
+  if (kind === 'bool') return value ? 'true' : 'false';
+  if (kind === 'string') return JSON.stringify(String(value));
+  if (kind === 'vector') {
+    return `[${value.map((item) => (typeof item === 'string' ? JSON.stringify(item) : String(item))).join(', ')}]`;
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    // Keep integers looking like integers; OpenSCAD accepts both.
+    return Number.isInteger(value) ? String(value) : String(value);
+  }
+  return String(value);
+}
+
+function applyCustomizerValue(source, name, kind, value) {
+  const serialized = serializeCustomizerValue(kind, value);
+  const pattern = new RegExp(`^(\\s*${escapeCustomizerRe(name)}\\s*=\\s*)[^;]+`, 'm');
+  return source.replace(pattern, `$1${serialized}`);
+}
+
+// OpenSCAD Customizer: top-level literal assignments before the first
+// module/function (and, per SPEC_LANG §18, before geometry). Section comments
+// group controls; /* [Hidden] */ hides everything after it.
+function parseCustomizerSource(source) {
+  const sections = [{ name: '', hidden: false, fields: [] }];
+  let section = sections[0];
+  let pendingDescription = '';
+  const lines = String(source || '').split('\n');
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const trimmed = lines[lineIndex].trim();
+    if (!trimmed) {
+      pendingDescription = '';
+      continue;
+    }
+    const sectionMatch = trimmed.match(/^\/\*\s*\[([^\]]*)\]\s*\*\/\s*$/);
+    if (sectionMatch) {
+      const name = sectionMatch[1].trim();
+      section = { name, hidden: /^hidden$/i.test(name), fields: [] };
+      sections.push(section);
+      pendingDescription = '';
+      continue;
+    }
+    if (trimmed.startsWith('//')) {
+      pendingDescription = trimmed.replace(/^\/\/\s?/, '').trim();
+      continue;
+    }
+    if (CUSTOMIZER_STOP.test(trimmed) || CUSTOMIZER_GEOMETRY.test(trimmed)) break;
+    if (/^(include|use)\s*[<"]/.test(trimmed)) {
+      pendingDescription = '';
+      continue;
+    }
+    const assign = trimmed.match(/^([A-Za-z_$][\w$]*)\s*=\s*([^;]+);\s*(?:\/\/(.*))?$/);
+    if (!assign) {
+      pendingDescription = '';
+      continue;
+    }
+    const name = assign[1];
+    const literal = parseCustomizerLiteral(assign[2]);
+    const prior = pendingDescription;
+    pendingDescription = '';
+    if (!literal || section.hidden) continue;
+    const comment = splitCustomizerComment(assign[3] || '');
+    const description = comment.description || prior;
+    const annotation = comment.annotation || { type: 'none' };
+    let field = null;
+    if (annotation.type === 'range' && (literal.kind === 'number' || literal.kind === 'vector')) {
+      field = literal.kind === 'vector'
+        ? {
+          name,
+          kind: 'vector',
+          value: literal.value.slice(),
+          min: annotation.min,
+          max: annotation.max,
+          step: annotation.step,
+          description,
+        }
+        : {
+          name,
+          kind: 'slider',
+          value: literal.value,
+          min: annotation.min,
+          max: annotation.max,
+          step: annotation.step,
+          description,
+        };
+    } else if (annotation.type === 'enum') {
+      field = {
+        name,
+        kind: 'select',
+        value: literal.value,
+        options: annotation.options,
+        description,
+      };
+    } else if (literal.kind === 'bool') {
+      field = { name, kind: 'checkbox', value: literal.value, description };
+    } else if (literal.kind === 'string') {
+      field = {
+        name,
+        kind: 'text',
+        value: literal.value,
+        maxLength: comment.maxLength,
+        description,
+      };
+    } else if (literal.kind === 'vector') {
+      field = { name, kind: 'vector', value: literal.value.slice(), description };
+    } else if (literal.kind === 'number') {
+      field = { name, kind: 'spinbox', value: literal.value, step: 1, description };
+    }
+    if (field) section.fields.push(field);
+  }
+  const visible = sections.filter((entry) => !entry.hidden && entry.fields.length);
+  return {
+    sections: visible.length ? visible : [],
+    fields: visible.flatMap((entry) => entry.fields),
+  };
+}
+
+function customizerFieldKey(field) {
+  if (field.kind === 'slider') return `${field.name}:slider:${field.min}:${field.step}:${field.max}`;
+  if (field.kind === 'select') {
+    return `${field.name}:select:${field.options.map((option) => `${option.value}=${option.label}`).join('|')}`;
+  }
+  if (field.kind === 'vector') {
+    return `${field.name}:vector:${field.value.length}:${field.min ?? ''}:${field.step ?? ''}:${field.max ?? ''}`;
+  }
+  if (field.kind === 'text') return `${field.name}:text:${field.maxLength ?? ''}`;
+  return `${field.name}:${field.kind}`;
+}
+
+function renderCustomizerField(field) {
+  const label = escapeHtml(field.name);
+  const title = field.description ? ` title="${escapeAttribute(field.description)}"` : '';
+  const hint = field.description
+    ? `<small class="custom-desc">${escapeHtml(field.description)}</small>`
+    : '';
+  if (field.kind === 'slider') {
+    return `<div class="custom-field" data-variable="${escapeAttribute(field.name)}" data-kind="slider"${title}>`
+      + `<label><span>${label}</span>`
+      + `<input type="number" min="${field.min}" max="${field.max}" step="${field.step}" value="${field.value}"></label>`
+      + hint
+      + `<input type="range" min="${field.min}" max="${field.max}" step="${field.step}" value="${field.value}">`
+      + `</div>`;
+  }
+  if (field.kind === 'spinbox') {
+    return `<div class="custom-field" data-variable="${escapeAttribute(field.name)}" data-kind="spinbox"${title}>`
+      + `<label><span>${label}</span>`
+      + `<input type="number" step="${field.step ?? 1}" value="${field.value}"></label>${hint}</div>`;
+  }
+  if (field.kind === 'select') {
+    const options = field.options.map((option) => {
+      const selected = Object.is(option.value, field.value) || String(option.value) === String(field.value) ? ' selected' : '';
+      return `<option value="${escapeAttribute(String(option.value))}"${selected}>${escapeHtml(option.label)}</option>`;
+    }).join('');
+    return `<div class="custom-field" data-variable="${escapeAttribute(field.name)}" data-kind="select"${title}>`
+      + `<label><span>${label}</span><select>${options}</select></label>${hint}</div>`;
+  }
+  if (field.kind === 'checkbox') {
+    return `<div class="custom-field" data-variable="${escapeAttribute(field.name)}" data-kind="checkbox"${title}>`
+      + `<label class="custom-check"><input type="checkbox"${field.value ? ' checked' : ''}>`
+      + `<span>${label}</span></label>${hint}</div>`;
+  }
+  if (field.kind === 'text') {
+    const max = field.maxLength != null ? ` maxlength="${field.maxLength}"` : '';
+    return `<div class="custom-field" data-variable="${escapeAttribute(field.name)}" data-kind="text"${title}>`
+      + `<label><span>${label}</span></label>${hint}`
+      + `<input type="text" value="${escapeAttribute(field.value)}"${max}>`
+      + `</div>`;
+  }
+  if (field.kind === 'vector') {
+    const inputs = field.value.map((component, index) => {
+      const bounds = field.min != null
+        ? ` min="${field.min}" max="${field.max}" step="${field.step}"`
+        : ' step="any"';
+      return `<input type="number" data-index="${index}" value="${component}"${bounds}>`;
+    }).join('');
+    return `<div class="custom-field" data-variable="${escapeAttribute(field.name)}" data-kind="vector"${title}>`
+      + `<label><span>${label}</span></label>${hint}`
+      + `<div class="custom-vector">${inputs}</div>`
+      + `</div>`;
+  }
+  return '';
+}
+
+function customizerValueKind(field, value) {
+  if (field.kind === 'checkbox') return 'bool';
+  if (field.kind === 'vector') return 'vector';
+  if (field.kind === 'text') return 'string';
+  if (field.kind === 'slider' || field.kind === 'spinbox') return 'number';
+  if (field.kind === 'select') return typeof value === 'number' ? 'number' : 'string';
+  return typeof value === 'number' ? 'number' : 'string';
+}
+
+function bindCustomizerField(container, field) {
+  const commit = (next) => {
+    field.value = next;
+    editor.value = applyCustomizerValue(editor.value, field.name, customizerValueKind(field, next), next);
+    syncEditor();
+    clearTimeout(renderDebounce);
+    renderDebounce = setTimeout(() => render('preview'), 350);
+  };
+
+  if (field.kind === 'slider') {
+    const range = $('input[type="range"]', container);
+    const number = $('input[type="number"]', container);
+    range.addEventListener('input', () => { number.value = range.value; });
+    range.addEventListener('change', () => commit(Number(range.value)));
+    number.addEventListener('change', () => commit(Number(number.value)));
+    return;
+  }
+  if (field.kind === 'spinbox') {
+    $('input[type="number"]', container).addEventListener('change', (event) => commit(Number(event.target.value)));
+    return;
+  }
+  if (field.kind === 'select') {
+    $('select', container).addEventListener('change', (event) => {
+      const raw = event.target.value;
+      const matched = field.options.find((option) => String(option.value) === raw);
+      commit(matched ? matched.value : raw);
+    });
+    return;
+  }
+  if (field.kind === 'checkbox') {
+    $('input[type="checkbox"]', container).addEventListener('change', (event) => commit(event.target.checked));
+    return;
+  }
+  if (field.kind === 'text') {
+    $('input[type="text"]', container).addEventListener('change', (event) => commit(event.target.value));
+    return;
+  }
+  if (field.kind === 'vector') {
+    $$('input[type="number"]', container).forEach((input) => {
+      input.addEventListener('change', () => {
+        const next = field.value.slice();
+        next[Number(input.dataset.index)] = Number(input.value);
+        commit(next);
+      });
+    });
+  }
+}
+
+function patchCustomizerValues(body, fields) {
+  for (const field of fields) {
+    const container = body.querySelector(`.custom-field[data-variable="${CSS.escape(field.name)}"]`);
+    if (!container) continue;
+    if (field.kind === 'slider') {
+      const range = $('input[type="range"]', container);
+      const number = $('input[type="number"]', container);
+      if (document.activeElement !== range && document.activeElement !== number) {
+        range.value = field.value;
+        number.value = field.value;
+      }
+    } else if (field.kind === 'spinbox') {
+      const number = $('input[type="number"]', container);
+      if (document.activeElement !== number) number.value = field.value;
+    } else if (field.kind === 'select') {
+      const select = $('select', container);
+      if (document.activeElement !== select) select.value = String(field.value);
+    } else if (field.kind === 'checkbox') {
+      const box = $('input[type="checkbox"]', container);
+      if (document.activeElement !== box) box.checked = !!field.value;
+    } else if (field.kind === 'text') {
+      const input = $('input[type="text"]', container);
+      if (document.activeElement !== input) input.value = field.value;
+    } else if (field.kind === 'vector') {
+      $$('input[type="number"]', container).forEach((input) => {
+        if (document.activeElement === input) return;
+        const index = Number(input.dataset.index);
+        if (index < field.value.length) input.value = field.value[index];
+      });
+    }
+  }
+}
 
 function updateCustomizer() {
-  const fields = [];
-  const pattern = /^\s*([A-Za-z_$][\w$]*)\s*=\s*(-?\d+(?:\.\d+)?)\s*;\s*\/\/\s*\[\s*(-?\d+(?:\.\d+)?)\s*:\s*(-?\d+(?:\.\d+)?)\s*:\s*(-?\d+(?:\.\d+)?)\s*\]/gm;
-  for (const match of editor.value.matchAll(pattern)) {
-    fields.push({ name: match[1], value: Number(match[2]), min: Number(match[3]), step: Number(match[4]), max: Number(match[5]) });
-  }
+  const parsed = parseCustomizerSource(editor.value);
+  const fields = parsed.fields;
   const body = $('#customizerBody');
-  // Nothing in the source is customizable, so the panel and its toggle have
-  // nothing to show or do — hide both rather than parking an empty column.
   // The panel hides itself when the model has nothing to customize, but the
   // toggle always stays available: opening it deliberately must still work,
   // and the empty state is where the feature is explained.
   const hasFields = fields.length > 0;
   $('#customizer').hidden = !hasFields && !customizerPinned;
   if (!hasFields) {
-    body.innerHTML = '<div class="customizer-empty"><span>{ }</span><p>Add a range comment like<br><code>// [1:1:20]</code> after a variable.</p></div>';
+    customizerStructureKey = '';
+    body.innerHTML = '<div class="customizer-empty"><span>{ }</span><p>Add Customizer annotations like<br><code>// [1:1:20]</code>, <code>// [a, b]</code>, or <code>/* [Section] */</code>.</p></div>';
     if (!customizerPinned) $('#customizer').classList.add('closed');
     return;
   }
   $('#customizer').classList.remove('closed');
-  body.innerHTML = fields.map((field) => `<div class="custom-field" data-variable="${field.name}"><label><span>${field.name}</span><input type="number" min="${field.min}" max="${field.max}" step="${field.step}" value="${field.value}"></label><input type="range" min="${field.min}" max="${field.max}" step="${field.step}" value="${field.value}"></div>`).join('');
+  const structure = parsed.sections.map((entry) => `${entry.name}{${entry.fields.map(customizerFieldKey).join(',')}}`).join('|');
+  if (structure === customizerStructureKey && body.querySelector('.custom-field')) {
+    patchCustomizerValues(body, fields);
+    return;
+  }
+  customizerStructureKey = structure;
+  body.innerHTML = parsed.sections.map((entry) => {
+    const heading = entry.name
+      ? `<h3 class="custom-section">${escapeHtml(entry.name)}</h3>`
+      : '';
+    return heading + entry.fields.map(renderCustomizerField).join('');
+  }).join('');
+  const flat = parsed.sections.flatMap((entry) => entry.fields);
   $$('.custom-field', body).forEach((container) => {
-    const range = $('input[type="range"]', container);
-    const number = $('input[type="number"]', container);
-    const commit = (value) => {
-      range.value = value;
-      number.value = value;
-      const variable = container.dataset.variable.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      editor.value = editor.value.replace(new RegExp(`(^\\s*${variable}\\s*=\\s*)-?\\d+(?:\\.\\d+)?`, 'm'), `$1${value}`);
-      syncEditor();
-      clearTimeout(renderDebounce);
-      renderDebounce = setTimeout(() => render('preview'), 350);
-    };
-    range.addEventListener('input', () => { number.value = range.value; });
-    range.addEventListener('change', () => commit(range.value));
-    number.addEventListener('change', () => commit(number.value));
+    const field = flat.find((entry) => entry.name === container.dataset.variable);
+    if (field) bindCustomizerField(container, field);
   });
 }
 
