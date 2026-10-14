@@ -10,8 +10,10 @@ and exporters in this repository were all written here.
 ## What it does
 
 Everything the desktop application does with a `.scad` file, minus the parts a
-web app has no business keeping: no menu bar, no tabs, no file name. The
-workspace *is* the document.
+web app has no business keeping: no menu bar, no desktop-style tab strip. A
+workspace is a small project: one entry file that compiles, plus optional
+companions so `include` / `use` can share parameters across parts. The editor
+shows one file at a time.
 
 An empty workspace opens on a catalogue of eighteen printable models — mounts,
 threads, household things, toys, hinged boxes, lettering — each one parametric,
@@ -29,9 +31,10 @@ It also does a few things the original does not:
 * **Intersection and clearance checking.** Find where parts collide, or where
   they are closer than a fabrication tolerance (0.2 mm by default), and see
   exactly where.
-* **An MCP server.** Eight tools that let an AI agent create a workspace, query
-  and patch the SCAD source, render, export, check clearances, and hand back a
-  link. The browser picks up an agent's edits live and highlights what changed.
+* **An MCP server.** Tools that let an AI agent create a workspace (including
+  multi-file projects), list/query/patch sources, render, export, check
+  clearances, and hand back a link. The browser picks up an agent's edits live
+  and highlights what changed.
 
 Export is STL, OFF, OBJ, 3MF or PNG.
 
@@ -89,9 +92,11 @@ described in [`web/backend/tests/README.md`](web/backend/tests/README.md).
 
 ## Workspaces
 
-A workspace is one SCAD file with a funny ID in its URL, and that URL is the
-only credential: anyone holding the link has full read and write. There are no
-accounts.
+A workspace is a SCAD project (entry file plus optional included companions)
+with a funny ID in its URL, and that URL is the only credential: anyone holding
+the link has full read and write. There are no accounts. `include <…>` and
+`use <…>` resolve against the workspace's virtual files first, then a small
+bundled library (`units.scad`, `shapes.scad`).
 
 **Share** offers two links. The one in the address bar is a capability to
 *edit* — there is no login, so handing it over hands over write access. The

@@ -28,13 +28,18 @@ test('the viewport uses the WebGL canvas mesh path', () => {
   assert.doesNotMatch(javascript, /renderImage|data:image\/png;base64/);
 });
 
-test('web shell omits desktop menus and multi-file tab chrome', () => {
+test('web shell omits desktop menus and keeps a single editor buffer with a file list', () => {
   assert.doesNotMatch(html, /data-menu=|class="menus"|menu-popover/);
   assert.doesNotMatch(html, /class="tab active"/);
-  // The editor pane carries no header chrome at all: one source buffer, no
-  // file name, no tab strip, no dead "editor settings" affordance.
   assert.doesNotMatch(html, /class="file-heading"|id="editorSettings"/);
   assert.equal(html.match(/<textarea[^>]*id="codeEditor"/g).length, 1);
+  assert.match(html, /id="fileList"/);
+  assert.match(html, /id="fileListItems"/);
+  assert.match(html, /id="newFileButton"/);
+  assert.match(html, /multiple/);
+  assert.match(javascript, /workspaceFiles/);
+  assert.match(javascript, /switchWorkspaceFile/);
+  assert.match(javascript, /buildStoreZip/);
 });
 
 test('scene inspection controls expose objects, visibility, selection, and tolerance', () => {
@@ -105,14 +110,14 @@ test('unknown legacy workspace URLs are migrated instead of stranded locally', (
   assert.match(loading, /await createWorkspace\(cached\?\.code \|\| ''\)/);
 });
 
-test('the workspace is the document: no file name is surfaced anywhere', () => {
+test('the workspace has no desktop document title chrome', () => {
   assert.doesNotMatch(html, /Untitled/);
   assert.doesNotMatch(javascript, /Untitled/);
   assert.doesNotMatch(html, /id="documentName"|id="editorTabName"|class="document-name"/);
   assert.doesNotMatch(javascript, /document\.title\s*=/);
   // Downloads still need a real file name on disk.
   assert.match(javascript, /function downloadFileName\(extension\)/);
-  assert.match(javascript, /downloadFileName\('scad'\)/);
+  assert.match(javascript, /downloadFileName\('scad'\)|downloadFileName\('zip'\)/);
 });
 
 test('examples are kick-start options above an empty editor, not a toolbar dropdown', () => {
@@ -155,7 +160,7 @@ test('recently visited workspaces are remembered in this browser, with previews'
   // Most recent first, which is the order it is stored in.
   assert.match(recents, /\[\{ id, visitedAt: Date\.now\(\) \}, \.\.\.rest\]/);
   // A blank workspace — what landing on "/" mints — must not be listed.
-  assert.match(javascript, /workspace\.id && \(workspace\.code \|\| ''\)\.trim\(\)/);
+  assert.match(javascript, /workspace\.id && \(activeCode \|\| ''\)\.trim\(\)/);
   // Removing one is a list operation and says so, because the wording is the
   // only thing standing between the user and thinking they deleted their work.
   // Asked in the page, like every other confirmation here — a native dialog
@@ -434,9 +439,10 @@ test('a printer build plate can bound the same surface later', () => {
 // --- 3D printer build plate ---------------------------------------------------------
 // The catalogue and the fit test are pure functions, so they are exercised for real rather
 // than pattern-matched: a wrong build volume is the one failure mode that silently misleads.
+const plateFitReturn = javascript.match(/  return \{ fits: over\.length === 0, over, size \};\r?\n\}/);
 const plateModule = new Function(`${javascript.slice(
   javascript.indexOf('const PRINTER_PLATES = ['),
-  javascript.indexOf('  return { fits: over.length === 0, over, size };\n}') + '  return { fits: over.length === 0, over, size };\n}'.length,
+  plateFitReturn.index + plateFitReturn[0].length,
 )}\nreturn { PRINTER_PLATES, findPlate, plateFit };`)();
 
 test('the build plate catalogue covers the brands the spec names, with sane volumes', () => {
@@ -1272,4 +1278,79 @@ test('the disclaimer and the copy affordance both say the link is the key', () =
 test('nothing writes a workspace id to the console', () => {
   // console.* survives into shared screens, extensions and crash reporters.
   assert.doesNotMatch(javascript, /console\.(log|info|warn|error|debug)\s*\(/);
+});
+
+test('customizer parses OpenSCAD annotations beyond numeric sliders', () => {
+  assert.match(html, /id="customizer"/);
+  assert.match(html, /id="customizerButton"/);
+  assert.match(javascript, /function parseCustomizerSource\(/);
+  assert.match(javascript, /kind: 'select'/);
+  assert.match(javascript, /kind: 'checkbox'/);
+  assert.match(javascript, /kind: 'text'/);
+  assert.match(javascript, /kind: 'vector'/);
+  assert.match(javascript, /\/\*\s*\[Hidden\]\s*\*\//);
+  assert.match(css, /\.custom-section/);
+  assert.match(css, /\.custom-vector/);
+
+  const start = javascript.indexOf('const CUSTOMIZER_STOP');
+  const end = javascript.indexOf('function customizerFieldKey');
+  assert.ok(start > 0 && end > start);
+  const parseCustomizerSource = new Function(`${javascript.slice(start, end)}\nreturn parseCustomizerSource;`)();
+  const applyCustomizerValue = new Function(`${javascript.slice(start, end)}\nreturn applyCustomizerValue;`)();
+
+  const parsed = parseCustomizerSource(`
+/* [Mast] */
+mast_unit = "inch"; // [inch:Inches, mm:Millimeters]
+height = 12; // Pole height [1:0.5:40]
+flag = true; // Show flag
+label = "hello"; // 10
+sizes = [1, 2, 3]; // [0:10]
+part = 2; // [1:Small, 2:Medium, 3:Large]
+// Thickness note
+wall = 2; // [1:5]
+derived = height / 2;
+/* [Hidden] */
+secret = 99; // [1:100]
+module draw() { cube(1); }
+visible_later = 1;
+`);
+  assert.deepEqual(parsed.fields.map((field) => field.name), [
+    'mast_unit', 'height', 'flag', 'label', 'sizes', 'part', 'wall',
+  ]);
+  assert.equal(parsed.sections[0].name, 'Mast');
+  assert.equal(parsed.fields[0].kind, 'select');
+  assert.deepEqual(parsed.fields[0].options.map((option) => option.label), ['Inches', 'Millimeters']);
+  assert.equal(parsed.fields[1].kind, 'slider');
+  assert.equal(parsed.fields[1].step, 0.5);
+  assert.equal(parsed.fields[2].kind, 'checkbox');
+  assert.equal(parsed.fields[3].kind, 'text');
+  assert.equal(parsed.fields[3].maxLength, 10);
+  assert.equal(parsed.fields[4].kind, 'vector');
+  assert.equal(parsed.fields[5].kind, 'select');
+  assert.equal(parsed.fields[5].options[1].label, 'Medium');
+  assert.equal(parsed.fields[6].kind, 'slider');
+  assert.equal(parsed.fields[6].description, 'Thickness note');
+  assert.equal(parsed.fields.some((field) => field.name === 'secret'), false);
+  assert.equal(parsed.fields.some((field) => field.name === 'derived'), false);
+
+  const updated = applyCustomizerValue('mast_unit = "inch";\nheight = 12;', 'mast_unit', 'string', 'mm');
+  assert.match(updated, /mast_unit = "mm";/);
+});
+
+test('example sources with trailing range descriptions feed the customizer', () => {
+  const start = javascript.indexOf('const CUSTOMIZER_STOP');
+  const end = javascript.indexOf('function customizerFieldKey');
+  const parseCustomizerSource = new Function(`${javascript.slice(start, end)}\nreturn parseCustomizerSource;`)();
+  const sample = `body_diameter = 42; // Thread-root outside diameter, mm [36:2:60]
+label = "MAKER"; // Text on the plate
+part = "assembly"; // [assembly, primary, secondary, solid]
+module x() {}`;
+  const fields = parseCustomizerSource(sample).fields;
+  assert.equal(fields[0].kind, 'slider');
+  assert.equal(fields[0].min, 36);
+  assert.equal(fields[0].step, 2);
+  assert.equal(fields[0].description, 'Thread-root outside diameter, mm');
+  assert.equal(fields[1].kind, 'text');
+  assert.equal(fields[2].kind, 'select');
+  assert.equal(fields[2].options.length, 4);
 });

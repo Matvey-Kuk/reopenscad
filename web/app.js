@@ -258,9 +258,12 @@ const QUEUE_POLL_MS = 1_000;
 // strictly better than making the user click again, but only a bounded number
 // of times and only while saying so out loud.
 const QUEUE_RETRY_LIMIT = 3;
-// The workspace IS the document, so no file name is surfaced in the UI. This base name
-// exists purely so browser downloads land with a meaningful name on disk.
+// Download base name for single-file saves and exports. Multi-file projects
+// still use this for zip / export names.
 let downloadBaseName = 'model';
+/** @type {Record<string, string>} */
+let workspaceFiles = {};
+let workspaceEntry = 'main.scad';
 let projection = 'perspective';
 // [panX, panY, panZ, pitch, unused, yaw, distance]. The first three are the pan offset in
 // world millimetres: the view presets below are literals of this same shape, which is why
@@ -1208,7 +1211,220 @@ function workspaceStorageKey(id = workspaceId) {
 
 function storeLocalWorkspace() {
   if (!workspaceId) return;
-  localStorage.setItem(workspaceStorageKey(), JSON.stringify({ code: editor.value, revision: workspaceRevision }));
+  workspaceFiles[workspaceEntry] = editor.value;
+  localStorage.setItem(workspaceStorageKey(), JSON.stringify({
+    code: editor.value,
+    entry: workspaceEntry,
+    files: workspaceFiles,
+    revision: workspaceRevision,
+  }));
+}
+
+function normalizeWorkspaceFiles(workspace, fallbackCode = '') {
+  const files = (workspace.files && typeof workspace.files === 'object' && !Array.isArray(workspace.files))
+    ? { ...workspace.files }
+    : {};
+  let entry = typeof workspace.entry === 'string' && workspace.entry.trim()
+    ? workspace.entry.trim()
+    : 'main.scad';
+  const code = typeof workspace.code === 'string' ? workspace.code : fallbackCode;
+  if (!Object.keys(files).length) files[entry] = code;
+  else if (!(entry in files)) {
+    if (code) files[entry] = code;
+    else entry = Object.keys(files).sort()[0];
+  }
+  return { files, entry };
+}
+
+function renderFileList() {
+  const list = $('#fileList');
+  const items = $('#fileListItems');
+  const paths = Object.keys(workspaceFiles).sort((a, b) => a.localeCompare(b));
+  list.hidden = paths.length <= 1;
+  items.innerHTML = '';
+  for (const path of paths) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.role = 'option';
+    button.textContent = path;
+    button.title = path;
+    button.dataset.path = path;
+    button.setAttribute('aria-selected', path === workspaceEntry ? 'true' : 'false');
+    button.addEventListener('click', () => switchWorkspaceFile(path));
+    items.appendChild(button);
+  }
+}
+
+async function patchWorkspaceFiles(body) {
+  if (!workspaceId) return null;
+  const response = await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...body, baseRevision: workspaceRevision, source: 'browser' }),
+  });
+  const payload = await response.json();
+  if (response.status === 409) {
+    surfaceWorkspaceConflict(payload);
+    return null;
+  }
+  if (!response.ok) throw new Error(payload.error || `Workspace service returned ${response.status}`);
+  applyWorkspace(payload);
+  setSyncState('Synced', 'synced');
+  return payload;
+}
+
+async function switchWorkspaceFile(path) {
+  if (!path || path === workspaceEntry) return;
+  workspaceFiles[workspaceEntry] = editor.value;
+  if (workspaceHasLocalChanges) await flushWorkspaceSave();
+  if (workspaceConflict) return;
+  try {
+    await patchWorkspaceFiles({ entry: path, code: workspaceFiles[path] ?? '', path });
+    render('preview');
+  } catch (error) {
+    log(error.message || 'Could not switch file.', 'error');
+  }
+}
+
+async function createWorkspaceFile() {
+  const name = prompt('New file name', 'part.scad');
+  if (!name) return;
+  const path = name.trim().replace(/\\/g, '/');
+  if (!path || path in workspaceFiles) {
+    log('Choose a new .scad file name.', 'warning');
+    return;
+  }
+  workspaceFiles[workspaceEntry] = editor.value;
+  if (workspaceHasLocalChanges) await flushWorkspaceSave();
+  try {
+    await patchWorkspaceFiles({
+      files: { [path]: `include <${workspaceEntry}>;\n\n` },
+      entry: path,
+      path,
+      code: `include <${workspaceEntry}>;\n\n`,
+    });
+    render('preview');
+  } catch (error) {
+    log(error.message || 'Could not create file.', 'error');
+  }
+}
+
+async function renameWorkspaceFile() {
+  if (Object.keys(workspaceFiles).length < 1) return;
+  const next = prompt('Rename file', workspaceEntry);
+  if (!next || next.trim() === workspaceEntry) return;
+  const path = next.trim().replace(/\\/g, '/');
+  if (path in workspaceFiles) {
+    log('A file with that name already exists.', 'warning');
+    return;
+  }
+  workspaceFiles[workspaceEntry] = editor.value;
+  if (workspaceHasLocalChanges) await flushWorkspaceSave();
+  const source = workspaceFiles[workspaceEntry] ?? editor.value;
+  try {
+    await patchWorkspaceFiles({
+      files: { [path]: source },
+      deletePaths: [workspaceEntry],
+      entry: path,
+      path,
+      code: source,
+    });
+  } catch (error) {
+    log(error.message || 'Could not rename file.', 'error');
+  }
+}
+
+async function deleteWorkspaceFile() {
+  const paths = Object.keys(workspaceFiles);
+  if (paths.length <= 1) {
+    log('A workspace must keep at least one file.', 'warning');
+    return;
+  }
+  if (!confirm(`Delete ${workspaceEntry}?`)) return;
+  const remaining = paths.filter((path) => path !== workspaceEntry).sort();
+  const nextEntry = remaining[0];
+  try {
+    await patchWorkspaceFiles({
+      deletePaths: [workspaceEntry],
+      entry: nextEntry,
+      path: nextEntry,
+      code: workspaceFiles[nextEntry] ?? '',
+    });
+    render('preview');
+  } catch (error) {
+    log(error.message || 'Could not delete file.', 'error');
+  }
+}
+
+function pickMultiFileEntry(paths) {
+  const common = paths.find((path) => /(^|\/)(trf_)?common\.scad$/i.test(path));
+  const nonCommon = paths.filter((path) => path !== common);
+  return nonCommon[0] || paths[0];
+}
+
+function buildStoreZip(files) {
+  const encoder = new TextEncoder();
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+  const crcTable = (() => {
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i += 1) {
+      let crc = i;
+      for (let j = 0; j < 8; j += 1) crc = (crc & 1) ? (0xedb88320 ^ (crc >>> 1)) : (crc >>> 1);
+      table[i] = crc >>> 0;
+    }
+    return table;
+  })();
+  const crc32 = (bytes) => {
+    let crc = 0xffffffff;
+    for (const byte of bytes) crc = crcTable[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+    return (crc ^ 0xffffffff) >>> 0;
+  };
+  const u16 = (value) => {
+    const out = new Uint8Array(2);
+    new DataView(out.buffer).setUint16(0, value, true);
+    return out;
+  };
+  const u32 = (value) => {
+    const out = new Uint8Array(4);
+    new DataView(out.buffer).setUint32(0, value, true);
+    return out;
+  };
+  const concat = (parts) => {
+    const total = parts.reduce((sum, part) => sum + part.length, 0);
+    const out = new Uint8Array(total);
+    let at = 0;
+    for (const part of parts) {
+      out.set(part, at);
+      at += part.length;
+    }
+    return out;
+  };
+  for (const [name, source] of Object.entries(files)) {
+    const nameBytes = encoder.encode(name);
+    const data = encoder.encode(source);
+    const crc = crc32(data);
+    const local = concat([
+      u32(0x04034b50), u16(20), u16(0), u16(0), u16(0), u16(0),
+      u32(crc), u32(data.length), u32(data.length), u16(nameBytes.length), u16(0),
+      nameBytes, data,
+    ]);
+    const central = concat([
+      u32(0x02014b50), u16(20), u16(20), u16(0), u16(0), u16(0), u16(0),
+      u32(crc), u32(data.length), u32(data.length), u16(nameBytes.length), u16(0),
+      u16(0), u16(0), u16(0), u32(0), u32(offset), nameBytes,
+    ]);
+    localParts.push(local);
+    centralParts.push(central);
+    offset += local.length;
+  }
+  const centralDir = concat(centralParts);
+  const end = concat([
+    u32(0x06054b50), u16(0), u16(0), u16(centralParts.length), u16(centralParts.length),
+    u32(centralDir.length), u32(offset), u16(0),
+  ]);
+  return new Blob([concat([...localParts, centralDir, end])], { type: 'application/zip' });
 }
 
 function finalAiUpdate(payload, workspace) {
@@ -1258,26 +1474,31 @@ function applyWorkspaceSettings(workspace) {
 
 function applyWorkspace(payload, { remote = false, force = false } = {}) {
   const workspace = workspaceFromPayload(payload);
+  const normalized = normalizeWorkspaceFiles(workspace, editor.value);
+  const activeCode = normalized.files[normalized.entry] ?? workspace.code ?? '';
   // Into the address book — but only once there is something in it. Landing on
   // "/" mints an empty workspace every time, and recording those would bury the
   // user's actual work under a stack of blanks they never typed in. A workspace
   // that gains content later is picked up by `uploadWorkspacePreview`.
-  if (!remote && workspace.id && (workspace.code || '').trim()) {
+  if (!remote && workspace.id && (activeCode || '').trim()) {
     rememberWorkspace(workspace.id);
   }
   const incomingRevision = Number(workspace.revision);
   let shouldRenderAiUpdate = false;
-  if (remote && !force && typeof workspace.code === 'string' && workspace.code !== editor.value && hasPendingLocalWorkspaceChanges()) {
+  if (remote && !force && typeof activeCode === 'string' && activeCode !== editor.value && hasPendingLocalWorkspaceChanges()) {
     surfaceWorkspaceConflict(payload);
     return false;
   }
   if (workspace.id) setWorkspaceIdentity(String(workspace.id));
   if (Number.isFinite(incomingRevision)) workspaceRevision = incomingRevision;
-  if (typeof workspace.code === 'string' && workspace.code !== editor.value) {
+  workspaceFiles = normalized.files;
+  workspaceEntry = normalized.entry;
+  if (typeof activeCode === 'string' && activeCode !== editor.value) {
     applyingRemoteUpdate = true;
-    editor.value = workspace.code;
+    editor.value = activeCode;
     const aiUpdate = remote ? finalAiUpdate(payload, workspace) : { isAi: false, ranges: [] };
-    aiUpdatedRanges = aiUpdate.isAi ? normalizeUpdatedRanges(workspace.code, aiUpdate.ranges) : [];
+    const ranges = (aiUpdate.ranges || []).filter((range) => !range.path || range.path === workspaceEntry);
+    aiUpdatedRanges = aiUpdate.isAi ? normalizeUpdatedRanges(activeCode, ranges) : [];
     $('#aiRevisionBadge').hidden = !aiUpdate.isAi;
     syncEditor(false);
     applyingRemoteUpdate = false;
@@ -1287,7 +1508,7 @@ function applyWorkspace(payload, { remote = false, force = false } = {}) {
       shouldRenderAiUpdate = true;
     }
   }
-  workspaceSavedCode = typeof workspace.code === 'string' ? workspace.code : editor.value;
+  workspaceSavedCode = typeof activeCode === 'string' ? activeCode : editor.value;
   workspaceHasLocalChanges = false;
   workspaceConflict = null;
   $('#syncState').title = '';
@@ -1296,6 +1517,7 @@ function applyWorkspace(payload, { remote = false, force = false } = {}) {
   // changed. Resolving a source conflict must not also roll back the build plate.
   if (!force) applyWorkspaceSettings(workspace);
   if (Array.isArray(workspace.objects) && (workspace.objects.length || !hasMesh)) setSceneObjects(workspace.objects);
+  renderFileList();
   updateKickstart();
   storeLocalWorkspace();
   if (shouldRenderAiUpdate) render('preview');
@@ -1329,10 +1551,18 @@ function normalizeUpdatedRanges(code, ranges) {
 
 // A brand new workspace starts genuinely empty so the kick-start options are what a first
 // visitor sees. `navigation` decides whether the previous workspace stays reachable via Back.
-async function createWorkspace(code = '', { navigation = 'replace' } = {}) {
+async function createWorkspace(code = '', { navigation = 'replace', files = null, entry = null } = {}) {
   leaveReadOnly();
   const generation = advanceWorkspaceGeneration();
   nextWorkspaceNavigation = navigation;
+  if (files && typeof files === 'object') {
+    workspaceFiles = { ...files };
+    workspaceEntry = entry || pickMultiFileEntry(Object.keys(workspaceFiles).sort());
+    code = workspaceFiles[workspaceEntry] ?? code;
+  } else {
+    workspaceEntry = 'main.scad';
+    workspaceFiles = { [workspaceEntry]: code };
+  }
   setSyncState('Creating', 'saving');
   try {
     const response = await fetch('/api/workspaces', {
@@ -1342,6 +1572,8 @@ async function createWorkspace(code = '', { navigation = 'replace' } = {}) {
       // the user creates a new workspace" means: the bed carries over instead of resetting.
       body: JSON.stringify({
         code,
+        entry: workspaceEntry,
+        files: workspaceFiles,
         plate: localStorage.getItem(PLATE_STORAGE_KEY) || '',
         // `|| DEFAULT` would turn a deliberate 0 mm clearance back into 0.2.
         tolerance: readTolerance() ?? DEFAULT_TOLERANCE,
@@ -1360,8 +1592,13 @@ async function createWorkspace(code = '', { navigation = 'replace' } = {}) {
     setWorkspaceIdentity(id);
     workspaceRevision = 1;
     editor.value = code;
+    if (!Object.keys(workspaceFiles).length) {
+      workspaceEntry = 'main.scad';
+      workspaceFiles = { [workspaceEntry]: code };
+    }
     syncEditor(false);
     workspaceSavedCode = '';
+    renderFileList();
     storeLocalWorkspace();
     setSyncState('Local', 'local');
   }
@@ -1390,10 +1627,17 @@ async function loadWorkspace(id) {
     // Viewer settings are not part of the source, so they restore on every path — including
     // the divergent-cache and conflict branches below, which never reach applyWorkspace().
     applyWorkspaceSettings(remote);
-    if (cached?.code && cached.code !== remote.code) {
-      editor.value = cached.code;
+    const cachedFiles = cached ? normalizeWorkspaceFiles(cached, cached.code || '') : null;
+    const remoteFiles = normalizeWorkspaceFiles(remote, remote.code || '');
+    const cachedActive = cachedFiles?.files[cachedFiles.entry] ?? cached?.code;
+    const remoteActive = remoteFiles.files[remoteFiles.entry] ?? remote.code;
+    if (cachedActive && cachedActive !== remoteActive) {
+      workspaceFiles = cachedFiles.files;
+      workspaceEntry = cachedFiles.entry;
+      editor.value = cachedActive;
       syncEditor(false);
-      workspaceSavedCode = remote.code;
+      renderFileList();
+      workspaceSavedCode = remoteActive;
       workspaceRevision = Number.isFinite(cachedRevision) ? cachedRevision : remoteRevision;
       workspaceHasLocalChanges = true;
       if (Number.isFinite(remoteRevision) && remoteRevision > workspaceRevision) {
@@ -1409,14 +1653,20 @@ async function loadWorkspace(id) {
   } catch {
     if (generation !== workspaceGeneration || id !== workspaceId) return;
     workspaceOnline = false;
-    if (cached?.code) {
+    if (cached?.code || cached?.files) {
       workspaceRevision = Number(cached.revision) || 1;
-      editor.value = cached.code;
+      const normalized = normalizeWorkspaceFiles(cached, cached.code || '');
+      workspaceFiles = normalized.files;
+      workspaceEntry = normalized.entry;
+      editor.value = workspaceFiles[workspaceEntry] || '';
     } else {
       // Never seed from another workspace's cache: an unknown workspace starts empty.
       editor.value = '';
+      workspaceEntry = 'main.scad';
+      workspaceFiles = { [workspaceEntry]: '' };
     }
     syncEditor(false);
+    renderFileList();
     workspaceSavedCode = '';
     setSyncState('Local', 'local');
   }
@@ -1494,6 +1744,8 @@ async function saveWorkspace() {
   const generation = workspaceGeneration;
   const baseRevision = workspaceRevision;
   const code = editor.value;
+  const path = workspaceEntry;
+  workspaceFiles[path] = code;
   const controller = new AbortController();
   workspaceSaveController = controller;
   setSyncState('Saving', 'saving');
@@ -1503,7 +1755,7 @@ async function saveWorkspace() {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
-        body: JSON.stringify({ code, baseRevision, source: 'browser' }),
+        body: JSON.stringify({ code, path, entry: path, baseRevision, source: 'browser' }),
       });
       const payload = await response.json();
       if (generation !== workspaceGeneration || id !== workspaceId) return false;
@@ -1517,8 +1769,11 @@ async function saveWorkspace() {
       workspaceSaveFailures = 0;
       const workspace = workspaceFromPayload(payload);
       if (Number.isFinite(Number(workspace.revision))) workspaceRevision = Number(workspace.revision);
+      if (workspace.files) workspaceFiles = { ...workspace.files };
+      if (workspace.entry) workspaceEntry = workspace.entry;
       workspaceSavedCode = code;
       workspaceHasLocalChanges = editor.value !== code;
+      renderFileList();
       storeLocalWorkspace();
       setSyncState(workspaceHasLocalChanges ? 'Unsaved' : 'Synced', workspaceHasLocalChanges ? 'saving' : 'synced');
       if (workspaceHasLocalChanges) scheduleWorkspaceSave();
@@ -2033,7 +2288,16 @@ function downloadBlob(blob, name) {
 }
 
 function saveScad() {
-  const name = downloadFileName('scad');
+  workspaceFiles[workspaceEntry] = editor.value;
+  const paths = Object.keys(workspaceFiles);
+  if (paths.length > 1) {
+    const name = downloadFileName('zip');
+    downloadBlob(buildStoreZip(workspaceFiles), name);
+    dirtyIndicator.classList.remove('visible');
+    log(`${name} saved to Downloads (${paths.length} files).`, 'success');
+    return;
+  }
+  const name = workspaceEntry.endsWith('.scad') ? workspaceEntry : downloadFileName('scad');
   downloadBlob(new Blob([editor.value], { type: 'text/plain' }), name);
   dirtyIndicator.classList.remove('visible');
   log(`${name} saved to Downloads.`, 'success');
@@ -2098,43 +2362,440 @@ async function exportModel(format, scope = 'visible') {
 // Set once the user opens the panel by hand, so an auto-hide never yanks it
 // back shut underneath them. Cleared when they close it again.
 let customizerPinned = false;
+// Rebuild signature: when only values change, patch inputs in place so a slider
+// drag or select focus is not destroyed by syncEditor's every-keystroke refresh.
+let customizerStructureKey = '';
+
+const CUSTOMIZER_STOP = /^(module|function)\b/;
+const CUSTOMIZER_GEOMETRY = /^(cube|sphere|cylinder|polyhedron|square|circle|polygon|text|import|surface|linear_extrude|rotate_extrude|resize|hull|minkowski|offset|projection|union|difference|intersection|intersection_for|translate|rotate|scale|mirror|multmatrix|color|render|group|children|for|intersection_for|if|let|assign)\s*(\(|$)/;
+
+function escapeCustomizerRe(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function parseCustomizerLiteral(text) {
+  const source = text.trim();
+  if (!source) return null;
+  if (source === 'true') return { kind: 'bool', value: true, raw: source };
+  if (source === 'false') return { kind: 'bool', value: false, raw: source };
+  if (source[0] === '"') {
+    let i = 1;
+    let out = '';
+    while (i < source.length) {
+      const ch = source[i];
+      if (ch === '\\' && i + 1 < source.length) {
+        out += source[i + 1];
+        i += 2;
+        continue;
+      }
+      if (ch === '"') {
+        if (source.slice(i + 1).trim()) return null;
+        return { kind: 'string', value: out, raw: source.slice(0, i + 1) };
+      }
+      out += ch;
+      i += 1;
+    }
+    return null;
+  }
+  if (source[0] === '[') {
+    const inner = source.slice(1, source.lastIndexOf(']'));
+    if (source[source.length - 1] !== ']' || /:/.test(inner)) return null;
+    const parts = [];
+    let depth = 0;
+    let start = 0;
+    for (let i = 0; i < inner.length; i += 1) {
+      const ch = inner[i];
+      if (ch === '[') depth += 1;
+      else if (ch === ']') depth -= 1;
+      else if (ch === ',' && depth === 0) {
+        parts.push(inner.slice(start, i));
+        start = i + 1;
+      }
+    }
+    parts.push(inner.slice(start));
+    const values = [];
+    for (const part of parts) {
+      const lit = parseCustomizerLiteral(part);
+      if (!lit || lit.kind === 'vector') return null;
+      if (lit.kind !== 'number' && lit.kind !== 'bool' && lit.kind !== 'string') return null;
+      values.push(lit.value);
+    }
+    if (!values.length) return null;
+    return { kind: 'vector', value: values, raw: source };
+  }
+  if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(source)) {
+    return { kind: 'number', value: Number(source), raw: source };
+  }
+  return null;
+}
+
+function parseCustomizerAnnotation(spec) {
+  const text = spec.trim();
+  if (!text) return { type: 'none' };
+  const rangeThree = text.match(/^([+-]?(?:\d+\.?\d*|\.\d+))\s*:\s*([+-]?(?:\d+\.?\d*|\.\d+))\s*:\s*([+-]?(?:\d+\.?\d*|\.\d+))$/);
+  if (rangeThree) {
+    return { type: 'range', min: Number(rangeThree[1]), step: Number(rangeThree[2]), max: Number(rangeThree[3]) };
+  }
+  const rangeTwo = text.match(/^([+-]?(?:\d+\.?\d*|\.\d+))\s*:\s*([+-]?(?:\d+\.?\d*|\.\d+))$/);
+  if (rangeTwo) {
+    return { type: 'range', min: Number(rangeTwo[1]), step: 1, max: Number(rangeTwo[2]) };
+  }
+  const options = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i <= text.length; i += 1) {
+    const ch = text[i];
+    if (ch === '(') depth += 1;
+    else if (ch === ')') depth -= 1;
+    if ((ch === ',' && depth === 0) || i === text.length) {
+      const piece = text.slice(start, i).trim();
+      start = i + 1;
+      if (!piece) continue;
+      const labeled = piece.match(/^([^:]+):(.*)$/);
+      if (labeled) {
+        const raw = labeled[1].trim();
+        const label = labeled[2].trim();
+        const asNum = Number(raw);
+        options.push({
+          value: Number.isFinite(asNum) && /^-?\d/.test(raw) ? asNum : raw,
+          label: label || raw,
+        });
+      } else {
+        const asNum = Number(piece);
+        options.push({
+          value: Number.isFinite(asNum) && /^-?\d/.test(piece) ? asNum : piece,
+          label: piece,
+        });
+      }
+    }
+  }
+  if (options.length > 1 || (options.length === 1 && text.includes(','))) {
+    return { type: 'enum', options };
+  }
+  if (options.length === 1 && !text.includes(':')) {
+    // A lone token inside [] is still an enum of one in OpenSCAD; treat as enum
+    // so labeled single-choice widgets stay consistent with multi-choice ones.
+    return { type: 'enum', options };
+  }
+  return { type: 'none' };
+}
+
+function splitCustomizerComment(comment) {
+  if (!comment) return { description: '', annotation: null, maxLength: null };
+  const bracket = comment.match(/\[([^\]]*)\]/);
+  if (bracket) {
+    const description = comment.slice(0, bracket.index).replace(/[,\s]+$/g, '').trim();
+    return { description, annotation: parseCustomizerAnnotation(bracket[1]), maxLength: null };
+  }
+  const maxOnly = comment.match(/^\s*(\d+)\s*$/);
+  if (maxOnly) return { description: '', annotation: null, maxLength: Number(maxOnly[1]) };
+  return { description: comment.trim(), annotation: null, maxLength: null };
+}
+
+function serializeCustomizerValue(kind, value) {
+  if (kind === 'bool') return value ? 'true' : 'false';
+  if (kind === 'string') return JSON.stringify(String(value));
+  if (kind === 'vector') {
+    return `[${value.map((item) => (typeof item === 'string' ? JSON.stringify(item) : String(item))).join(', ')}]`;
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    // Keep integers looking like integers; OpenSCAD accepts both.
+    return Number.isInteger(value) ? String(value) : String(value);
+  }
+  return String(value);
+}
+
+function applyCustomizerValue(source, name, kind, value) {
+  const serialized = serializeCustomizerValue(kind, value);
+  const pattern = new RegExp(`^(\\s*${escapeCustomizerRe(name)}\\s*=\\s*)[^;]+`, 'm');
+  return source.replace(pattern, `$1${serialized}`);
+}
+
+// OpenSCAD Customizer: top-level literal assignments before the first
+// module/function (and, per SPEC_LANG §18, before geometry). Section comments
+// group controls; /* [Hidden] */ hides everything after it.
+function parseCustomizerSource(source) {
+  const sections = [{ name: '', hidden: false, fields: [] }];
+  let section = sections[0];
+  let pendingDescription = '';
+  const lines = String(source || '').split('\n');
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const trimmed = lines[lineIndex].trim();
+    if (!trimmed) {
+      pendingDescription = '';
+      continue;
+    }
+    const sectionMatch = trimmed.match(/^\/\*\s*\[([^\]]*)\]\s*\*\/\s*$/);
+    if (sectionMatch) {
+      const name = sectionMatch[1].trim();
+      section = { name, hidden: /^hidden$/i.test(name), fields: [] };
+      sections.push(section);
+      pendingDescription = '';
+      continue;
+    }
+    if (trimmed.startsWith('//')) {
+      pendingDescription = trimmed.replace(/^\/\/\s?/, '').trim();
+      continue;
+    }
+    if (CUSTOMIZER_STOP.test(trimmed) || CUSTOMIZER_GEOMETRY.test(trimmed)) break;
+    if (/^(include|use)\s*[<"]/.test(trimmed)) {
+      pendingDescription = '';
+      continue;
+    }
+    const assign = trimmed.match(/^([A-Za-z_$][\w$]*)\s*=\s*([^;]+);\s*(?:\/\/(.*))?$/);
+    if (!assign) {
+      pendingDescription = '';
+      continue;
+    }
+    const name = assign[1];
+    const literal = parseCustomizerLiteral(assign[2]);
+    const prior = pendingDescription;
+    pendingDescription = '';
+    if (!literal || section.hidden) continue;
+    const comment = splitCustomizerComment(assign[3] || '');
+    const description = comment.description || prior;
+    const annotation = comment.annotation || { type: 'none' };
+    let field = null;
+    if (annotation.type === 'range' && (literal.kind === 'number' || literal.kind === 'vector')) {
+      field = literal.kind === 'vector'
+        ? {
+          name,
+          kind: 'vector',
+          value: literal.value.slice(),
+          min: annotation.min,
+          max: annotation.max,
+          step: annotation.step,
+          description,
+        }
+        : {
+          name,
+          kind: 'slider',
+          value: literal.value,
+          min: annotation.min,
+          max: annotation.max,
+          step: annotation.step,
+          description,
+        };
+    } else if (annotation.type === 'enum') {
+      field = {
+        name,
+        kind: 'select',
+        value: literal.value,
+        options: annotation.options,
+        description,
+      };
+    } else if (literal.kind === 'bool') {
+      field = { name, kind: 'checkbox', value: literal.value, description };
+    } else if (literal.kind === 'string') {
+      field = {
+        name,
+        kind: 'text',
+        value: literal.value,
+        maxLength: comment.maxLength,
+        description,
+      };
+    } else if (literal.kind === 'vector') {
+      field = { name, kind: 'vector', value: literal.value.slice(), description };
+    } else if (literal.kind === 'number') {
+      field = { name, kind: 'spinbox', value: literal.value, step: 1, description };
+    }
+    if (field) section.fields.push(field);
+  }
+  const visible = sections.filter((entry) => !entry.hidden && entry.fields.length);
+  return {
+    sections: visible.length ? visible : [],
+    fields: visible.flatMap((entry) => entry.fields),
+  };
+}
+
+function customizerFieldKey(field) {
+  if (field.kind === 'slider') return `${field.name}:slider:${field.min}:${field.step}:${field.max}`;
+  if (field.kind === 'select') {
+    return `${field.name}:select:${field.options.map((option) => `${option.value}=${option.label}`).join('|')}`;
+  }
+  if (field.kind === 'vector') {
+    return `${field.name}:vector:${field.value.length}:${field.min ?? ''}:${field.step ?? ''}:${field.max ?? ''}`;
+  }
+  if (field.kind === 'text') return `${field.name}:text:${field.maxLength ?? ''}`;
+  return `${field.name}:${field.kind}`;
+}
+
+function renderCustomizerField(field) {
+  const label = escapeHtml(field.name);
+  const title = field.description ? ` title="${escapeAttribute(field.description)}"` : '';
+  const hint = field.description
+    ? `<small class="custom-desc">${escapeHtml(field.description)}</small>`
+    : '';
+  if (field.kind === 'slider') {
+    return `<div class="custom-field" data-variable="${escapeAttribute(field.name)}" data-kind="slider"${title}>`
+      + `<label><span>${label}</span>`
+      + `<input type="number" min="${field.min}" max="${field.max}" step="${field.step}" value="${field.value}"></label>`
+      + hint
+      + `<input type="range" min="${field.min}" max="${field.max}" step="${field.step}" value="${field.value}">`
+      + `</div>`;
+  }
+  if (field.kind === 'spinbox') {
+    return `<div class="custom-field" data-variable="${escapeAttribute(field.name)}" data-kind="spinbox"${title}>`
+      + `<label><span>${label}</span>`
+      + `<input type="number" step="${field.step ?? 1}" value="${field.value}"></label>${hint}</div>`;
+  }
+  if (field.kind === 'select') {
+    const options = field.options.map((option) => {
+      const selected = Object.is(option.value, field.value) || String(option.value) === String(field.value) ? ' selected' : '';
+      return `<option value="${escapeAttribute(String(option.value))}"${selected}>${escapeHtml(option.label)}</option>`;
+    }).join('');
+    return `<div class="custom-field" data-variable="${escapeAttribute(field.name)}" data-kind="select"${title}>`
+      + `<label><span>${label}</span><select>${options}</select></label>${hint}</div>`;
+  }
+  if (field.kind === 'checkbox') {
+    return `<div class="custom-field" data-variable="${escapeAttribute(field.name)}" data-kind="checkbox"${title}>`
+      + `<label class="custom-check"><input type="checkbox"${field.value ? ' checked' : ''}>`
+      + `<span>${label}</span></label>${hint}</div>`;
+  }
+  if (field.kind === 'text') {
+    const max = field.maxLength != null ? ` maxlength="${field.maxLength}"` : '';
+    return `<div class="custom-field" data-variable="${escapeAttribute(field.name)}" data-kind="text"${title}>`
+      + `<label><span>${label}</span></label>${hint}`
+      + `<input type="text" value="${escapeAttribute(field.value)}"${max}>`
+      + `</div>`;
+  }
+  if (field.kind === 'vector') {
+    const inputs = field.value.map((component, index) => {
+      const bounds = field.min != null
+        ? ` min="${field.min}" max="${field.max}" step="${field.step}"`
+        : ' step="any"';
+      return `<input type="number" data-index="${index}" value="${component}"${bounds}>`;
+    }).join('');
+    return `<div class="custom-field" data-variable="${escapeAttribute(field.name)}" data-kind="vector"${title}>`
+      + `<label><span>${label}</span></label>${hint}`
+      + `<div class="custom-vector">${inputs}</div>`
+      + `</div>`;
+  }
+  return '';
+}
+
+function customizerValueKind(field, value) {
+  if (field.kind === 'checkbox') return 'bool';
+  if (field.kind === 'vector') return 'vector';
+  if (field.kind === 'text') return 'string';
+  if (field.kind === 'slider' || field.kind === 'spinbox') return 'number';
+  if (field.kind === 'select') return typeof value === 'number' ? 'number' : 'string';
+  return typeof value === 'number' ? 'number' : 'string';
+}
+
+function bindCustomizerField(container, field) {
+  const commit = (next) => {
+    field.value = next;
+    editor.value = applyCustomizerValue(editor.value, field.name, customizerValueKind(field, next), next);
+    syncEditor();
+    clearTimeout(renderDebounce);
+    renderDebounce = setTimeout(() => render('preview'), 350);
+  };
+
+  if (field.kind === 'slider') {
+    const range = $('input[type="range"]', container);
+    const number = $('input[type="number"]', container);
+    range.addEventListener('input', () => { number.value = range.value; });
+    range.addEventListener('change', () => commit(Number(range.value)));
+    number.addEventListener('change', () => commit(Number(number.value)));
+    return;
+  }
+  if (field.kind === 'spinbox') {
+    $('input[type="number"]', container).addEventListener('change', (event) => commit(Number(event.target.value)));
+    return;
+  }
+  if (field.kind === 'select') {
+    $('select', container).addEventListener('change', (event) => {
+      const raw = event.target.value;
+      const matched = field.options.find((option) => String(option.value) === raw);
+      commit(matched ? matched.value : raw);
+    });
+    return;
+  }
+  if (field.kind === 'checkbox') {
+    $('input[type="checkbox"]', container).addEventListener('change', (event) => commit(event.target.checked));
+    return;
+  }
+  if (field.kind === 'text') {
+    $('input[type="text"]', container).addEventListener('change', (event) => commit(event.target.value));
+    return;
+  }
+  if (field.kind === 'vector') {
+    $$('input[type="number"]', container).forEach((input) => {
+      input.addEventListener('change', () => {
+        const next = field.value.slice();
+        next[Number(input.dataset.index)] = Number(input.value);
+        commit(next);
+      });
+    });
+  }
+}
+
+function patchCustomizerValues(body, fields) {
+  for (const field of fields) {
+    const container = body.querySelector(`.custom-field[data-variable="${CSS.escape(field.name)}"]`);
+    if (!container) continue;
+    if (field.kind === 'slider') {
+      const range = $('input[type="range"]', container);
+      const number = $('input[type="number"]', container);
+      if (document.activeElement !== range && document.activeElement !== number) {
+        range.value = field.value;
+        number.value = field.value;
+      }
+    } else if (field.kind === 'spinbox') {
+      const number = $('input[type="number"]', container);
+      if (document.activeElement !== number) number.value = field.value;
+    } else if (field.kind === 'select') {
+      const select = $('select', container);
+      if (document.activeElement !== select) select.value = String(field.value);
+    } else if (field.kind === 'checkbox') {
+      const box = $('input[type="checkbox"]', container);
+      if (document.activeElement !== box) box.checked = !!field.value;
+    } else if (field.kind === 'text') {
+      const input = $('input[type="text"]', container);
+      if (document.activeElement !== input) input.value = field.value;
+    } else if (field.kind === 'vector') {
+      $$('input[type="number"]', container).forEach((input) => {
+        if (document.activeElement === input) return;
+        const index = Number(input.dataset.index);
+        if (index < field.value.length) input.value = field.value[index];
+      });
+    }
+  }
+}
 
 function updateCustomizer() {
-  const fields = [];
-  const pattern = /^\s*([A-Za-z_$][\w$]*)\s*=\s*(-?\d+(?:\.\d+)?)\s*;\s*\/\/\s*\[\s*(-?\d+(?:\.\d+)?)\s*:\s*(-?\d+(?:\.\d+)?)\s*:\s*(-?\d+(?:\.\d+)?)\s*\]/gm;
-  for (const match of editor.value.matchAll(pattern)) {
-    fields.push({ name: match[1], value: Number(match[2]), min: Number(match[3]), step: Number(match[4]), max: Number(match[5]) });
-  }
+  const parsed = parseCustomizerSource(editor.value);
+  const fields = parsed.fields;
   const body = $('#customizerBody');
-  // Nothing in the source is customizable, so the panel and its toggle have
-  // nothing to show or do — hide both rather than parking an empty column.
   // The panel hides itself when the model has nothing to customize, but the
   // toggle always stays available: opening it deliberately must still work,
   // and the empty state is where the feature is explained.
   const hasFields = fields.length > 0;
   $('#customizer').hidden = !hasFields && !customizerPinned;
   if (!hasFields) {
-    body.innerHTML = '<div class="customizer-empty"><span>{ }</span><p>Add a range comment like<br><code>// [1:1:20]</code> after a variable.</p></div>';
+    customizerStructureKey = '';
+    body.innerHTML = '<div class="customizer-empty"><span>{ }</span><p>Add Customizer annotations like<br><code>// [1:1:20]</code>, <code>// [a, b]</code>, or <code>/* [Section] */</code>.</p></div>';
     if (!customizerPinned) $('#customizer').classList.add('closed');
     return;
   }
   $('#customizer').classList.remove('closed');
-  body.innerHTML = fields.map((field) => `<div class="custom-field" data-variable="${field.name}"><label><span>${field.name}</span><input type="number" min="${field.min}" max="${field.max}" step="${field.step}" value="${field.value}"></label><input type="range" min="${field.min}" max="${field.max}" step="${field.step}" value="${field.value}"></div>`).join('');
+  const structure = parsed.sections.map((entry) => `${entry.name}{${entry.fields.map(customizerFieldKey).join(',')}}`).join('|');
+  if (structure === customizerStructureKey && body.querySelector('.custom-field')) {
+    patchCustomizerValues(body, fields);
+    return;
+  }
+  customizerStructureKey = structure;
+  body.innerHTML = parsed.sections.map((entry) => {
+    const heading = entry.name
+      ? `<h3 class="custom-section">${escapeHtml(entry.name)}</h3>`
+      : '';
+    return heading + entry.fields.map(renderCustomizerField).join('');
+  }).join('');
+  const flat = parsed.sections.flatMap((entry) => entry.fields);
   $$('.custom-field', body).forEach((container) => {
-    const range = $('input[type="range"]', container);
-    const number = $('input[type="number"]', container);
-    const commit = (value) => {
-      range.value = value;
-      number.value = value;
-      const variable = container.dataset.variable.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      editor.value = editor.value.replace(new RegExp(`(^\\s*${variable}\\s*=\\s*)-?\\d+(?:\\.\\d+)?`, 'm'), `$1${value}`);
-      syncEditor();
-      clearTimeout(renderDebounce);
-      renderDebounce = setTimeout(() => render('preview'), 350);
-    };
-    range.addEventListener('input', () => { number.value = range.value; });
-    range.addEventListener('change', () => commit(range.value));
-    number.addEventListener('change', () => commit(number.value));
+    const field = flat.find((entry) => entry.name === container.dataset.variable);
+    if (field) bindCustomizerField(container, field);
   });
 }
 
@@ -2343,16 +3004,29 @@ $('#newButton').addEventListener('click', async () => {
   emptyState.hidden = false;
 });
 $('#fileInput').addEventListener('change', async (event) => {
-  const file = event.target.files[0];
-  if (!file) return;
-  editor.value = await file.text();
-  setDownloadBaseName(file.name);
-  syncEditor(false);
-  scheduleWorkspaceSave();
+  const selected = [...(event.target.files || [])];
+  event.target.value = '';
+  if (!selected.length) return;
+  const files = {};
+  for (const file of selected) {
+    const path = file.name.replace(/\\/g, '/').split('/').pop();
+    if (!path) continue;
+    files[path] = await file.text();
+  }
+  const paths = Object.keys(files).sort((a, b) => a.localeCompare(b));
+  if (!paths.length) return;
+  const entry = pickMultiFileEntry(paths);
+  workspaceFiles = files;
+  workspaceEntry = entry;
+  setDownloadBaseName(entry.replace(/\.scad$/i, '') || 'model');
+  await createWorkspace(files[entry] || '', { navigation: 'push', files, entry });
   dirtyIndicator.classList.remove('visible');
-  log(`${file.name} opened.`, 'success');
+  log(paths.length > 1 ? `Opened ${paths.length} files (${entry}).` : `${entry} opened.`, 'success');
   render('preview');
 });
+$('#newFileButton').addEventListener('click', () => createWorkspaceFile());
+$('#renameFileButton').addEventListener('click', () => renameWorkspaceFile());
+$('#deleteFileButton').addEventListener('click', () => deleteWorkspaceFile());
 // Delegated from the panel, not from the catalogue: the recents list is a
 // sibling of it, and binding to the catalogue alone left every card in the
 // recents group inert.
