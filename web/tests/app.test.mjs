@@ -28,13 +28,18 @@ test('the viewport uses the WebGL canvas mesh path', () => {
   assert.doesNotMatch(javascript, /renderImage|data:image\/png;base64/);
 });
 
-test('web shell omits desktop menus and multi-file tab chrome', () => {
+test('web shell omits desktop menus and keeps a single editor buffer with a file list', () => {
   assert.doesNotMatch(html, /data-menu=|class="menus"|menu-popover/);
   assert.doesNotMatch(html, /class="tab active"/);
-  // The editor pane carries no header chrome at all: one source buffer, no
-  // file name, no tab strip, no dead "editor settings" affordance.
   assert.doesNotMatch(html, /class="file-heading"|id="editorSettings"/);
   assert.equal(html.match(/<textarea[^>]*id="codeEditor"/g).length, 1);
+  assert.match(html, /id="fileList"/);
+  assert.match(html, /id="fileListItems"/);
+  assert.match(html, /id="newFileButton"/);
+  assert.match(html, /multiple/);
+  assert.match(javascript, /workspaceFiles/);
+  assert.match(javascript, /switchWorkspaceFile/);
+  assert.match(javascript, /buildStoreZip/);
 });
 
 test('scene inspection controls expose objects, visibility, selection, and tolerance', () => {
@@ -105,14 +110,14 @@ test('unknown legacy workspace URLs are migrated instead of stranded locally', (
   assert.match(loading, /await createWorkspace\(cached\?\.code \|\| ''\)/);
 });
 
-test('the workspace is the document: no file name is surfaced anywhere', () => {
+test('the workspace has no desktop document title chrome', () => {
   assert.doesNotMatch(html, /Untitled/);
   assert.doesNotMatch(javascript, /Untitled/);
   assert.doesNotMatch(html, /id="documentName"|id="editorTabName"|class="document-name"/);
   assert.doesNotMatch(javascript, /document\.title\s*=/);
   // Downloads still need a real file name on disk.
   assert.match(javascript, /function downloadFileName\(extension\)/);
-  assert.match(javascript, /downloadFileName\('scad'\)/);
+  assert.match(javascript, /downloadFileName\('scad'\)|downloadFileName\('zip'\)/);
 });
 
 test('examples are kick-start options above an empty editor, not a toolbar dropdown', () => {
@@ -155,7 +160,7 @@ test('recently visited workspaces are remembered in this browser, with previews'
   // Most recent first, which is the order it is stored in.
   assert.match(recents, /\[\{ id, visitedAt: Date\.now\(\) \}, \.\.\.rest\]/);
   // A blank workspace — what landing on "/" mints — must not be listed.
-  assert.match(javascript, /workspace\.id && \(workspace\.code \|\| ''\)\.trim\(\)/);
+  assert.match(javascript, /workspace\.id && \(activeCode \|\| ''\)\.trim\(\)/);
   // Removing one is a list operation and says so, because the wording is the
   // only thing standing between the user and thinking they deleted their work.
   // Asked in the page, like every other confirmation here — a native dialog
