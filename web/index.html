@@ -47,7 +47,7 @@
           <button class="tool-button" id="newButton" title="New workspace (⌘N)" aria-label="New workspace" data-icon="new"></button>
           <button class="tool-button" id="openButton" title="Open (⌘O)" aria-label="Open file" data-icon="open"></button>
           <button class="tool-button" id="saveButton" title="Save SCAD (⌘S)" aria-label="Save file" data-icon="save"></button>
-          <input id="fileInput" type="file" accept=".scad,text/plain" hidden />
+          <input id="fileInput" type="file" accept=".scad,text/plain" multiple hidden />
         </div>
         <div class="tool-divider"></div>
         <div class="tool-group">
@@ -101,6 +101,14 @@
         </aside>
 
         <section class="editor-pane" aria-label="OpenSCAD editor">
+          <div class="file-list" id="fileList" hidden aria-label="Workspace files">
+            <div class="file-list-items" id="fileListItems" role="listbox" aria-label="Project files"></div>
+            <div class="file-list-actions">
+              <button type="button" id="newFileButton" title="New file">+</button>
+              <button type="button" id="renameFileButton" title="Rename file">Rename</button>
+              <button type="button" id="deleteFileButton" title="Delete file">Delete</button>
+            </div>
+          </div>
           <div class="editor-wrap">
             <div class="editor-overlay">
               <i id="dirtyIndicator" title="Unsaved changes"></i>

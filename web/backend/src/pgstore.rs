@@ -34,10 +34,13 @@ use std::time::{Duration, Instant};
 use postgres::{Client, Config, Row};
 use serde_json::Value;
 
+use std::collections::BTreeMap;
+
 use crate::{
-    default_workspace_name, normalize_source, sanitize_name, sanitize_plate, sanitize_tolerance,
-    unix_millis, valid_workspace_id, validate_source, EditResult, UpdateError, Workspace,
-    WorkspaceEvent, WorkspaceUpdate, DEFAULT_TOLERANCE, MAX_BODY, MAX_EVENTS, MAX_WORKSPACES,
+    assemble_workspace_files, default_workspace_name, normalize_source, normalize_workspace_document,
+    prepare_workspace_edit, sanitize_name, sanitize_plate, sanitize_tolerance, unix_millis,
+    valid_workspace_id, EditResult, UpdateError, Workspace, WorkspaceEvent, WorkspaceUpdate,
+    DEFAULT_TOLERANCE, MAX_EVENTS, MAX_WORKSPACES,
 };
 
 /// Idle connections kept alive between requests. The server is thread-per-
@@ -72,7 +75,7 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(600);
 const MIGRATION_LOCK_KEY: i64 = 0x_7265_6f70_656e_0001;
 
 const SELECT_COLUMNS: &str =
-    "id, name, code, revision, created_at, updated_at, plate, tolerance, preview, share_token, events";
+    "id, name, code, entry, files, revision, created_at, updated_at, plate, tolerance, preview, share_token, events";
 
 /// The retained-workspace ceiling, from `REOPENSCAD_MAX_WORKSPACES`.
 ///
@@ -384,10 +387,12 @@ impl PgWorkspaceStore {
         name: Option<String>,
         plate: Option<String>,
         tolerance: Option<f64>,
+        files: Option<BTreeMap<String, String>>,
+        entry: Option<String>,
     ) -> Result<Workspace, String> {
-        if code.len() > MAX_BODY {
-            return Err("Workspace code exceeds the 2 MiB limit.".into());
-        }
+        let (files, entry, code) = assemble_workspace_files(code, files, entry)?;
+        let files_json = serde_json::to_value(&files)
+            .map_err(|error| format!("Workspace files could not be stored: {error}"))?;
         let now = unix_millis() as i64;
         let name = sanitize_name(name);
         let plate = plate.as_deref().map(sanitize_plate).unwrap_or_default();
@@ -399,10 +404,10 @@ impl PgWorkspaceStore {
             let inserted = self.pool.with(|client| {
                 client.execute(
                     "INSERT INTO workspaces
-                         (id, name, code, revision, created_at, updated_at, plate, tolerance, events)
-                     VALUES ($1, $2, $3, 1, $4, $4, $5, $6, '[]'::jsonb)
+                         (id, name, code, entry, files, revision, created_at, updated_at, plate, tolerance, events)
+                     VALUES ($1, $2, $3, $4, $5, 1, $6, $6, $7, $8, '[]'::jsonb)
                      ON CONFLICT (id) DO NOTHING",
-                    &[&id, &name, &code, &now, &plate, &tolerance],
+                    &[&id, &name, &code, &entry, &files_json, &now, &plate, &tolerance],
                 )
             })?;
             if inserted == 1 {
@@ -410,6 +415,8 @@ impl PgWorkspaceStore {
                     id,
                     name,
                     code,
+                    entry,
+                    files,
                     revision: 1,
                     created_at: now as u64,
                     updated_at: now as u64,
@@ -471,47 +478,19 @@ impl PgWorkspaceStore {
         if expected != current.revision {
             return Err(UpdateError::Conflict(current));
         }
-        let (code, start, end, inserted_length) = if let Some(code) = update.code {
-            let old_len = current.code.len();
-            let new_len = code.len();
-            (code, 0, old_len, new_len)
-        } else {
-            let start = update.start.ok_or_else(|| {
-                UpdateError::Invalid("Provide code or a start/end/text edit.".into())
-            })?;
-            let end = update.end.ok_or_else(|| {
-                UpdateError::Invalid("Provide code or a start/end/text edit.".into())
-            })?;
-            let text = update.text.unwrap_or_default();
-            if start > end
-                || end > current.code.len()
-                || !current.code.is_char_boundary(start)
-                || !current.code.is_char_boundary(end)
-            {
-                return Err(UpdateError::Invalid(
-                    "Edit range must use valid UTF-8 byte offsets within the document.".into(),
-                ));
-            }
-            let mut code = current.code.clone();
-            code.replace_range(start..end, &text);
-            let inserted_length = text.len();
-            (code, start, end, inserted_length)
-        };
-        if code.len() > MAX_BODY {
-            return Err(UpdateError::Invalid(
-                "Workspace code exceeds the 2 MiB limit.".into(),
-            ));
-        }
-        validate_source(&code).map_err(UpdateError::Validation)?;
+        let prepared = prepare_workspace_edit(&current, &update)?;
+        let files_json = serde_json::to_value(&prepared.files)
+            .map_err(|error| UpdateError::Internal(error.to_string()))?;
 
         let now = unix_millis();
         let event = WorkspaceEvent {
             workspace_id: id.to_string(),
             revision: current.revision + 1,
             source: normalize_source(&update.source),
-            start,
-            end,
-            inserted_length,
+            path: prepared.path.clone(),
+            start: prepared.start,
+            end: prepared.end,
+            inserted_length: prepared.inserted_length,
             timestamp: now,
         };
         // Fields the caller did not mention are passed as NULL and resolved by
@@ -528,7 +507,7 @@ impl PgWorkspaceStore {
             .map_err(|error| UpdateError::Internal(error.to_string()))?;
 
         // The compare-and-swap. `revision = revision + 1` is computed by the
-        // server under the row lock, and the `AND revision = $9` predicate is
+        // server under the row lock, and the `AND revision = $11` predicate is
         // what makes a concurrent writer on the same base revision lose. There
         // is no read-modify-write window for a second instance to slip into.
         let owned = id.to_string();
@@ -542,18 +521,22 @@ impl PgWorkspaceStore {
                     &format!(
                         "UPDATE workspaces SET
                              code = $1,
-                             name = COALESCE($2, name),
-                             plate = COALESCE($3, plate),
-                             tolerance = COALESCE($4, tolerance),
-                             updated_at = $5,
+                             entry = $2,
+                             files = $3,
+                             name = COALESCE($4, name),
+                             plate = COALESCE($5, plate),
+                             tolerance = COALESCE($6, tolerance),
+                             updated_at = $7,
                              revision = revision + 1,
-                             events = (CASE WHEN jsonb_array_length(events) >= $6
-                                            THEN events - 0 ELSE events END) || $7
-                         WHERE id = $8 AND revision = $9
+                             events = (CASE WHEN jsonb_array_length(events) >= $8
+                                            THEN events - 0 ELSE events END) || $9
+                         WHERE id = $10 AND revision = $11
                          RETURNING {SELECT_COLUMNS}"
                     ),
                     &[
-                        &code,
+                        &prepared.code,
+                        &prepared.entry,
+                        &files_json,
                         &name,
                         &plate,
                         &tolerance,
@@ -723,7 +706,9 @@ fn row_to_workspace(row: &Row) -> Result<Workspace, String> {
     }
     let name: String = column(row, "name")?;
     let events: Value = column(row, "events")?;
-    Ok(Workspace {
+    let files_value: Value = column(row, "files")?;
+    let files: BTreeMap<String, String> = serde_json::from_value(files_value).unwrap_or_default();
+    Ok(normalize_workspace_document(Workspace {
         id: column(row, "id")?,
         name: if name.trim().is_empty() {
             default_workspace_name()
@@ -731,6 +716,8 @@ fn row_to_workspace(row: &Row) -> Result<Workspace, String> {
             name
         },
         code: column(row, "code")?,
+        entry: column(row, "entry")?,
+        files,
         revision: column::<i64>(row, "revision")?.max(0) as u64,
         created_at: column::<i64>(row, "created_at")?.max(0) as u64,
         updated_at: column::<i64>(row, "updated_at")?.max(0) as u64,
@@ -741,7 +728,7 @@ fn row_to_workspace(row: &Row) -> Result<Workspace, String> {
         // A row whose event log somehow failed to round-trip must not make the
         // workspace unreadable; the log is a UI convenience, the code is not.
         events: serde_json::from_value(events).unwrap_or_default(),
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -826,6 +813,14 @@ const MIGRATIONS: &[(i32, &[&str])] = &[(
         "CREATE UNIQUE INDEX IF NOT EXISTS workspaces_share_token_idx
              ON workspaces (share_token) WHERE share_token <> ''",
     ],
+), (
+    4,
+    &[
+        // Multi-file project VFS. Empty `files` means legacy single-file; the
+        // loader normalizes that to `{entry: code}` in process.
+        "ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS entry TEXT NOT NULL DEFAULT 'main.scad'",
+        "ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS files JSONB NOT NULL DEFAULT '{}'::jsonb",
+    ],
 )];
 
 // ---------------------------------------------------------------------------
@@ -893,7 +888,7 @@ mod tests {
     fn a_workspace_round_trips_through_the_database() {
         let Some(store) = store() else { return };
         let created = store
-            .create_with_settings("cube(1);".into(), Some("Test".into()), None, None)
+            .create_with_settings("cube(1);".into(), Some("Test".into()), None, None, None, None)
             .unwrap();
         let loaded = store.get(&created.id).unwrap().expect("persisted");
         assert_eq!(loaded.code, "cube(1);");
@@ -913,7 +908,7 @@ mod tests {
     fn concurrent_updates_on_one_base_revision_produce_one_winner() {
         let Some(store) = store() else { return };
         let created = store
-            .create_with_settings("cube(1);".into(), None, None, None)
+            .create_with_settings("cube(1);".into(), None, None, None, None, None)
             .unwrap();
         let base = created.revision;
 
@@ -932,15 +927,9 @@ mod tests {
                     &id,
                     WorkspaceUpdate {
                         code: Some(code.to_string()),
-                        name: None,
-                        start: None,
-                        end: None,
-                        text: None,
                         expected_revision: Some(base),
-                        base_revision: None,
-                        plate: None,
-                        tolerance: None,
                         source: "browser".into(),
+                        ..Default::default()
                     },
                 )
             }));
@@ -974,7 +963,7 @@ mod tests {
     fn settings_writes_do_not_disturb_the_revision() {
         let Some(store) = store() else { return };
         let created = store
-            .create_with_settings("cube(1);".into(), None, None, None)
+            .create_with_settings("cube(1);".into(), None, None, None, None, None)
             .unwrap();
         let updated = store
             .update_settings(&created.id, Some("bambulab-x1c"), Some(0.35))
@@ -996,7 +985,7 @@ mod tests {
     fn a_code_save_does_not_roll_back_a_concurrent_settings_change() {
         let Some(store) = store() else { return };
         let created = store
-            .create_with_settings("cube(1);".into(), None, None, None)
+            .create_with_settings("cube(1);".into(), None, None, None, None, None)
             .unwrap();
         // Stand in for the interleaving: the caller read revision 1 with an
         // empty plate, another tab set a plate, then the caller's edit lands.
@@ -1008,15 +997,9 @@ mod tests {
                 &created.id,
                 WorkspaceUpdate {
                     code: Some("cube(2);".into()),
-                    name: None,
-                    start: None,
-                    end: None,
-                    text: None,
                     expected_revision: Some(created.revision),
-                    base_revision: None,
-                    plate: None,
-                    tolerance: None,
                     source: "browser".into(),
+                    ..Default::default()
                 },
             )
             .expect("a settings write must not consume the revision")
@@ -1035,7 +1018,7 @@ mod tests {
     fn the_event_log_stays_bounded() {
         let Some(store) = store() else { return };
         let mut workspace = store
-            .create_with_settings("cube(1);".into(), None, None, None)
+            .create_with_settings("cube(1);".into(), None, None, None, None, None)
             .unwrap();
         for index in 0..(MAX_EVENTS + 5) {
             workspace = store
@@ -1043,15 +1026,9 @@ mod tests {
                     &workspace.id,
                     WorkspaceUpdate {
                         code: Some(format!("cube({});", index + 1)),
-                        name: None,
-                        start: None,
-                        end: None,
-                        text: None,
                         expected_revision: Some(workspace.revision),
-                        base_revision: None,
-                        plate: None,
-                        tolerance: None,
                         source: "ai".into(),
+                        ..Default::default()
                     },
                 )
                 .unwrap()
