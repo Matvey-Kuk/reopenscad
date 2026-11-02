@@ -192,9 +192,10 @@ module hollow_lid() {
     }
 }
 
+// Print layout: the lid lies flipped beside the base, hinge pin through both.
 module print_layout() {
-    base();
-    translate([0,2*axis_y,total_height]) rotate([180,0,0]) lid();
+    color("#e4665f") base();
+    color("#d9dde2") translate([0,2*axis_y,total_height]) rotate([180,0,0]) lid();
 }
 
 print_layout();

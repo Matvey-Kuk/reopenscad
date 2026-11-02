@@ -22,7 +22,7 @@
 //! selection and the sampled-mesher fallback, this module re-derives the faces
 //! from the triangles:
 //!
-//! 1. weld vertices with the kernel's own [`VertexWelder`], so two triangles
+//! 1. weld vertices with the kernel's own [`VertexWelder`](crate::csg::mesh::VertexWelder), so two triangles
 //!    that meet along an edge agree on its endpoints *by index*;
 //! 2. build the half-edge twin map, which is exact integer bookkeeping;
 //! 3. grow planar regions across twin edges, seeding from the largest triangle
@@ -65,10 +65,11 @@
 //! without the face merging. That is a property of the input, not a bug here,
 //! and it is better than refusing the export.
 
-use crate::csg::mesh::{Bounds, FastMap, Plane, Vec3, VertexWelder};
+use crate::csg::mesh::{Bounds, FastMap, Plane, Vec3};
 use crate::csg::poly2d::{point_in_contour, signed_area, Point2};
 use crate::csg::solid::plane_basis;
 use crate::engine::Mesh;
+use crate::export::ExportBody;
 use std::fmt::{Arguments, Write as _};
 
 /// Relative tolerance for "this triangle lies in the region's plane".
@@ -179,20 +180,14 @@ impl Brep {
 /// zero-length `EDGE_CURVE` is a degenerate curve that CAD kernels reject
 /// outright rather than ignore.
 fn weld(mesh: &Mesh) -> (Vec<Vec3>, Vec<[u32; 3]>) {
-    let mut welder = VertexWelder::default();
-    let mut triangles = Vec::with_capacity(mesh.triangles.len());
-    for triangle in &mesh.triangles {
-        let corners = triangle.vertices.map(|point| Vec3::new(point.x, point.y, point.z));
-        if !corners.iter().all(|point| point.is_finite()) {
-            continue;
-        }
-        let indices = corners.map(|point| welder.insert(point));
-        if indices[0] == indices[1] || indices[1] == indices[2] || indices[0] == indices[2] {
-            continue;
-        }
-        triangles.push(indices);
-    }
-    (welder.vertices, triangles)
+    // The export cleanup's welder, so STEP and the cleaned bodies agree on
+    // which corners are one vertex.
+    let indexed = crate::csg::cleanup::weld_triangles(
+        mesh.triangles
+            .iter()
+            .map(|triangle| triangle.vertices.map(|point| Vec3::new(point.x, point.y, point.z))),
+    );
+    (indexed.vertices, indexed.triangles)
 }
 
 /// Half-edge `h = 3 * triangle + corner` runs from corner `corner` to the next.
@@ -706,8 +701,69 @@ fn id_list(ids: &[u32]) -> String {
 ///
 /// `title` names the product and the file, and is the only place the caller's
 /// text reaches the output.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn write(mesh: &Mesh, title: &str, budget: usize) -> Option<Vec<u8>> {
-    let mut brep = Brep::recover(mesh);
+    write_breps(vec![(String::new(), None, Brep::recover(mesh))], title, budget)
+}
+
+/// Serialise several bodies into one file, one named solid (or more, if a
+/// body is itself disconnected) per body, never merged.
+///
+/// Each body's faces are recovered from its own mesh, so two touching bodies
+/// share no vertex, edge or face — they arrive in a CAD package as separate
+/// solids that can be selected, hidden or exported on their own. A stated
+/// `color()` becomes an AP214 `STYLED_ITEM` on the body's solids. A single
+/// body is written exactly as [`write`] writes a mesh, plus its colour.
+pub fn write_bodies(bodies: &[ExportBody], title: &str, budget: usize) -> Option<Vec<u8>> {
+    // Face recovery holds several arrays per half-edge, so a file that is
+    // certainly over budget is refused before any of it is built.
+    let floor: usize = bodies.iter().map(|body| minimum_size(&body.mesh)).sum();
+    if floor > budget {
+        return None;
+    }
+    // Every body, a lone one included, keeps its own name on its solids; the
+    // product carries the document title.
+    let breps = bodies
+        .iter()
+        .map(|body| (body.name.clone(), body.color, Brep::recover(&body.mesh)))
+        .collect();
+    write_breps(breps, title, budget)
+}
+
+/// Fewest bytes any face costs in the file: `ADVANCED_FACE`, its `PLANE` and
+/// placement (a point and two directions), a bound, a loop and at least three
+/// oriented edges. Measured faces run several times this.
+const MIN_FACE_BYTES: usize = 200;
+
+/// A lower bound on the Part 21 size of `mesh`, computed in one pass.
+///
+/// Every recovered face lies in one plane, so it has one normal; triangles
+/// whose normals differ cannot share a face. Normals are bucketed on a coarse
+/// grid, and one plane's triangles — equal normals up to rounding — can
+/// straddle at most two buckets per axis, so distinct buckets divided by eight
+/// never exceeds the number of faces.
+fn minimum_size(mesh: &Mesh) -> usize {
+    const GRID: f64 = 1.0e4;
+    let mut normals: std::collections::HashSet<[i32; 3]> = std::collections::HashSet::new();
+    for triangle in &mesh.triangles {
+        let [a, b, c] = triangle.vertices;
+        let (ux, uy, uz) = (b.x - a.x, b.y - a.y, b.z - a.z);
+        let (vx, vy, vz) = (c.x - a.x, c.y - a.y, c.z - a.z);
+        let n = [uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx];
+        let length = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        if !length.is_finite() || length <= 0.0 {
+            continue;
+        }
+        normals.insert(n.map(|value| (value / length * GRID).round() as i32));
+    }
+    normals.len().div_ceil(8) * MIN_FACE_BYTES
+}
+
+fn write_breps(
+    mut breps: Vec<(String, Option<[f64; 4]>, Brep)>,
+    title: &str,
+    budget: usize,
+) -> Option<Vec<u8>> {
     let name = escape(title);
 
     let mut part = Part21::new(&name, budget);
@@ -743,19 +799,39 @@ pub fn write(mesh: &Mesh, title: &str, budget: usize) -> Option<Vec<u8>> {
         "AXIS2_PLACEMENT_3D('',#{origin},#{world_z},#{world_x})"
     );
 
-    let shape = if brep.faces.is_empty() {
+    let shape = if breps.iter().all(|(_, _, brep)| brep.faces.is_empty()) {
         // An empty `CLOSED_SHELL` is not a legal solid, so a model with no
         // geometry becomes a representation with no items rather than an
         // unreadable file.
         entity!(part, "SHAPE_REPRESENTATION('',(#{world}),#{context})")
     } else {
         let mut items = vec![world];
-        items.extend(write_solids(&mut part, &mut brep));
-        entity!(
+        let mut styled = Vec::new();
+        for (body_name, color, brep) in &mut breps {
+            if brep.faces.is_empty() {
+                continue;
+            }
+            let solids = write_solids(&mut part, brep, &escape(body_name));
+            if let Some(color) = color {
+                for solid in &solids {
+                    styled.push(write_style(&mut part, *solid, *color));
+                }
+            }
+            items.extend(solids);
+        }
+        let shape = entity!(
             part,
             "ADVANCED_BREP_SHAPE_REPRESENTATION('',{},#{context})",
             id_list(&items)
-        )
+        );
+        if !styled.is_empty() {
+            entity!(
+                part,
+                "MECHANICAL_DESIGN_GEOMETRIC_PRESENTATION_REPRESENTATION('',{},#{context})",
+                id_list(&styled)
+            );
+        }
+        shape
     };
 
     // --- product structure -------------------------------------------------
@@ -794,8 +870,24 @@ pub fn write(mesh: &Mesh, title: &str, budget: usize) -> Option<Vec<u8>> {
     part.finish()
 }
 
+/// The AP214 presentation chain that colours one solid's surfaces, as most
+/// CAD kernels write it. Returns the `STYLED_ITEM`.
+fn write_style(part: &mut Part21, solid: u32, color: [f64; 4]) -> u32 {
+    let [r, g, b, _] = color.map(|channel| channel.clamp(0.0, 1.0));
+    let rgb = entity!(part, "COLOUR_RGB('',{},{},{})", real(r), real(g), real(b));
+    let fill_colour = entity!(part, "FILL_AREA_STYLE_COLOUR('',#{rgb})");
+    let fill = entity!(part, "FILL_AREA_STYLE('',(#{fill_colour}))");
+    let surface_fill = entity!(part, "SURFACE_STYLE_FILL_AREA(#{fill})");
+    let side = entity!(part, "SURFACE_SIDE_STYLE('',(#{surface_fill}))");
+    let usage = entity!(part, "SURFACE_STYLE_USAGE(.BOTH.,#{side})");
+    let assignment = entity!(part, "PRESENTATION_STYLE_ASSIGNMENT((#{usage}))");
+    entity!(part, "STYLED_ITEM('color',(#{assignment}),#{solid})")
+}
+
 /// Emits the geometry and topology, returning one solid id per body.
-fn write_solids(part: &mut Part21, brep: &mut Brep) -> Vec<u32> {
+///
+/// `name` is the Part 21-escaped name every emitted solid carries.
+fn write_solids(part: &mut Part21, brep: &mut Brep, name: &str) -> Vec<u32> {
     // The bodies are worked out first, because deciding them can *change* a
     // face: an inside-out shell that belongs to no body has to be turned the
     // right way round before its `ADVANCED_FACE`s are written, not after.
@@ -946,7 +1038,7 @@ fn write_solids(part: &mut Part21, brep: &mut Brep) -> Vec<u32> {
         ));
     }
 
-    write_shells(part, &plan, &faces)
+    write_shells(part, &plan, &faces, name)
 }
 
 /// How the faces divide into bodies, and which bodies own which cavities.
@@ -1086,7 +1178,7 @@ fn plan_shells(brep: &mut Brep, face_edges: &[Vec<u32>]) -> ShellPlan {
 
 /// Emits one `CLOSED_SHELL` per body and one solid per body that is not itself
 /// a cavity.
-fn write_shells(part: &mut Part21, plan: &ShellPlan, faces: &[u32]) -> Vec<u32> {
+fn write_shells(part: &mut Part21, plan: &ShellPlan, faces: &[u32], name: &str) -> Vec<u32> {
     // Bucket the faces in one pass rather than rescanning them per component:
     // a model built from a grid of small parts has hundreds of bodies, and the
     // obvious nested loop is quadratic in that.
@@ -1105,7 +1197,7 @@ fn write_shells(part: &mut Part21, plan: &ShellPlan, faces: &[u32]) -> Vec<u32> 
             continue;
         }
         if plan.voids[component].is_empty() {
-            solids.push(entity!(part, "MANIFOLD_SOLID_BREP('',#{shell})"));
+            solids.push(entity!(part, "MANIFOLD_SOLID_BREP('{name}',#{shell})"));
             continue;
         }
         // The cavity's faces already point into the void, which is the sense
@@ -1120,7 +1212,7 @@ fn write_shells(part: &mut Part21, plan: &ShellPlan, faces: &[u32]) -> Vec<u32> 
             .collect();
         solids.push(entity!(
             part,
-            "BREP_WITH_VOIDS('',#{shell},{})",
+            "BREP_WITH_VOIDS('{name}',#{shell},{})",
             id_list(&oriented)
         ));
     }

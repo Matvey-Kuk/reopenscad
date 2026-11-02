@@ -444,8 +444,9 @@ own virtual file system / project storage.
 
 ## 18. Customizer parameter annotations
 
-Structured comments turn top-level assignments into UI controls (needed for
-feature parity with the desktop Customizer panel):
+Structured comments describe top-level assignments, using the notation of
+OpenSCAD's Customizer panel. This app has no such panel: `get_parameters` returns
+each parameter's trailing comment as a hint, and `set_parameters` changes values:
 
 ```scad
 /* [Section name] */          // groups following parameters into a tab
@@ -463,8 +464,8 @@ part  = 2;        // [1:Small, 2:Medium, 3:Large]  → labeled dropdown
 ```
 
 Only top-level assignments *before* the first module/function definition or
-geometry statement participate. Values set by the customizer override the
-source defaults at evaluation time.
+geometry statement participate. `set_parameters` rewrites the value in the
+source as a new revision.
 
 ## 19. Deprecated / legacy constructs (accept + warn)
 
@@ -559,5 +560,5 @@ Minimum bar for "exact feature parity" with desktop OpenSCAD 2021.01:
 6. `include`/`use` against the project's virtual file system.
 7. Console with ECHO/WARNING/ERROR streams; `assert` aborts.
 8. Modifier characters affecting both preview display and geometry per §15.
-9. Customizer annotations (§18) driving the variable-controls UI.
+9. Customizer annotations (§18) accepted as comments and reported by `get_parameters`.
 10. Deprecated forms of §19 accepted with warnings.

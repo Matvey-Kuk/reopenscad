@@ -30,12 +30,13 @@ module mounting_hole(x) {
                  r1=screw_diameter/2,r2=screw_head_diameter/2+cut_extra);
 }
 
-union() {
+color("#55a9e8") union() {
     difference() {
         linear_extrude(plate_thickness) plate_outline();
         for (side=[-1,1]) mounting_hole(side*(length/2-screw_margin));
     }
-    translate([0,0,plate_thickness-cut_extra])
+    // Raised lettering in a second colour, still one printed part.
+    color("#d9dde2") translate([0,0,plate_thickness-cut_extra])
         linear_extrude(letter_height+cut_extra)
             text(label,size=letter_size,font=font_name,halign="center",valign="center");
 }

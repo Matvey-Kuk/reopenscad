@@ -1,15 +1,15 @@
 //! The kick-start models ship with the app, so the engine owes them.
 //!
-//! These are the twelve `.scad` sources behind the cards on an empty
-//! workspace. A user's first click lands on one of them, which makes a
+//! These are the `.scad` sources behind the example cards on the landing
+//! page. A user's first click lands on one of them, which makes a
 //! regression here worse than a regression in the golden corpora: the corpora
 //! are measurements, these are the product.
 //!
 //! What is asserted is what a person would notice — it compiles, it is
 //! watertight, it is not empty, and it is quick enough that the first click
 //! does not look broken. Facet-level agreement with OpenSCAD is deliberately
-//! not asserted; a quarter of these use `text()`, which draws with this engine's
-//! own font and never matches. `tests/oracle.sh` renders the same sources with
+//! not asserted; some of these use `text()`, whose outlines depend on the font
+//! and never match facet for facet. `tests/oracle.sh` renders the same sources with
 //! the OpenSCAD binary when a second opinion is wanted.
 
 mod support;
@@ -83,19 +83,29 @@ fn unpaired_edges(mesh: &engine::Mesh) -> usize {
     edges.values().filter(|balance| **balance != 0).count()
 }
 
+/// The slugs `manifest.json` lists, in catalogue order.
+fn catalogue_slugs() -> Vec<String> {
+    let text = fs::read_to_string(examples_root().join("manifest.json"))
+        .expect("the catalogue should exist");
+    let manifest: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+    manifest["categories"]
+        .as_array()
+        .expect("categories")
+        .iter()
+        .flat_map(|category| category["examples"].as_array().expect("examples").iter())
+        .map(|example| example["slug"].as_str().expect("slug").to_string())
+        .collect()
+}
+
 #[test]
-fn the_examples_directory_is_the_twelve_the_catalogue_promises() {
+fn the_examples_directory_is_exactly_what_the_catalogue_promises() {
     let found = sources();
-    assert_eq!(
-        found.len(),
-        12,
-        "found {} sources: {:?}",
-        found.len(),
-        found.iter().map(|(name, _)| name).collect::<Vec<_>>()
-    );
+    let mut listed = catalogue_slugs();
+    listed.sort();
+    let present: Vec<String> = found.iter().map(|(name, _)| name.clone()).collect();
+    assert_eq!(present, listed, "the .scad files and manifest.json disagree");
     // Every one has the preview its card shows. `web/tests/examples.test.mjs`
-    // checks the manifest agrees with both; this is the half that survives
-    // without Node.
+    // checks the same agreement from the app's side.
     for (name, _) in &found {
         let preview = examples_root().join(format!("{name}.png"));
         assert!(preview.is_file(), "{name} has no preview render next to it");

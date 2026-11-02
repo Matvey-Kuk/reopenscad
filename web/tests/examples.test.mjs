@@ -94,24 +94,45 @@ test('every model is parametric and says what it is', async () => {
       parameters.length >= 4,
       `${example.slug} has ${parameters.length} documented parameters`,
     );
-    // Features the engine does not implement, which would make a card open a
-    // model that cannot render.
-    for (const unsupported of ['polyhedron', 'import', 'surface', 'projection', 'multmatrix']) {
+    // Constructs the catalogue keeps out; see examples/README.md.
+    for (const unsupported of ['polyhedron', 'import', 'surface', 'projection', 'multmatrix', 'resize']) {
       assert.doesNotMatch(
         source,
         new RegExp(`\\b${unsupported}\\s*\\(`),
-        `${example.slug} calls ${unsupported}(), which this engine cannot render`,
+        `${example.slug} calls ${unsupported}(), which the catalogue does not allow`,
       );
     }
   }
 });
 
-test('the catalogue covers the categories the empty workspace advertises', () => {
+test('the catalogue covers the categories the landing page advertises, in order', () => {
   const ids = manifest.categories.map((category) => category.id);
-  assert.deepEqual(ids, ['mounts', 'threads', 'hinges', 'text']);
+  // Gridfinity leads: it is the most-searched printable system, so it is the
+  // first row a visitor sees.
+  assert.deepEqual(ids, [
+    'gridfinity',
+    'skadis',
+    'modular-walls',
+    'threads',
+    'din-rail',
+    'maker-hardware',
+    'hinges',
+    'text',
+  ]);
   for (const category of manifest.categories) {
     assert.ok(category.name?.length > 2, `${category.id} has no name`);
     assert.ok(category.blurb?.length > 10, `${category.id} has no blurb`);
-    assert.equal(category.examples.length, 3, `${category.id} should offer three models`);
+    assert.ok(
+      category.examples.length >= 3 && category.examples.length <= 5,
+      `${category.id} offers ${category.examples.length} models`,
+    );
+  }
+});
+
+test('every hint reads as calls joined by a middle dot', () => {
+  for (const example of examples) {
+    for (const part of example.hint.split(' · ')) {
+      assert.match(part, /^[a-z_][a-z0-9_]*\([^()]*\)$/, `${example.slug}: hint part "${part}"`);
+    }
   }
 });

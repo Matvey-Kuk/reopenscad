@@ -1,19 +1,18 @@
-//! The language features this engine does not implement yet, held to OpenSCAD.
+//! The language features the coverage audit found missing, held to OpenSCAD.
 //!
 //! Every case here is a `.scad` source that the OpenSCAD binary renders to a
 //! closed solid, checked in beside the binary STL it produced. They were chosen
-//! from `tests/LANGUAGE_COVERAGE.md` — the audit of what this engine is missing
-//! — so the corpus is a *specification of the gap*, not a record of what
-//! already works. When this file is green the gap is closed.
+//! from `tests/LANGUAGE_COVERAGE.md` — the audit of what this engine was missing
+//! — so the corpus specifies that gap and keeps it closed.
 //!
-//! Two groups, and they fail for different reasons:
+//! Two groups, which failed for different reasons:
 //!
 //! * **Modules** — `hull()` over anything but boxes, `polyhedron`, `resize`,
-//!   `multmatrix`, `projection`, `render`. These are hard errors today: the
-//!   compile aborts and nothing is produced.
+//!   `multmatrix`, `projection`, `render`. These were hard errors: the
+//!   compile aborted and nothing was produced.
 //! * **Semantics** — `-2^2`, `str()` precision, vector comparison and addition,
-//!   `each` over a string. These are worse, because they *succeed* and return a
-//!   different number. Each one is written so the wrong answer changes the
+//!   `each` over a string. These were worse, because they *succeeded* and returned
+//!   a different number. Each one is written so the wrong answer changes the
 //!   geometry, which is the only way an STL comparison can see it.
 //!
 //! What is compared is what survives a different triangulation — volume,

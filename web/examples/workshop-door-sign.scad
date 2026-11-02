@@ -30,18 +30,22 @@ module raised_words(words,size,y) {
             text(words,size=size,font=font_name,halign="center",valign="center");
 }
 
-union() {
+color("#e4665f") union() {
     difference() {
         linear_extrude(backing) sign_outline();
         for (side=[-1,1])
             translate([side*(length/2-hanger_margin),height/2-hanger_margin,-cut_extra])
                 cylinder(h=backing+2*cut_extra,d=hanger_diameter);
     }
-    translate([0,0,backing-cut_extra])
-        linear_extrude(relief+cut_extra) difference() {
-            sign_outline();
-            offset(delta=-border_width) sign_outline();
-        }
-    raised_words(title,title_size,line_spacing/2);
-    raised_words(subtitle,subtitle_size,-line_spacing/2);
+    // Raised border and lettering in a second colour: a filament swap or a
+    // second material, still one printed part.
+    color("#d9dde2") {
+        translate([0,0,backing-cut_extra])
+            linear_extrude(relief+cut_extra) difference() {
+                sign_outline();
+                offset(delta=-border_width) sign_outline();
+            }
+        raised_words(title,title_size,line_spacing/2);
+        raised_words(subtitle,subtitle_size,-line_spacing/2);
+    }
 }

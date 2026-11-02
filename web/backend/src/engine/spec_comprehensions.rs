@@ -20,7 +20,7 @@ fn assert_value(expression: &str, expected: Value) {
 }
 
 fn numbers(values: &[f64]) -> Value {
-    Value::Vector(values.iter().copied().map(Value::Number).collect())
+    Value::vector(values.iter().copied().map(Value::Number).collect())
 }
 
 #[test]
@@ -39,7 +39,7 @@ fn comprehensions_generate_mix_and_nest_values() {
     );
     assert_value(
         "[for (i = [0:2]) for (j = [0:1]) [i, j]]",
-        Value::Vector(vec![
+        Value::vector(vec![
             numbers(&[0.0, 0.0]),
             numbers(&[0.0, 1.0]),
             numbers(&[1.0, 0.0]),
@@ -50,7 +50,7 @@ fn comprehensions_generate_mix_and_nest_values() {
     );
     assert_value(
         "[for (i = [0:2]) [i, i * i]]",
-        Value::Vector(vec![
+        Value::vector(vec![
             numbers(&[0.0, 0.0]),
             numbers(&[1.0, 1.0]),
             numbers(&[2.0, 4.0]),
@@ -74,7 +74,7 @@ fn comprehension_if_else_and_let_are_scoped_and_composable() {
     );
     assert_value("[let (a = 2) if (a > 1) a else 0]", numbers(&[2.0]));
     assert_value("let (v = [for (i = [0:1]) i]) i", Value::Undefined);
-    assert_value("[for (i = []) i]", Value::Vector(Vec::new()));
+    assert_value("[for (i = []) i]", Value::vector(Vec::new()));
 }
 
 #[test]
@@ -87,10 +87,10 @@ fn each_splices_one_level_and_preserves_non_lists() {
         "[for (i = [1:3]) each [i, -i]]",
         numbers(&[1.0, -1.0, 2.0, -2.0, 3.0, -3.0]),
     );
-    assert_value("[each undef]", Value::Vector(vec![Value::Undefined]));
+    assert_value("[each undef]", Value::vector(vec![Value::Undefined]));
     assert_value(
         "[each [[1, 2], [3, 4]]]",
-        Value::Vector(vec![numbers(&[1.0, 2.0]), numbers(&[3.0, 4.0])]),
+        Value::vector(vec![numbers(&[1.0, 2.0]), numbers(&[3.0, 4.0])]),
     );
 }
 
@@ -102,7 +102,7 @@ fn c_style_generators_initialize_test_update_and_stop() {
     );
     assert_value(
         "[for (i = 0, j = 10; i < 3; i = i + 1, j = j + 2) [i, j]]",
-        Value::Vector(vec![
+        Value::vector(vec![
             numbers(&[0.0, 10.0]),
             numbers(&[1.0, 12.0]),
             numbers(&[2.0, 14.0]),
@@ -112,7 +112,7 @@ fn c_style_generators_initialize_test_update_and_stop() {
         .expect_err("an unbounded C-style generator must hit its safety budget");
     assert!(error.to_string().contains("step limit"));
 
-    let nested = eval("[for (i = [0:100]) [for (j = [0:999]) j]]")
+    let nested = eval("[for (i = [0:1000]) [for (j = [0:999]) j]]")
         .expect_err("nested comprehensions must share an aggregate output budget");
     assert!(nested.to_string().contains("step limit"));
 }

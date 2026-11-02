@@ -367,7 +367,6 @@ fn an_unknown_module_warns_and_leaves_the_rest_of_the_model_standing() {
     let (shape, diagnostics) = evaluate_source_with_diagnostics(
         r#"
             notamodule(1, 2);
-            import("nowhere.stl");
             surface(file = "nowhere.dat") { echo("never evaluated"); }
             cube([12, 8, 4]);
         "#,
@@ -377,7 +376,6 @@ fn an_unknown_module_warns_and_leaves_the_rest_of_the_model_standing() {
     assert_inside(&shape, Vec3::new(6.0, 4.0, 2.0));
     for expected in [
         "WARNING: Ignoring unknown module 'notamodule'.",
-        "WARNING: Ignoring unknown module 'import'.",
         "WARNING: Ignoring unknown module 'surface'.",
     ] {
         assert!(

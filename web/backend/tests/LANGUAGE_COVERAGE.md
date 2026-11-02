@@ -1,7 +1,7 @@
 # OpenSCAD language coverage audit
 
-**Audited tree:** `/Users/matvey/Desktop/reopenscad/web/backend/src/` (Rust engine)
-**Reference tree:** `/Users/matvey/Desktop/reopenscad/openscad/` — written `$OSCAD` in citations below (C++, commit `2fddda3`, `OpenSCAD version 2026.06.12` — the binary on `PATH` is the same version)
+**Audited tree:** `web/backend/src/` (Rust engine)
+**Reference tree:** `openscad/` (a separate upstream clone, not in this repository) — written `$OSCAD` in citations below (C++, commit `2fddda3`, `OpenSCAD version 2026.06.12` — the binary on `PATH` is the same version)
 **Method:** static reading of both trees, plus ~145 differential probes compiled through *both* engines. Every "ran this and got X" below is reproducible; probe sources are throwaway and not checked in.
 
 ---
@@ -23,10 +23,10 @@ Reference registrations are in `$OSCAD/src/core/*.cc` via `Builtins::init("name"
 | `square(size, center)` | implemented | `engine.rs:3547`. Ref `primitives.cc:514`. Probe `square([4,2],center=true)` → both bbox `[-2,-1,0, 2,1,1]`, 12 tris. |
 | `circle(r\|d)` | implemented | `engine.rs:3621`; `$fn/$fa/$fs` via `fragment_count` (`engine.rs:5598`). Probe `circle(d=10,$fn=8)` → both 28 tris, bbox `[-5,-5,0, 5,5,1]`. |
 | `polygon(points, paths, convexity)` | implemented | `engine.rs:3576`. `convexity` accepted and ignored (`engine.rs:3595-3598`) — harmless, it is preview-only in ref too. Probe with 2 paths → both 32 tris. |
-| `text(...)` | **partial** | See §6. Own single-stroke font; `font`/`direction`/`language`/`script` ignored, `em` missing. |
-| `import(file, ...)` | **missing** | Ref `ImportNode.cc:301`, params `{file, layer, convexity, origin, scale}` + `{width, height, filename, layername, center, dpi, id}` (`ImportNode.cc:68-70`). Ours: hard error. Probe `import("x.stl")` → ref warns "Can't open import file", ours `Unsupported module import()`. |
+| `text(...)` | **partial** | See §6. Bundled outline fonts (Liberation Sans/Serif/Mono, Dancing Script, Great Vibes) plus a single-stroke face; `font` (positional or named), `em` and all four `direction`s honoured; no shaper, so `script` other than Latin warns. |
+| `import(file, ...)` | **partial — STL via workspace assets** | Ref `ImportNode.cc:301`, params `{file, layer, convexity, origin, scale}` + `{width, height, filename, layername, center, dpi, id}` (`ImportNode.cc:68-70`), all accepted. Ours: `Evaluator::import_asset` resolves `file` (exact name or with a leading `./`; deprecated `filename=` warns) against the design's uploaded mesh assets (`assets::lookup`), never the filesystem, and yields `Shape::Mesh` — the shared `Arc<TriMesh>`, handed to the kernel without a copy through SCAD values (`exact::mesh_to_solid`). `center=true` centres the bounding box on the origin; `convexity` and the 2D-format parameters are ignored, as they are for STL in ref. A missing asset warns `Can't open import file 'x'.` like ref and contributes nothing; any non-`.stl` extension (OFF/3MF/AMF/OBJ/DXF/SVG) warns `Unsupported file format while trying to import file 'x'; only STL workspace assets can be imported.`. Objects are named after the file stem (`import("scan.stl")` → `scan 1`). Engine memo and persistent render keys include `assets::current_digest()`. Tests: `engine/spec_import.rs`. |
 | `projection(cut, convexity)` | **missing (kernel exists)** | Ref `ProjectionNode.cc:64`. Ours: hard error. **But** `csg::planar::projection_cut` (`csg/planar.rs:126`) and `projection_shadow` (`csg/planar.rs:152`) are implemented and unit-tested (`csg/planar.rs:231`) with no callers. |
-| `offset(r, delta, chamfer)` | **partial** | `engine.rs:3952`. `r` (rounded) and `delta` (mitred) both honoured; `chamfer=true` is silently downgraded to mitred with `WARNING: offset(chamfer = true) is mitred here` (`engine.rs:3982-3986`). Probe `offset(r=-1) square(10)` → both bbox `[1,1,0, 9,9,1]`, 12 tris. |
+| `offset(r, delta, chamfer)` | **partial** | `engine.rs:3952`. `r` (rounded) and `delta` (mitred) both honoured; `chamfer=true` is silently downgraded to mitred with `WARNING: offset(chamfer = true) is mitred here` (`engine.rs:3982-3986`). Probe `offset(r=-1) square(10)` → both bbox `[1,1,0, 9,9,1]`, 12 tris. Raw per-contour offsets are resolved to the positive-winding region (`poly2d::resolve_nonzero`), so grown neighbours merge and self-crossing script outlines stay manifold; negative offsets grow the complement. |
 
 ### 3D primitives
 
@@ -51,7 +51,7 @@ Reference registrations are in `$OSCAD/src/core/*.cc` via `Builtins::init("name"
 | `resize(newsize, auto, convexity)` | **missing (kernel exists)** | Ref `CgalAdvNode.cc:152`, params `:80`. Ours: hard error. `csg::primitives::resize` (`csg/primitives.rs:582`) implements it, uncalled. |
 | `mirror(v)` | implemented | `engine.rs:3932`. Probe `mirror([1,1]) translate([1,1,0]) cube(1)` → both bbox `[-2,-2,0, -1,-1,1]`. |
 | `multmatrix(m)` | **missing** | Ref `TransformNode.cc:308`, accepts 4×4 / 4×3 / 3×3 (`:233-260`). Ours: hard error. The internal `Transform` type already carries a general 4×4 (`engine.rs`, `Transform::point`), so this is a small arm, not new geometry. |
-| `color(c, alpha)` | implemented | `engine.rs:4188`. Named colours, `#rrggbb`, and vectors all accepted (`parse_color_value`). Bad values warn and pass children through, matching ref's non-geometric treatment. |
+| `color(c, alpha)` | implemented | Named colours, `#rrggbb`, and vectors all accepted (`parse_color_value`). Bad values warn and pass children through, matching ref's non-geometric treatment. Honoured at any depth: the exact kernel paints each face (`csg::Polygon::color`, `exact::shape_to_solid`) and a multi-colour object is meshed per colour (`FaceColors`); see `engine/spec_colors.rs`. |
 | `hull()` | **partial — severely** | See §5. |
 | `minkowski(convexity)` | implemented (exact kernel) | `engine.rs:3738` → `csg::primitives::minkowski` (`csg/primitives.rs:539`). Probe `minkowski(){cube(10,center=true); sphere(2,$fn=8);}` → **92 triangles and bbox `[-6.8478,…,6.8478]` in both engines**. 2D minkowski is **not** supported: probe `minkowski(){square(10); circle(2);}` → ours `ERROR: This shape cannot be used where 2D geometry is expected` (`engine/exact.rs:534`); ref gives 36 tris. Ref routes 2D minkowski to `applyMinkowski2D` (`GeometryEvaluator.cc:421`). |
 
@@ -281,25 +281,27 @@ text(text = "", size = 10, font = "", direction = "ltr", language = "en",
      em = 13.9 [, $fn])
 ```
 
-with positional order `{text, size, font}` and named-only `{direction, language, script, halign, valign, spacing, em}` (`TextNode.cc:46-48`). Ours is `engine.rs:4085-4133`, drawing with the built-in single-stroke font in `engine/font.rs`.
+with positional order `{text, size, font}` and named-only `{direction, language, script, halign, valign, spacing, em}` (`TextNode.cc:46-48`). Ours is the `"text"` arm in `engine.rs` (~4745-4880) plus `outline_text` (`engine.rs:5248`), setting glyph outlines from the TrueType faces bundled in `engine/typeface.rs` (files and licences in `engine/fonts/`); the older single-stroke face in `engine/font.rs` remains selectable as `font = "ReOpenSCAD Stroke"`.
+
+*Updated 2026-10-03: the table below reflects the outline-font implementation; the original audit's stroke-only findings (font ignored, `em` silent, ASCII-only coverage) are fixed.*
 
 | Parameter | Reference | Ours | Status |
 |---|---|---|---|
 | `text` | positional 0, string | positional 0, **stringifies non-strings** (`engine.rs:4091-4095`) | implemented (superset — ref would need `str()`) |
 | `size` | positional 1, default 10 | positional 1, default 10 (`engine.rs:4100`) | **honoured** — probe `size=8` vs default changes the mesh |
-| `font` | positional 2, FreeType face + style | **named-only**, accepted then warned (`engine.rs:4117-4129`) | **ignored.** Worse: given *positionally* (`text("Ag", 8, "Liberation Sans")`) it is **silently dropped with no warning** — the probe produced byte-identical geometry to `text("Ag", size=8)` and emitted nothing. |
-| `halign` | `left` / `center` / `right` | `engine.rs:4504-4508` | **honoured.** Probe bboxes: left `[-0.19 … 11.83]`, center `[-6.29 … 5.73]`, right `[-12.39 … -0.38]`. Unknown values fall back to `left` silently. |
-| `valign` | `baseline` / `top` / `center` / `bottom`, driven by the *font's* ascent/descent | `engine.rs:4509-4514`, driven by `font::CAP_HEIGHT = 0.70` and `font::DESCENDER = -0.20` | **honoured but numerically different** — the offsets come from this font's metrics, so a `valign="top"` label sits at a different y than OpenSCAD's. Unavoidable given a different face. |
+| `font` | positional 2, FreeType face + style | positional 2 or named; fontconfig syntax (`"Family:style=Bold"`) resolved by `typeface::resolve` | **honoured over a fixed set.** Bundled: Liberation Sans (Regular/Bold/Italic), Liberation Serif, Liberation Mono, Dancing Script, Great Vibes. Arial/Helvetica/Times/Courier map to the metric-compatible Liberation face with a warning; an unknown family falls back to Liberation Sans with a warning listing the available fonts; a missing style picks the nearest with a warning. |
+| `halign` | `left` / `center` / `right` | `outline_text` | **honoured.** Unknown values fall back to `left` **with a warning**. |
+| `valign` | `baseline` / `top` / `center` / `bottom` | `outline_text`, from the set string's ink bounds | **honoured.** Unknown values fall back to `baseline` with a warning. |
 | `spacing` | advance multiplier | `engine.rs:4105-4113` | **honoured** — probe `spacing=2` widens 11.83 → 18.23. |
-| `direction` (`ltr`/`rtl`/`ttb`/`btt`) | HarfBuzz shaping direction | accepted, **warned, ignored** (`engine.rs:4117-4129`) | **ignored.** RTL and vertical text render left-to-right. |
-| `language` | HarfBuzz language tag | accepted, **warned, ignored** | **ignored** |
-| `script` | HarfBuzz script tag | accepted, **warned, ignored** | **ignored** |
-| `em` | default 13.9, the em size that yields `size=10` (`TextNode.cc:74-75`) | **absent** | **missing and silent** — probe `text("Ag", em=13.9)` produced geometry byte-identical to `text("Ag")` with no diagnostic at all. |
-| `$fn` | tessellates the glyph outlines | `fragment_count(size * 0.35, …)` (`engine.rs:4131`), and the pen nib is clamped to 8–16 sides (`engine.rs:4533`) | **honoured** — probe `$fn=6` → 252 tris, `$fn=64` → 1876 tris. |
+| `direction` (`ltr`/`rtl`/`ttb`/`btt`) | HarfBuzz shaping direction | glyph order reversed for `rtl`/`btt`, stacked vertically for `ttb`/`btt`; unknown values warn | **honoured** for the outline faces (no bidi shaping). The stroke face only reverses `rtl` and warns on vertical. |
+| `language` | HarfBuzz language tag | accepted, ignored | **ignored** (no shaper; harmless for Latin) |
+| `script` | HarfBuzz script tag | accepted; anything other than `latin`/`latn` warns that glyphs are placed one by one | **partial** — per-glyph placement with pair kerning, no complex shaping |
+| `em` | default 13.9, the em size that yields `size=10` (`TextNode.cc:74-75`) | named; overrides the default em of `size / 0.72` | **honoured** by the outline faces; the stroke face warns and uses `size`. |
+| `$fn` | tessellates the glyph outlines | `fragment_count(size, …)` flattens the outline curves; the stroke face uses `size * 0.35` for its pen nib | **honoured** |
 | `$fa` / `$fs` | used when `$fn` is 0 | used, via `fragment_count` | implemented |
-| Glyph coverage | any installed face, full Unicode | **printable ASCII only** (`engine/font.rs:108`); missing characters are dropped with `WARNING: text() has no glyph for …` (`engine.rs:4491-4499`) | **partial** — accented Latin, Greek, Cyrillic, CJK and most punctuation beyond ASCII simply vanish from the part. |
+| Glyph coverage | any installed face, full Unicode | whatever the bundled face covers (the Liberation files are unmodified upstream releases: Latin, Greek, Cyrillic; Great Vibes is subset to Latin-1); a character the chosen face lacks is taken from Liberation Sans with a warning, and one no bundled face has is dropped with `WARNING: text() has no glyph for …` | **partial** — no CJK, Arabic, Hebrew or other scripts outside the bundled faces. |
 
-The letterforms themselves will never match OpenSCAD (the file says so at `engine/font.rs:12-20`, and that is the right call for a service with no font files). The actionable items are the three *silent* ones: positional `font` dropped without a warning, `em` accepted-and-ignored without a warning, and unknown `halign`/`valign` values falling back without a warning.
+With no `font`, or `font = "Liberation Sans"`, the face is OpenSCAD's own default, so letterforms match in shape; an installed font other than the bundled set cannot be used. The three *silent* items the original audit flagged — positional `font`, `em`, unknown `halign`/`valign` — are all fixed.
 
 ---
 
@@ -335,8 +337,8 @@ Priority is by how often an arbitrary real-world `.scad` file would hit the gap,
 
 14. **`linear_extrude(v=…)` and `segments=`; `rotate_extrude(start=…)`.** Newer parameters (`LinearExtrudeNode.cc:48-50`, `RotateExtrudeNode.cc:51`) that are currently accepted-and-ignored — again silent wrong geometry rather than a diagnostic. At minimum, warn.
 
-15. **`text()`: warn on positional `font`, on `em`, and on unrecognised `halign`/`valign`.** §6. Cheap honesty; the letterforms can never match anyway, but silence about a dropped `font` argument is avoidable.
+15. ~~**`text()`: warn on positional `font`, on `em`, and on unrecognised `halign`/`valign`.**~~ Done (2026-10-03): positional `font` and `em` are honoured, unknown alignments warn. §6.
 
-16. **`parent_module()`, `fill()`, 2D `minkowski()`, `import()`, `surface()`, `roof()`, `dxf_dim`/`dxf_cross`.** Long tail. `fill()` and 2D `minkowski()` are real 2D gaps (`GeometryEvaluator.cc:271`, `:421`); `import`/`surface`/`dxf_*` need a file source this service deliberately does not have and should degrade to warnings rather than be implemented; `roof` is disabled by default in the reference binary too.
+16. **`parent_module()`, `fill()`, 2D `minkowski()`, `import()`, `surface()`, `roof()`, `dxf_dim`/`dxf_cross`.** Long tail. `fill()` and 2D `minkowski()` are real 2D gaps (`GeometryEvaluator.cc:271`, `:421`); `import()` now reads STL workspace assets (see the table above); `surface`/`dxf_*` need a file source this service deliberately does not have and degrade to warnings; `roof` is disabled by default in the reference binary too.
 
 Not worth doing: `assign()` (removed upstream), `textmetrics`/`fontmetrics`/`is_object`/`object`/`has_key` (experimental and off by default in the reference binary), `$fe` (same), matching `rands()`'s PRNG stream (would require copying the reference implementation — document the difference instead).

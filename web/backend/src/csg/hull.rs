@@ -107,10 +107,14 @@ fn convex_hull_inner(points: &[Vec3]) -> Vec<Polygon> {
         None => return Vec::new(),
     };
 
+    let mut polls = 0usize;
     for index in 0..points.len() {
         if seed.contains(&index) {
             continue;
         }
+        // Each insertion scans every face, so a hull of a scan's tens of
+        // thousands of points runs long; honour the request's deadline.
+        super::bsp::poll_interrupt(&mut polls, 64);
         insert_point(&points, &mut faces, index, above_tolerance);
     }
 

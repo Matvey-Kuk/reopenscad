@@ -104,8 +104,9 @@ impl Solid {
             if vertices.len() < 3 {
                 continue;
             }
-            if let Some(polygon) = Polygon::new(vertices) {
-                polygons.push(polygon);
+            if let Some(mut transformed) = Polygon::new(vertices) {
+                transformed.color = polygon.color;
+                polygons.push(transformed);
             }
         }
         Self { polygons }
@@ -290,7 +291,7 @@ impl Solid {
     /// [`Self::sealed`]; a merge that skips the repair can leave a seam open,
     /// and that is not a difference an exporter or a later boolean forgives.
     pub fn simplified(&self) -> Self {
-        self.merge_faces(false)
+        self.merge_faces(false, false)
     }
 
     /// [`Self::simplified`] plus the cross-plane T-junction repair.
@@ -301,24 +302,39 @@ impl Solid {
     /// booleans no longer merge at all, so it is the only place a solid is
     /// merged.
     pub fn sealed(&self) -> Self {
-        self.merge_faces(true)
+        self.merge_faces(true, false)
     }
 
-    fn merge_faces(&self, seal: bool) -> Self {
-        prof::scope("merge:total", || self.merge_faces_inner(seal))
+    /// [`Self::sealed`], except that faces of different [`Polygon::color`]s
+    /// are never merged into one: a red and a blue wall in one plane stay two
+    /// faces, so every output polygon keeps the one colour it was painted.
+    /// The cross-plane T-junction repair still runs over every face at once,
+    /// so the colour seams are as closed as any other edge.
+    pub fn sealed_by_color(&self) -> Self {
+        self.merge_faces(true, true)
     }
 
-    fn merge_faces_inner(&self, seal: bool) -> Self {
+    fn merge_faces(&self, seal: bool, by_color: bool) -> Self {
+        prof::scope("merge:total", || self.merge_faces_inner(seal, by_color))
+    }
+
+    fn merge_faces_inner(&self, seal: bool, by_color: bool) -> Self {
         if self.polygons.is_empty() {
             return Self::default();
         }
         let mut welder = VertexWelder::default();
         let mut planes: PlaneIndex = PlaneIndex::default();
-        // Indexed by plane group id. `PlaneIndex` hands out ids densely from
-        // zero, so this is a `BTreeMap<usize, _>` without the per-entry node:
-        // iterating it visits the groups in the same ascending order.
-        let mut groups: Vec<Vec<Vec<u32>>> = Vec::new();
+        // One slot per (plane group, colour). Without `by_color` the colour is
+        // always `None`, so the slots are exactly the plane groups, in the same
+        // first-seen order `PlaneIndex` hands their ids out in.
+        let mut slots: FastMap<(usize, Option<[u8; 4]>), usize> = FastMap::default();
+        let mut groups: Vec<(usize, Option<[u8; 4]>, Vec<Vec<u32>>)> = Vec::new();
+        // Every stage of this pass is polled for the request's deadline and
+        // cancellation: on a mesh of hundreds of thousands of faces it runs
+        // for seconds after the last boolean has finished.
+        let mut polls = 0usize;
         for polygon in &self.polygons {
+            bsp::poll_interrupt(&mut polls, 4096);
             let mut ring: Vec<u32> = prof::scope("merge:weld", || {
                 polygon
                     .vertices
@@ -331,23 +347,34 @@ impl Solid {
                 continue;
             }
             let group = prof::scope("merge:plane_index", || planes.insert(polygon.plane));
-            if group >= groups.len() {
-                groups.resize_with(group + 1, Vec::new);
-            }
-            groups[group].push(ring);
+            let color = if by_color { polygon.color } else { None };
+            let slot = *slots.entry((group, color)).or_insert_with(|| {
+                groups.push((group, color, Vec::new()));
+                groups.len() - 1
+            });
+            groups[slot].2.push(ring);
+        }
+        if !by_color {
+            // Plane groups are handed out densely in first-seen order, so this
+            // is already ascending; kept explicit because the face order is
+            // visible in the exported facet set.
+            groups.sort_by_key(|(group, _, _)| *group);
         }
 
         let vertices = welder.vertices;
         let mut group_loops: Vec<(Plane, Vec<Vec<u32>>)> = Vec::with_capacity(groups.len());
+        let mut group_colors: Vec<Option<[u8; 4]>> = Vec::with_capacity(groups.len());
         prof::scope("merge:extract_loops", || {
-            for (group, rings) in groups.into_iter().enumerate() {
+            for (group, color, rings) in groups {
                 if rings.is_empty() {
                     continue;
                 }
+                bsp::poll_interrupt(&mut polls, 16);
                 let plane = planes.planes[group];
                 let loops = extract_loops_owned(plane, rings, &vertices);
                 if !loops.is_empty() {
                     group_loops.push((plane, loops));
+                    group_colors.push(color);
                 }
             }
         });
@@ -364,8 +391,13 @@ impl Solid {
 
         let mut polygons = Vec::new();
         prof::scope("merge:emit_faces", || {
-            for (plane, loops) in group_loops {
+            for ((plane, loops), color) in group_loops.into_iter().zip(group_colors) {
+                bsp::poll_interrupt(&mut polls, 64);
+                let start = polygons.len();
                 emit_faces(plane, &loops, &vertices, &mut polygons);
+                for polygon in &mut polygons[start..] {
+                    polygon.color = color;
+                }
             }
         });
         Self { polygons }
@@ -397,6 +429,7 @@ impl Solid {
         }
         let mut output = Vec::new();
         for constraints in cells {
+            bsp::check_interrupt();
             let mut cell = bounding_box_polygons(bounds, 1.0);
             for plane in &constraints {
                 cell = clip_convex(&cell, *plane);
@@ -429,7 +462,11 @@ impl Solid {
             })
             .unwrap_or(1.0);
         let tolerance = scale * 1.0e-9;
+        // Quadratic in the face count, so a large convex operand (a hull of a
+        // scan) spends real time here; polled like the kernel's own loops.
+        let mut polls = 0usize;
         for polygon in &self.polygons {
+            bsp::poll_interrupt(&mut polls, 64);
             for other in &self.polygons {
                 for vertex in &other.vertices {
                     if polygon.plane.distance(*vertex) > tolerance {
@@ -703,6 +740,10 @@ fn subdivide_group_edges(rings: &mut [Vec<u32>], vertices: &[Vec3]) {
 }
 
 fn subdivide_group_edges_inner(rings: &mut [Vec<u32>], vertices: &[Vec3]) {
+    subdivide_group_edges_with(rings, vertices, SUBDIVIDE_TREE_MIN)
+}
+
+fn subdivide_group_edges_with(rings: &mut [Vec<u32>], vertices: &[Vec3], tree_min: usize) {
     let mut group_vertices: Vec<u32> = rings.iter().flatten().copied().collect();
     group_vertices.sort_unstable();
     group_vertices.dedup();
@@ -739,7 +780,20 @@ fn subdivide_group_edges_inner(rings: &mut [Vec<u32>], vertices: &[Vec3]) {
         .collect();
     sorted.sort_by(|left, right| left.0.total_cmp(&right.0));
 
+    // A slab along one axis is selective for short boundary edges but not
+    // for long diagonals: a fan over a 100k-gon cap has 100k chords, each
+    // spanning a slab of tens of thousands of vertices, which made merging
+    // that one face take most of a minute. Large groups therefore also get a
+    // k-d tree, and an edge whose slab is crowded queries the tree instead.
+    // Both visit a superset of the candidates the exact test below accepts,
+    // so the accepted set, and the output, are the same either way.
+    let tree = (sorted.len() >= tree_min).then(|| PointTree::new(&group_vertices, vertices));
+
     let mut inserts: Vec<(f64, u32)> = Vec::new();
+    let mut nearby: Vec<u32> = Vec::new();
+    // Counts candidate visits, so that a poll lands every million or so
+    // whatever the shape of the work.
+    let mut work = 0usize;
     for ring in rings.iter_mut() {
         let mut expanded: Vec<u32> = Vec::with_capacity(ring.len());
         let count = ring.len();
@@ -756,16 +810,11 @@ fn subdivide_group_edges_inner(rings: &mut [Vec<u32>], vertices: &[Vec3]) {
             }
             let low = start.min(end).sub(Vec3::new(tolerance, tolerance, tolerance));
             let high = start.max(end).add(Vec3::new(tolerance, tolerance, tolerance));
-            let slab = sorted.partition_point(|entry| entry.0 < low.component(axis));
-            inserts.clear();
-            for (coordinate, candidate) in &sorted[slab..] {
-                if *coordinate > high.component(axis) {
-                    break;
+            let accept = |candidate: u32, inserts: &mut Vec<(f64, u32)>| {
+                if candidate == from || candidate == to {
+                    return;
                 }
-                if *candidate == from || *candidate == to {
-                    continue;
-                }
-                let point = vertices[*candidate as usize];
+                let point = vertices[candidate as usize];
                 if point.x < low.x
                     || point.x > high.x
                     || point.y < low.y
@@ -773,17 +822,39 @@ fn subdivide_group_edges_inner(rings: &mut [Vec<u32>], vertices: &[Vec3]) {
                     || point.z < low.z
                     || point.z > high.z
                 {
-                    continue;
+                    return;
                 }
                 let t = point.sub(start).dot(direction) / length_squared;
                 if t <= 0.0 || t >= 1.0 {
-                    continue;
+                    return;
                 }
                 let projected = start.add(direction.mul(t));
                 if projected.sub(point).length() > tolerance {
-                    continue;
+                    return;
                 }
-                inserts.push((t, *candidate));
+                inserts.push((t, candidate));
+            };
+            let slab = sorted.partition_point(|entry| entry.0 < low.component(axis));
+            let slab_end = slab + sorted[slab..].partition_point(|entry| entry.0 <= high.component(axis));
+            inserts.clear();
+            match &tree {
+                Some(tree) if slab_end - slab > SUBDIVIDE_TREE_SLAB => {
+                    nearby.clear();
+                    work += tree.near_segment(start, end, low, high, tolerance, &mut nearby);
+                    for candidate in &nearby {
+                        accept(*candidate, &mut inserts);
+                    }
+                }
+                _ => {
+                    work += slab_end - slab;
+                    for (_, candidate) in &sorted[slab..slab_end] {
+                        accept(*candidate, &mut inserts);
+                    }
+                }
+            }
+            if work >= 1 << 20 {
+                work = 0;
+                bsp::check_interrupt();
             }
             // Ties on `t` were previously broken by the scan order, which was
             // ascending vertex index; the slab visits candidates in a different
@@ -793,6 +864,101 @@ fn subdivide_group_edges_inner(rings: &mut [Vec<u32>], vertices: &[Vec3]) {
             expanded.extend(inserts.iter().map(|(_, index)| *index));
         }
         *ring = expanded;
+    }
+}
+
+/// Groups smaller than this only use the slab.
+const SUBDIVIDE_TREE_MIN: usize = 512;
+/// An edge whose slab holds more candidates than this queries the tree.
+const SUBDIVIDE_TREE_SLAB: usize = 64;
+
+/// A static k-d tree over a group's vertices, answering "which vertices may
+/// lie within `tolerance` of this segment" conservatively.
+struct PointTree {
+    /// Vertex indices, permuted so every node owns a contiguous range.
+    order: Vec<u32>,
+    /// `(min, max, range start, range end, children)`; children index
+    /// `nodes`, or `usize::MAX` for a leaf.
+    nodes: Vec<(Vec3, Vec3, usize, usize, [usize; 2])>,
+}
+
+impl PointTree {
+    const LEAF: usize = 16;
+
+    fn new(indices: &[u32], vertices: &[Vec3]) -> Self {
+        let mut entries: Vec<(Vec3, u32)> = indices.iter().map(|i| (vertices[*i as usize], *i)).collect();
+        let mut nodes = Vec::with_capacity(2 * indices.len() / Self::LEAF + 1);
+        Self::build(&mut entries, 0, &mut nodes);
+        Self {
+            order: entries.iter().map(|(_, index)| *index).collect(),
+            nodes,
+        }
+    }
+
+    fn build(entries: &mut [(Vec3, u32)], offset: usize, nodes: &mut Vec<(Vec3, Vec3, usize, usize, [usize; 2])>) -> usize {
+        let mut low = entries[0].0;
+        let mut high = entries[0].0;
+        for (point, _) in entries.iter() {
+            low = low.min(*point);
+            high = high.max(*point);
+        }
+        let id = nodes.len();
+        nodes.push((low, high, offset, offset + entries.len(), [usize::MAX; 2]));
+        if entries.len() > Self::LEAF {
+            let size = high.sub(low);
+            let axis = if size.x >= size.y && size.x >= size.z {
+                0
+            } else if size.y >= size.z {
+                1
+            } else {
+                2
+            };
+            let middle = entries.len() / 2;
+            entries.select_nth_unstable_by(middle, |a, b| a.0.component(axis).total_cmp(&b.0.component(axis)));
+            let (left, right) = entries.split_at_mut(middle);
+            let first = Self::build(left, offset, nodes);
+            let second = Self::build(right, offset + middle, nodes);
+            nodes[id].4 = [first, second];
+        }
+        id
+    }
+
+    /// Appends every vertex that might be within `tolerance` of the segment
+    /// and inside `[low, high]`, and returns how many it looked at.
+    fn near_segment(&self, start: Vec3, end: Vec3, low: Vec3, high: Vec3, tolerance: f64, out: &mut Vec<u32>) -> usize {
+        let mut visited = 0usize;
+        let mut stack = vec![0usize];
+        let direction = end.sub(start);
+        let length_squared = direction.dot(direction);
+        while let Some(id) = stack.pop() {
+            let (box_low, box_high, first, last, children) = self.nodes[id];
+            visited += 1;
+            if box_high.x < low.x
+                || box_low.x > high.x
+                || box_high.y < low.y
+                || box_low.y > high.y
+                || box_high.z < low.z
+                || box_low.z > high.z
+            {
+                continue;
+            }
+            // Every point of the box is within `radius` of its centre, so
+            // none is nearer the segment than the centre is, less `radius`.
+            let centre = box_low.add(box_high).mul(0.5);
+            let radius = box_high.sub(box_low).length() * 0.5;
+            let t = (centre.sub(start).dot(direction) / length_squared).clamp(0.0, 1.0);
+            let gap = start.add(direction.mul(t)).sub(centre).length();
+            if gap - radius > tolerance * 2.0 + radius * 1.0e-12 {
+                continue;
+            }
+            if children[0] == usize::MAX {
+                visited += last - first;
+                out.extend_from_slice(&self.order[first..last]);
+            } else {
+                stack.extend_from_slice(&children);
+            }
+        }
+        visited
     }
 }
 
@@ -929,6 +1095,7 @@ fn remove_globally_collinear_vertices(vertices: &[Vec3], groups: &mut [(Plane, V
     let mut touched: Vec<u32> = Vec::new();
     let mut removable: Vec<bool> = vec![false; vertices.len()];
     for _ in 0..8 {
+        bsp::check_interrupt();
         for vertex in touched.drain(..) {
             seen[vertex as usize] = false;
             removable[vertex as usize] = false;
@@ -1019,7 +1186,14 @@ fn insert_t_junction_vertices(vertices: &[Vec3], groups: &mut [(Plane, Vec<Vec<u
     // within 20 nm and left 30 edges open along the blades of the louvred
     // basket fixture.
     let tolerance = (scale * 1.0e-10).max(WELD_EPSILON);
-    let cell = (scale / 64.0).max(tolerance * 16.0);
+    // About the vertex spacing of a surface this densely sampled (a surface
+    // of `n` vertices spans roughly `sqrt(n)` spacings), and never finer
+    // than the old fixed 1/64 of the model for a sparse one. Only the search
+    // granularity: every probe keeps a one-cell margin over a cell at least
+    // the tolerance wide, so the seams found are the same, and a 200k
+    // triangle scan no longer checks hundreds of candidates per edge.
+    let divisions = ((used.len() as f64).sqrt() / 2.0).max(64.0);
+    let cell = (scale / divisions).max(tolerance * 16.0);
 
     let key = |point: Vec3| -> [i64; 3] {
         [
@@ -1035,8 +1209,10 @@ fn insert_t_junction_vertices(vertices: &[Vec3], groups: &mut [(Plane, Vec<Vec<u
             .push(*index);
     }
 
+    let mut polls = 0usize;
     for (_, loops) in groups.iter_mut() {
         for ring in loops.iter_mut() {
+            bsp::poll_interrupt(&mut polls, 256);
             let count = ring.len();
             let mut expanded: Vec<u32> = Vec::with_capacity(count);
             for index in 0..count {
@@ -1480,6 +1656,49 @@ fn chain_cap(segments: &[(Vec3, Vec3)], plane: Plane) -> Option<Polygon> {
 mod tests {
     use super::*;
     use crate::csg::{self, primitives};
+
+    /// The k-d tree only narrows which candidates get the exact test, so the
+    /// subdivided rings must be identical with and without it: fans over
+    /// large polygons (long chords) plus T-junction vertices on the edges.
+    #[test]
+    fn subdividing_with_the_point_tree_matches_the_slab_scan() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for case in 0..12 {
+            let count = 600 + case * 150;
+            let (tilt, radius) = (random(), 1.0 + random() * 100.0);
+            let mut vertices: Vec<Vec3> = (0..count)
+                .map(|i| {
+                    let angle = std::f64::consts::TAU * i as f64 / count as f64;
+                    let (x, y) = (radius * angle.cos(), radius * angle.sin());
+                    Vec3::new(x, y * (1.0 - tilt), y * tilt)
+                })
+                .collect();
+            // Fan triangles from the last vertex, plus midpoints of some
+            // chords and boundary edges so there is something to insert.
+            let last = (count - 1) as u32;
+            let mut rings: Vec<Vec<u32>> = (0..count - 2).map(|k| vec![last, k as u32, k as u32 + 1]).collect();
+            for _ in 0..40 {
+                let k = (random() * (count - 2) as f64) as usize;
+                let (a, b) = if random() < 0.5 { (vertices[count - 1], vertices[k]) } else { (vertices[k], vertices[k + 1]) };
+                let t = 0.1 + random() * 0.8;
+                vertices.push(a.add(b.sub(a).mul(t)));
+                let new = (vertices.len() - 1) as u32;
+                rings.push(vec![new, last, k as u32]);
+            }
+            let mut slab = rings.clone();
+            let mut tree = rings.clone();
+            subdivide_group_edges_with(&mut slab, &vertices, usize::MAX);
+            subdivide_group_edges_with(&mut tree, &vertices, 0);
+            assert_eq!(slab, tree, "case {case}");
+            assert_ne!(slab, rings, "case {case} inserted nothing");
+        }
+    }
 
     /// Two solids that meet face to face are a union the kernel has to get
     /// right — a printed-in-place hinge is nothing but that. It used to

@@ -36,6 +36,10 @@ fn unpruned_distance(shape: &Shape, point: Vec3) -> f64 {
             radius,
             ..
         } => unpruned_distance(shape, point.sub(*offset)) - radius,
+        Shape::Sweep { shape, points, .. } => super::sweep_samples(shape, points)
+            .into_iter()
+            .map(|offset| unpruned_distance(shape, point.sub(offset)))
+            .fold(f64::INFINITY, f64::min),
         Shape::Union { children, .. } => children
             .iter()
             .map(|child| unpruned_distance(&child.shape, point))

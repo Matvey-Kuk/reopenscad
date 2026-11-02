@@ -1,3 +1,9 @@
+// Shared by several test binaries (`mod support;` in each), and each uses
+// only a subset; the rest, including the OpenSCAD-golden comparison used by
+// the `#[ignore]`d full-corpus and OpenAPPA parity gates, would otherwise warn
+// as dead code in every binary that does not call it.
+#![allow(dead_code)]
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs;

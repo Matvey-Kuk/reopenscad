@@ -71,3 +71,9 @@ Thumbs.db
 # Session instructions for the coding agent, not project documentation.
 CLAUDE.md
 .claude/
+
+# Ad video build workspace (sources + renders)
+video-ad/
+
+# Unrelated project with its own repository
+nonappa/

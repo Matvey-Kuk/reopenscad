@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import fs from 'node:fs';
 import test from 'node:test';
 
 const html = await readFile(new URL('../index.html', import.meta.url), 'utf8');
@@ -48,7 +49,7 @@ test('scene inspection controls expose objects, visibility, selection, and toler
 });
 
 test('workspace client persists revisions and listens for AI updates', () => {
-  assert.match(javascript, /fetch\('\/api\/workspaces'/);
+  assert.match(javascript, /fetch\('\/api\/designs'/);
   assert.match(javascript, /method: 'PATCH'/);
   assert.match(javascript, /\/events\?since=/);
   assert.match(javascript, /source === 'ai'/);
@@ -58,34 +59,48 @@ test('workspace client persists revisions and listens for AI updates', () => {
 
 test('unchanged polls and local edits cannot overwrite each other', () => {
   const polling = javascript.slice(javascript.indexOf('function beginWorkspacePolling'), javascript.indexOf('function normalizeObjects'));
-  assert.match(polling, /payload\.changed === true/);
-  assert.ok(polling.indexOf('payload.changed === true') < polling.indexOf('applyWorkspace(payload, { remote: true })'));
-  assert.match(javascript, /remote && !force[^\n]+hasPendingLocalWorkspaceChanges\(\)/);
-  assert.match(javascript, /surfaceWorkspaceConflict\(payload\)/);
+  assert.match(javascript, /payload\.changed === true/);
+  assert.match(polling, /workspacePollAction\(payload, sinceRevision, workspaceRevision\)/);
+  assert.match(polling, /if \(action === 'apply'\) applyWorkspace\(payload, \{ remote: true \}\)/);
+  // The server wins: unsaved edits are set aside for an explicit restore, never
+  // left holding the editor on a stale revision, and never silently dropped.
+  assert.match(javascript, /if \(remote && [^\n]+hasPendingLocalWorkspaceChanges\(\)\) \{\s*displaceLocalEdits\(editor\.value\)/);
   assert.match(javascript, /workspace-conflict-resolver/);
+  assert.match(javascript, /data-resolution="restore"/);
   assert.doesNotMatch(javascript, /window\.confirm/);
+  assert.doesNotMatch(javascript, /workspaceConflict\b|surfaceWorkspaceConflict/);
 });
 
 test('render and export flush source and bind requests to a revision', () => {
   const rendering = javascript.slice(javascript.indexOf("async function render(mode"), javascript.indexOf('function cancelRender'));
-  const exporting = javascript.slice(javascript.indexOf('async function exportModel'), javascript.indexOf('function updateCustomizer'));
+  const exporting = javascript.slice(javascript.indexOf('async function exportModel'), javascript.indexOf('async function loadExample'));
   assert.match(rendering, /await flushWorkspaceSave\(\)/);
-  assert.match(rendering, /revision: workspaceRevision/);
+  assert.match(rendering, /revision: sharedToken \? readOnlyRevision : workspaceRevision/);
   assert.match(rendering, /requestId: request\.id/);
   assert.match(rendering, /activeRender !== request/);
   assert.match(exporting, /await flushWorkspaceSave\(\)/);
   assert.match(exporting, /revision: workspaceRevision/);
-  assert.match(exporting, /scope === 'selected'/);
-  assert.match(html, /data-format="stl" data-scope="selected"/);
+  assert.match(exporting, /const objectIds = exportObjectIds\(scope\)/);
+  // A per-object export recompiles first when the ids belong to older source.
+  assert.match(exporting, /if \(!sceneObjectsCurrent\(\)\) \{[\s\S]*?await render\('preview'\)/);
 });
 
-test('exports never filter on placeholder object IDs', () => {
+test('the workspace export names no objects, so it can never be stale', () => {
   const selecting = javascript.slice(javascript.indexOf('function exportObjectIds'), javascript.indexOf('async function exportModel'));
-  assert.match(javascript, /placeholder: true/);
-  assert.match(selecting, /sceneObjects\.some\(\(object\) => object\.placeholder\)\) return null/);
-  assert.match(selecting, /visible\.length === sceneObjects\.length \? null/);
-  const exporting = javascript.slice(javascript.indexOf('async function exportModel'), javascript.indexOf('function updateCustomizer'));
+  // No id list: the server exports every object as its own body in one file,
+  // `%` background excluded. Hidden objects are part of "all".
+  assert.doesNotMatch(selecting, /visible !== false/);
+  assert.match(javascript, /!object\.placeholder && !object\.background/);
+  const exporting = javascript.slice(javascript.indexOf('async function exportModel'), javascript.indexOf('async function loadExample'));
+  assert.match(exporting, /async function exportModel\(format, scope = 'all'\)/);
   assert.match(exporting, /\.\.\.\(objectIds \? \{ objectIds \} : \{\}\)/);
+  assert.match(javascript, /exportModel\(button\.dataset\.format, 'all'\)/);
+  assert.match(html, /<b>Export all objects<\/b>/);
+  assert.doesNotMatch(html, /Export all visible objects/);
+  assert.match(html, /id="objectExportHint"/);
+  // Objects are tied to the source they were compiled from.
+  const rendering = javascript.slice(javascript.indexOf("async function render(mode"), javascript.indexOf('function cancelRender'));
+  assert.match(rendering, /if \(Array\.isArray\(data\.objects\)\) sceneObjectsSource = source;/);
 });
 
 test('async workspace operations are generation scoped', () => {
@@ -95,14 +110,17 @@ test('async workspace operations are generation scoped', () => {
   assert.match(javascript, /workspaceSaveController\?\.abort\(\)/);
 });
 
-test('unknown legacy workspace URLs are migrated instead of stranded locally', () => {
-  const loading = javascript.slice(javascript.indexOf('async function loadWorkspace'), javascript.indexOf('function scheduleWorkspaceSave'));
+test('a missing workspace is reported, never silently replaced by a new one', () => {
+  const loading = javascript.slice(javascript.indexOf('async function loadWorkspace'), javascript.indexOf('async function refreshWorkspaceFromServer'));
   assert.match(loading, /\?allowMissing=1/);
   assert.match(loading, /response\.ok && payload\.missing === true/);
   assert.doesNotMatch(loading, /response\.status === 404/);
-  assert.match(loading, /localStorage\.getItem\(workspaceStorageKey\(id\)\)/);
-  // A migrated workspace keeps its own cached source and never falls back to a seeded example.
-  assert.match(loading, /await createWorkspace\(cached\?\.code \|\| ''\)/);
+  assert.match(loading, /readCachedWorkspace\(id\)/);
+  assert.match(javascript, /localStorage\.getItem\(workspaceStorageKey\(id\)\)/);
+  // Opening a URL must never mint a workspace; the cached source is offered instead.
+  assert.doesNotMatch(loading, /createWorkspace\(/);
+  assert.match(loading, /const recoverable = cached\?\.code \|\| displacedEdits\?\.code \|\| '';\s*showLanding\(\{ missing: \{ id, code: recoverable \} \}\)/);
+  assert.match(html, /id="landingRecoverMissing"/);
 });
 
 test('the workspace is the document: no file name is surfaced anywhere', () => {
@@ -115,37 +133,40 @@ test('the workspace is the document: no file name is surfaced anywhere', () => {
   assert.match(javascript, /downloadFileName\('scad'\)/);
 });
 
-test('examples are kick-start options above an empty editor, not a toolbar dropdown', () => {
+test('examples live on the landing page and each opens as a new workspace', () => {
   assert.doesNotMatch(html, /example-picker|id="exampleSelect"/);
   assert.doesNotMatch(css, /example-picker/);
-  assert.match(html, /id="kickstart"/);
-  assert.match(html, /id="kickstartGrid"/);
-  // The grid sits inside the editor pane, above the edit field.
-  const editorPane = html.slice(html.indexOf('class="editor-pane"'), html.indexOf('class="splitter vertical"'));
-  assert.match(editorPane, /id="kickstart"/);
+  // No gallery over the editor any more: an empty workspace is an empty editor.
+  assert.doesNotMatch(html + javascript + css, /kickstart/i);
+  assert.match(html, /<textarea id="codeEditor"[^>]*placeholder="/);
+  const landing = html.slice(html.indexOf('<main class="landing"'), html.indexOf('</main>'));
+  assert.match(landing, /id="landingExamples"/);
+  assert.ok(landing.indexOf('id="landingRecents"') < landing.indexOf('id="landingExamples"'));
   // The catalogue is fetched from real files rather than inlined here, so the
   // sources the cards open are the same ones the Rust suite compiles and the
   // OpenSCAD oracle checks.
-  assert.doesNotMatch(javascript, /const kickstartOptions = \[/);
   assert.match(javascript, /const EXAMPLES_BASE = '\/examples\/';/);
   assert.match(javascript, /fetch\(`\$\{EXAMPLES_BASE\}manifest\.json`\)/);
   assert.match(javascript, /fetch\(`\$\{EXAMPLES_BASE\}\$\{encodeURIComponent\(slug\)\}\.scad`\)/);
-  assert.match(javascript, /function updateKickstart\(\)[\s\S]*?editor\.value\.trim\(\)\.length === 0/);
-  assert.match(javascript, /data-example=/);
-  // Built only when the panel is actually shown: a workspace that opens with
-  // code in it must not pay for the manifest and eighteen preview requests.
-  assert.match(javascript, /if \(!hidden\) renderKickstart\(\);/);
-  // Every card carries its own render.
-  assert.match(javascript, /class="kickstart-shot"><img src="\$\{EXAMPLES_BASE\}\$\{slug\}\.png"/);
-  // A new workspace must actually be empty, or the kick-start options can never appear.
+  // Every card carries its own render, loaded eagerly: the landing page is its
+  // own scroll container, where a lazy image could stay a blank placeholder.
+  const rendering = javascript.slice(javascript.indexOf('async function renderLandingExamples'), javascript.indexOf('function updateEmptyState'));
+  assert.match(rendering, /class="example-shot"><img src="\$\{EXAMPLES_BASE\}\$\{slug\}\.png"/);
+  assert.doesNotMatch(rendering, /loading="lazy"/);
+  // Clicking one seeds a brand new workspace with the example's source.
+  const loading = javascript.slice(javascript.indexOf('async function loadExample'), javascript.indexOf('async function renderLandingExamples'));
+  assert.match(loading, /await startNewWorkspace\(code\)/);
+  assert.match(javascript, /\$\('#landingExamples'\)\.addEventListener\('click'[\s\S]{0,160}loadExample\(card\.dataset\.example\)/);
+  assert.match(javascript, /renderLandingRecents\(\);\s*renderLandingExamples\(\);/);
+  // A new workspace is genuinely empty.
   assert.doesNotMatch(javascript, /createWorkspace\(examples\.starter/);
   assert.match(javascript, /async function createWorkspace\(code = ''/);
 });
 
 test('recently visited workspaces are remembered in this browser, with previews', () => {
   // The URL is the only handle on a workspace, so the app has to keep one.
-  assert.match(javascript, /const RECENTS_STORAGE_KEY = 'reopenscad\.recentWorkspaces';/);
-  assert.match(html, /id="kickstartRecents"/);
+  assert.match(javascript, /const RECENTS_STORAGE_KEY = 'reopenscad\.recentDesigns';/);
+  assert.match(html, /id="landingRecents"/);
   // In this browser, never on the server: a list of everything someone opened
   // is the one thing an account-less service must not collect.
   const recents = javascript.slice(javascript.indexOf('function readRecents'), javascript.indexOf('function loadCatalogue'));
@@ -153,14 +174,16 @@ test('recently visited workspaces are remembered in this browser, with previews'
   assert.match(recents, /localStorage\.setItem\(RECENTS_STORAGE_KEY/);
   assert.doesNotMatch(recents, /fetch\([^)]*recent/i);
   // Most recent first, which is the order it is stored in.
-  assert.match(recents, /\[\{ id, visitedAt: Date\.now\(\) \}, \.\.\.rest\]/);
-  // A blank workspace — what landing on "/" mints — must not be listed.
-  assert.match(javascript, /workspace\.id && \(workspace\.code \|\| ''\)\.trim\(\)/);
+  assert.match(recents, /\[\{ id, visitedAt: Date\.now\(\), empty: [^}]+\}, \.\.\.rest\]/);
+  // Every workspace opened here is listed, empty ones included (labelled as such):
+  // the list's own copy promises "workspaces you create or open".
+  assert.match(javascript, /if \(!remote && workspace\.id\) rememberWorkspace\(String\(workspace\.id\), \{ empty: incomingEmpty \}\);/);
+  assert.match(javascript, /Designs you create or open in this browser are listed here\./);
   // Removing one is a list operation and says so, because the wording is the
   // only thing standing between the user and thinking they deleted their work.
   // Asked in the page, like every other confirmation here — a native dialog
   // blocks the tab and cannot carry the second sentence.
-  assert.match(html + javascript, /Remove workspace from the list\? It will still be available/);
+  assert.match(html + javascript, /Remove design from the list\? It will still be available/);
   assert.match(javascript, /class = 'forget-prompt'|className = 'forget-prompt'/);
   // ...and it only touches local storage.
   const forget = javascript.slice(javascript.indexOf('function forgetRecentWorkspace'), javascript.indexOf('// --- Render thumbnails'));
@@ -186,19 +209,11 @@ test('starting a new workspace clears the viewport, not just the flag', () => {
   // `hasMesh = false` stops the next draw being requested; the last frame stays
   // on the canvas until the buffers go and something repaints.
   assert.match(javascript, /clearMesh\(\) \{[\s\S]*?this\.meshBatches = \[\];[\s\S]*?this\.draw\(\);/);
-  const newButton = javascript.slice(javascript.indexOf("$('#newButton').addEventListener"), javascript.indexOf("$('#fileInput').addEventListener"));
-  assert.match(newButton, /hasMesh = false;\s*\n\s*meshViewport\.clearMesh\(\);/);
-});
-
-test('the kick-start panel scrolls, and clicking it still reaches the editor', () => {
-  // `pointer-events: none` made the whole catalogue unscrollable: a wheel over
-  // it went to the editor underneath, which does not scroll either.
-  assert.match(css, /\.kickstart \{[^}]*overflow: auto;[^}]*pointer-events: auto;/);
-  // Taking pointer events back means forwarding a background click by hand.
-  assert.match(javascript, /\$\('#kickstart'\)\.addEventListener\('mousedown'[\s\S]*?editor\.focus\(\)/);
-  // Delegated from the panel so the recents group is live too, not from the
-  // catalogue, which is only one of its two children.
-  assert.match(javascript, /\$\('#kickstart'\)\.addEventListener\('click'/);
+  const reset = javascript.slice(javascript.indexOf('function resetScene()'), javascript.indexOf('async function leaveCurrentWorkspace'));
+  assert.match(reset, /hasMesh = false;\s*\n\s*meshViewport\.clearMesh\(\);/);
+  const starting = javascript.slice(javascript.indexOf('async function startNewWorkspace'), javascript.indexOf("$('#fileInput').addEventListener"));
+  assert.match(starting, /await createWorkspace\(code, \{ navigation: 'push' \}\);\s*\n\s*resetScene\(\);/);
+  assert.match(starting, /\$\('#newButton'\)\.addEventListener\('click', \(\) => startNewWorkspace\(''\)\)/);
 });
 
 test('sharing offers an editable link and a read-only one that cannot become it', () => {
@@ -230,9 +245,24 @@ test('sharing offers an editable link and a read-only one that cannot become it'
   assert.match(shared, /workspaceId = null/);
 });
 
+test('a read-only view renders the stored design per part, through its token', () => {
+  // `/api/render` answers one merged mesh with no objects, which drew a shared
+  // multi-part design as a single uncoloured body with an empty parts panel.
+  const renderBody = javascript.slice(javascript.indexOf('async function render(mode'), javascript.indexOf('function cancelRender('));
+  assert.match(renderBody, /const sharedToken = readOnlyToken;/);
+  assert.match(renderBody, /sharedRoute\s*\?\s*`\/api\/shared\/\$\{encodeURIComponent\(sharedToken\)\}\/render`/);
+  assert.match(renderBody, /revision: sharedToken \? readOnlyRevision : workspaceRevision/);
+  // A newer revision is loaded into the editor before it is rendered.
+  assert.match(renderBody, /sharedRoute && attempt\.status === 409[\s\S]{0,200}reloadSharedSource\(sharedToken, request, superseded\)/);
+  assert.match(javascript, /function applySharedPayload\(payload\) \{[\s\S]{0,200}readOnlyRevision = Number\(payload\.revision\) \|\| 0;/);
+  // Still no design id: the read-only view never learns which design it shows.
+  const shared = javascript.slice(javascript.indexOf('function applySharedPayload'), javascript.indexOf("$('#forkWorkspace')"));
+  assert.doesNotMatch(shared, /workspaceId = /);
+});
+
 test('a read-only view cannot save, and offers a way out that can', () => {
   assert.match(html, /id="readonlyBanner"/);
-  assert.match(html, /Copy to a new workspace to edit/);
+  assert.match(html, /Copy to a new design to edit/);
   // Saving, polling and preview upload all key off `workspaceId`, which a
   // shared view deliberately does not have — that is what makes it read-only
   // rather than read-only-by-convention.
@@ -251,48 +281,21 @@ test('the shell pins its grid rows so a hidden banner cannot shift the layout', 
   // the workspace and the status bar up a row each while the banner is hidden.
   assert.match(css, /\.app-shell > \.workspace \{ grid-row: 4; \}/);
   assert.match(css, /\.app-shell > \.status-bar \{ grid-row: 5; \}/);
-  // `[hidden]` is user-agent weight and loses to a class that sets `display`.
-  assert.match(css, /\.tool-button\[hidden\] \{ display: none; \}/);
-});
-
-test('the blank-workspace card reaches the editor instead of minting a workspace', () => {
-  // The catalogue is only on screen when this workspace is already empty, so
-  // creating another empty one changes the URL and leaves the screen looking
-  // identical — which is exactly what the card used to do, and why clicking it
-  // appeared to do nothing.
-  assert.match(javascript, /data-blank-editor aria-label="Blank workspace"/);
-  assert.doesNotMatch(javascript, /data-new-workspace/);
-  const handler = javascript.slice(javascript.indexOf("data-blank-editor]')"), javascript.indexOf("[data-workspace]')"));
-  assert.match(handler, /kickstartDismissed = true;/);
-  assert.match(handler, /editor\.focus\(\);/);
-  assert.doesNotMatch(handler, /newButton|createWorkspace/);
-  // Dismissal lasts the sitting, not the workspace: an empty workspace should
-  // offer help again when it is opened afresh.
-  assert.doesNotMatch(javascript, /kickstart\.dismissed/);
-  assert.match(javascript, /kickstartDismissed = false;/);
-});
-
-test('a read-only view shows the editor, never the catalogue', () => {
-  // Every card either types into this editor or makes a workspace, and a
-  // reader came here to do neither — a shared blank model is just a blank
-  // editor.
-  assert.match(javascript, /const hidden = !empty \|\| kickstartDismissed \|\| Boolean\(readOnlyToken\);/);
-  // `readOnlyToken` is read by `updateKickstart`, which is defined long before
-  // the read-only code; declaring it down there would be a dead-zone trap.
-  const declaration = javascript.indexOf('let readOnlyToken = null;');
-  assert.ok(declaration > 0 && declaration < javascript.indexOf('function updateKickstart'));
+  // `[hidden]` is user-agent weight and loses to a class that sets `display`: Share is the one toolbar button that hides.
+  assert.match(css, /\.share-button\[hidden\] \{ display: none; \}/);
 });
 
 test('an empty editor is not offered a preview it cannot produce', () => {
+  assert.match(javascript, /function updateEmptyState\(\) \{\s*const empty = editor\.value\.trim\(\)\.length === 0;/);
   assert.match(javascript, /\$\('#firstPreview'\)\.hidden = empty;/);
   assert.match(javascript, /\$\('#emptyHint'\)\.hidden = empty;/);
 });
 
-test('one recent workspace is the same size as one of three', () => {
+test('one example card is the same size as one of three', () => {
   // `auto-fit` collapses the empty tracks, so a single card stretches the whole
   // row — and with a fixed-aspect thumbnail a full-width card is a very tall one.
-  assert.match(css, /\.kickstart-grid \{ display: grid; grid-template-columns: repeat\(auto-fill,/);
-  assert.doesNotMatch(css, /\.kickstart-grid \{[^}]*auto-fit/);
+  assert.match(css, /\.example-grid \{ display: grid; grid-template-columns: repeat\(auto-fill,/);
+  assert.doesNotMatch(css, /\.example-grid \{[^}]*auto-fit/);
 });
 
 test('intersection tolerance defaults to 0.2 mm, persists, and never coerces to zero', () => {
@@ -315,7 +318,7 @@ test('offline workspace ids satisfy the server id rules and history stays naviga
   assert.doesNotMatch(generator, /Math\.random\(\)\.toString\(36\)/);
   assert.match(javascript, /history\.pushState\(\{ workspaceId: id \}/);
   assert.match(javascript, /addEventListener\('popstate'/);
-  assert.match(javascript, /createWorkspace\('', \{ navigation: 'push' \}\)/);
+  assert.match(javascript, /createWorkspace\(code, \{ navigation: 'push' \}\)/);
 });
 
 test('a failed workspace save retries with backoff instead of waiting for the next keystroke', () => {
@@ -327,10 +330,16 @@ test('a failed workspace save retries with backoff instead of waiting for the ne
 });
 
 test('no unscoped source cache can leak one workspace into another', () => {
-  const writes = [...javascript.matchAll(/localStorage\.setItem\('reopenscad\.code'/g)];
+  const writes = [...javascript.matchAll(/localStorage\.setItem\(('reopenscad\.code'|LEGACY_DRAFT_KEY)/g)];
   assert.deepEqual(writes, []);
   assert.doesNotMatch(javascript, /localStorage\.getItem\('reopenscad\.code'\)/);
-  assert.match(javascript, /localStorage\.removeItem\('reopenscad\.code'\)/);
+  // The pre-workspace cache is still somebody's work: it is offered on the
+  // landing page, read nowhere else, and removed only once it is in a workspace.
+  assert.match(javascript, /const LEGACY_DRAFT_KEY = 'reopenscad\.code';/);
+  assert.equal([...javascript.matchAll(/localStorage\.getItem\(LEGACY_DRAFT_KEY\)/g)].length, 1);
+  const offering = javascript.slice(javascript.indexOf("if (event.target.closest('[data-landing-draft]'))"), javascript.indexOf("const open = event.target.closest('[data-landing-workspace]')"));
+  assert.ok(offering.indexOf('await startNewWorkspace(draft)') < offering.indexOf('localStorage.removeItem(LEGACY_DRAFT_KEY)'));
+  assert.match(offering, /if \(workspaceOnline\)/);
 });
 
 test('only the final AI revision supplies source highlights', () => {
@@ -339,7 +348,7 @@ test('only the final AI revision supplies source highlights', () => {
   assert.match(selection, /event\.source === 'ai'/);
   assert.match(selection, /event\.revision.*finalEvent\.revision/);
   const applying = javascript.slice(javascript.indexOf('function applyWorkspace'), javascript.indexOf('function byteOffsetToStringIndex'));
-  assert.ok(applying.indexOf('workspaceSavedCode =') < applying.indexOf('if (shouldRenderAiUpdate) render'));
+  assert.ok(applying.indexOf('workspaceSavedCode =') < applying.indexOf('if (remote && sourceChanged && rerender) scheduleSourceRender()'));
 });
 
 test('the ground surface is real scene geometry, not a CSS backdrop', () => {
@@ -354,7 +363,7 @@ test('the ground surface is real scene geometry, not a CSS backdrop', () => {
   // It reuses the shared world-space line pass rather than a second GL pipeline.
   const drawing = javascript.slice(javascript.indexOf('  drawGround(mvp, metrics) {'), javascript.indexOf('  drawGroundLabels(metrics) {'));
   assert.match(drawing, /this\.beginLinePass\(this\.multiply\(mvp, this\.scaleMatrix\(metrics\.spacing\)\)\)/);
-  assert.equal((drawing.match(/this\.drawLineSegments\(/g) || []).length, 5, 'minor, major, origin, build volume and bed outline are drawn separately');
+  assert.equal((drawing.match(/this\.drawLineSegments\(/g) || []).length, 3, 'minor, major and origin are drawn separately');
 });
 
 test('grid divisions snap to a human-readable 1-2-5 progression', () => {
@@ -403,8 +412,8 @@ test('grid values are labelled in millimetres as upright screen-space text', () 
 });
 
 test('the ground sits under the model: depth tested and biased off Z=0', () => {
-  const drawEnd = javascript.slice(javascript.indexOf('    if (this.showGround) this.drawGround'), javascript.indexOf('  projectPoint(point) {'));
-  assert.match(drawEnd, /if \(this\.showGround\) this\.drawGround\(mvp, metrics\)/);
+  const drawEnd = javascript.slice(javascript.indexOf('    this.drawGround(mvp, metrics)'), javascript.indexOf('  projectPoint(point) {'));
+  assert.match(drawEnd, /this\.drawGround\(mvp, metrics\)/);
   // No gl.disable(gl.DEPTH_TEST) anywhere: world datums are occluded by real geometry.
   assert.doesNotMatch(javascript, /disable\(gl\.DEPTH_TEST\)/);
   // A face lying exactly on the plane must win the depth test instead of z-fighting.
@@ -413,112 +422,11 @@ test('the ground sits under the model: depth tested and biased off Z=0', () => {
   assert.match(buffer, /-GROUND_DEPTH_BIAS/);
 });
 
-test('the ground plane has a toggle whose preference outlives the workspace', () => {
-  assert.match(html, /id="groundToggle"[^>]*type="checkbox" checked/);
-  assert.match(javascript, /const GROUND_STORAGE_KEY = 'reopenscad\.ground';/);
-  assert.match(javascript, /function restoreGroundPreference\(\)/);
-  assert.match(javascript, /localStorage\.setItem\(GROUND_STORAGE_KEY/);
-  const restoring = javascript.slice(javascript.indexOf('function restoreGroundPreference()'), javascript.indexOf("$('#groundToggle').addEventListener"));
-  assert.match(restoring, /stored === null \? true : stored === 'true'/);
-  const bootstrapping = javascript.slice(javascript.indexOf('async function bootstrap()'), javascript.indexOf('// Back/forward moves between workspaces'));
-  assert.match(bootstrapping, /restoreGroundPreference\(\)/);
-});
-
-test('a printer build plate can bound the same surface later', () => {
-  // The plate task swaps a bounded, labelled bed in where the model bbox is read today.
-  assert.match(javascript, /this\.plate = null;/);
-  const span = javascript.slice(javascript.indexOf('  groundSpan() {'), javascript.indexOf('  groundExtents() {'));
-  assert.match(span, /if \(this\.plate\) return Math\.max\(this\.plate\.size\[0\], this\.plate\.size\[1\]\)/);
-});
-
-// --- 3D printer build plate ---------------------------------------------------------
-// The catalogue and the fit test are pure functions, so they are exercised for real rather
-// than pattern-matched: a wrong build volume is the one failure mode that silently misleads.
-const plateModule = new Function(`${javascript.slice(
-  javascript.indexOf('const PRINTER_PLATES = ['),
-  javascript.indexOf('  return { fits: over.length === 0, over, size };\n}') + '  return { fits: over.length === 0, over, size };\n}'.length,
-)}\nreturn { PRINTER_PLATES, findPlate, plateFit };`)();
-
-test('the build plate catalogue covers the brands the spec names, with sane volumes', () => {
-  const { PRINTER_PLATES, findPlate } = plateModule;
-  const brands = PRINTER_PLATES.map((group) => group.brand);
-  for (const required of ['Bambu Lab', 'Creality', 'Prusa']) assert.ok(brands.includes(required), `${required} missing`);
-  const models = PRINTER_PLATES.flatMap((group) => group.models);
-  assert.ok(models.length >= 20, 'a useful catalogue, not a token three');
-  const ids = new Set();
-  for (const model of models) {
-    assert.equal(ids.has(model.id), false, `duplicate plate id ${model.id}`);
-    ids.add(model.id);
-    // The server sanitizes plate ids to this charset; an id outside it would be silently
-    // dropped on save and the plate would not survive a reload.
-    assert.match(model.id, /^[a-z0-9_-]{1,64}$/, `${model.id} would not survive sanitize_plate`);
-    assert.equal(model.size.length, 3, `${model.id} needs X, Y and Z`);
-    for (const value of model.size) {
-      assert.ok(Number.isFinite(value) && value >= 100 && value <= 1000, `${model.id} has an implausible dimension ${value}`);
-    }
-  }
-  // Spot-check three published build volumes, one per named brand.
-  assert.deepEqual(findPlate('bambu-x1').size, [256, 256, 256]);
-  assert.deepEqual(findPlate('prusa-mk4s').size, [250, 210, 220]);
-  assert.deepEqual(findPlate('creality-k1-max').size, [300, 300, 300]);
-  assert.equal(findPlate(''), null);
-  assert.equal(findPlate('not-a-printer'), null);
-});
-
-test('the fit check measures the model, not where it sits', () => {
-  const { plateFit, findPlate } = plateModule;
-  const plate = findPlate('prusa-mk4s'); // 250 x 210 x 220
-  // Centred on the origin is the OpenSCAD norm: half the part is below Z=0 and it still fits.
-  assert.equal(plateFit(plate, { min: [-20, -12, -9], max: [20, 12, 9] }).fits, true);
-  // Exactly the bed is a fit, not a miss.
-  assert.equal(plateFit(plate, { min: [0, 0, 0], max: [250, 210, 220] }).fits, true);
-  const over = plateFit(plate, { min: [0, 0, 0], max: [300, 100, 400] });
-  assert.equal(over.fits, false);
-  assert.deepEqual(over.over, ['X', 'Z'], 'names the axes that actually overflow');
-  assert.deepEqual(over.size, [300, 100, 400]);
-  // No plate, or nothing rendered yet, is "no verdict" rather than a false pass.
-  assert.equal(plateFit(null, { min: [0, 0, 0], max: [1, 1, 1] }), null);
-  assert.equal(plateFit(plate, null), null);
-});
-
-test('a selected bed drives the surface per axis and draws its own outline', () => {
-  const extents = javascript.slice(javascript.indexOf('  groundExtents() {'), javascript.indexOf('  ensureGroundBuffer('));
-  // Rectangular beds: each axis gets its own half-count, off the bed dimension not the span.
-  assert.match(extents, /cellsX = this\.plate \? cellsFor\(this\.plate\.size\[0\], false\)/);
-  assert.match(extents, /cellsY = this\.plate \? cellsFor\(this\.plate\.size\[1\], false\)/);
-  assert.match(extents, /this\.plate\.size\[0\] \/ 2 \/ spacing/);
-  const buffer = javascript.slice(javascript.indexOf('  ensureGroundBuffer(metrics) {'), javascript.indexOf('  drawGround(mvp, metrics) {'));
-  // The bed rectangle and the build-volume box are separate ranges in the same buffer.
-  assert.match(buffer, /const bed = \[\];/);
-  assert.match(buffer, /const volume = \[\];/);
-  const drawing = javascript.slice(javascript.indexOf('  drawGround(mvp, metrics) {'), javascript.indexOf('  drawGroundLabels(metrics) {'));
-  // The bed edge is a datum, so it shares the origin line colour.
-  assert.match(drawing, /geometry\.bed\.count.*0\.416, 0\.463, 0\.514/);
-  // Labels follow the rectangle rather than a single square extent.
-  const labels = javascript.slice(javascript.indexOf('  drawGroundLabels(metrics) {'), javascript.indexOf('  gridlineAnchor(from, to, margin) {'));
-  assert.match(labels, /metrics\.extentY/);
-  assert.match(labels, /metrics\.extentX/);
-});
-
-test('the plate is optional, defaults to none, and is offered grouped by brand', () => {
-  assert.match(html, /id="plateSelect"/);
-  // No hard-coded options: the catalogue is the single source of truth for both.
-  assert.doesNotMatch(html, /<option[^>]*value="bambu/);
-  const populating = javascript.slice(javascript.indexOf('function populatePlateSelect()'), javascript.indexOf('// Reflects the current bed'));
-  assert.match(populating, /none\.value = '';/);
-  assert.match(populating, /createElement\('optgroup'\)/);
-  assert.match(populating, /optgroup\.label = group\.brand/);
-  const restoring = javascript.slice(javascript.indexOf('function restorePlatePreference()'), javascript.indexOf("$('#plateSelect').addEventListener"));
-  // Nothing stored means no plate, so the viewport opens on the model-driven grid.
-  assert.match(restoring, /localStorage\.getItem\(PLATE_STORAGE_KEY\) \|\| ''/);
-});
-
-test('the plate and tolerance persist in the workspace AND into new workspaces', () => {
+test('the tolerance persists in the workspace AND into new workspaces; a saved plate is left alone', () => {
   // localStorage: carried into every NEW workspace.
-  assert.match(javascript, /const PLATE_STORAGE_KEY = 'reopenscad\.plate';/);
-  assert.match(javascript, /localStorage\.setItem\(PLATE_STORAGE_KEY/);
+  assert.doesNotMatch(javascript, /PLATE_STORAGE_KEY|reopenscad\.plate|reopenscad\.ground|groundToggle|axesToggle/);
   const creating = javascript.slice(javascript.indexOf('async function createWorkspace('), javascript.indexOf('async function loadWorkspace('));
-  assert.match(creating, /plate: localStorage\.getItem\(PLATE_STORAGE_KEY\) \|\| ''/);
+  assert.doesNotMatch(creating, /plate:/);
   // `|| DEFAULT_TOLERANCE` would resurrect 0.2 from a deliberate 0 mm clearance.
   assert.match(creating, /tolerance: readTolerance\(\) \?\? DEFAULT_TOLERANCE/);
   assert.doesNotMatch(creating, /Number\(localStorage\.getItem\(TOLERANCE_STORAGE_KEY\)\) \|\|/);
@@ -526,23 +434,22 @@ test('the plate and tolerance persist in the workspace AND into new workspaces',
   // Server side: travels with the workspace URL.
   const settings = javascript.slice(javascript.indexOf('function saveWorkspaceSettings()'), javascript.indexOf('function scheduleWorkspaceSave('));
   assert.match(settings, /method: 'PATCH'/);
-  assert.match(settings, /plate: meshViewport\.plate \? meshViewport\.plate\.id : ''/);
+  // Never sent, so a PATCH cannot wipe what agents' print tools read from the design.
+  assert.doesNotMatch(settings, /plate:/);
   assert.match(settings, /tolerance: readTolerance\(\) \?\? DEFAULT_TOLERANCE/);
   // Settings are not an edit: no baseRevision, so they can never conflict with a code save.
   assert.doesNotMatch(settings, /baseRevision/);
   const applying = javascript.slice(javascript.indexOf('function applyWorkspaceSettings('), javascript.indexOf('function applyWorkspace('));
-  assert.match(applying, /typeof workspace\.plate === 'string'/);
+  assert.doesNotMatch(applying, /plate/i);
   assert.match(applying, /Number\(workspace\.tolerance\)/);
   assert.match(javascript, /applyWorkspaceSettings\(workspace\);/);
   // Both settings write through to localStorage, so what the URL carried becomes the default.
-  assert.match(applying, /localStorage\.setItem\(PLATE_STORAGE_KEY/);
   assert.match(applying, /localStorage\.setItem\(TOLERANCE_STORAGE_KEY/);
   // Changing the tolerance now reaches the server too, not just localStorage.
   const tolerance = javascript.slice(javascript.indexOf("$('#toleranceInput').addEventListener"), javascript.indexOf('async function checkIntersections()'));
   assert.match(tolerance, /saveWorkspaceSettings\(\)/);
   const bootstrapping = javascript.slice(javascript.indexOf('async function bootstrap()'), javascript.indexOf('// Back/forward moves between workspaces'));
-  assert.match(bootstrapping, /populatePlateSelect\(\)/);
-  assert.match(bootstrapping, /restorePlatePreference\(\)/);
+  assert.doesNotMatch(bootstrapping, /Plate|restoreGround/);
 });
 
 test('an in-flight settings save cannot be undone by a stale remote payload', () => {
@@ -567,42 +474,17 @@ test('an in-flight settings save cannot be undone by a stale remote payload', ()
   assert.match(applying, /settingsSavesInFlight\.has\(String\(workspace\.id \?\? workspaceId\)\)/);
 });
 
-test('opening a plateless workspace never erases the plate the user owns', () => {
-  const applying = javascript.slice(javascript.indexOf('function applyWorkspaceSettings('), javascript.indexOf('function applyWorkspace('));
-  // Every legacy and every plateless workspace serializes plate:"" via the serde default.
-  // Writing that through would mean visiting one shared link wiped the local default, and
-  // the next NEW workspace would come up bare — the exact thing the spec asks us to keep.
-  assert.match(applying, /if \(plate\) localStorage\.setItem\(PLATE_STORAGE_KEY, plate\.id\)/);
-  assert.doesNotMatch(applying, /localStorage\.setItem\(PLATE_STORAGE_KEY, plate \? plate\.id : ''\)/);
-  // The workspace is still authoritative for its own viewport: the empty plate IS applied.
-  assert.match(applying, /const plate = applyPlate\(workspace\.plate\)/);
-  // A forced conflict resolution replays a snapshot captured when the banner appeared, so
-  // its settings are stale and must not roll back a plate changed since.
-  assert.match(javascript, /if \(!force\) applyWorkspaceSettings\(workspace\);/);
-  // A preference naming a printer this build dropped must not be forwarded to the server.
-  const restoring = javascript.slice(javascript.indexOf('function restorePlatePreference()'), javascript.indexOf('function frameForPlate('));
-  assert.match(restoring, /if \(stored && !plate\) localStorage\.removeItem\(PLATE_STORAGE_KEY\)/);
-});
-
-test('choosing a plate frames it, and a settings PATCH is never charged an evaluator permit', () => {
-  // Selecting a 350 mm bed while zoomed onto a 20 mm part would leave the bed off-screen,
-  // so the only visible effect would be the grid getting coarser.
-  const framing = javascript.slice(javascript.indexOf('function frameForPlate(plate)'), javascript.indexOf("$('#plateSelect').addEventListener"));
-  assert.match(framing, /Math\.max\(plate\.size\[0\], plate\.size\[1\], plate\.size\[2\]\)/);
-  assert.match(framing, /Math\.max\(span \* 1\.9, meshViewport\.radius \* 4, 20\)/);
-  const listener = javascript.slice(javascript.indexOf("$('#plateSelect').addEventListener"), javascript.indexOf("$('#viewport').addEventListener('wheel'"));
-  assert.match(listener, /if \(plate\) frameForPlate\(plate\)/);
+test('settings sync on every poll', () => {
   // Settings sync on every poll: they are revisionless, so `changed` says nothing about them.
   const polling = javascript.slice(javascript.indexOf('function beginWorkspacePolling'), javascript.indexOf('function normalizeObjects'));
   assert.match(polling, /applyWorkspaceSettings\(\{ \.\.\.workspaceFromPayload\(payload\), id \}\)/);
-  assert.ok(polling.indexOf('applyWorkspaceSettings(') < polling.indexOf('payload.changed === true'));
+  assert.ok(polling.indexOf('applyWorkspaceSettings(') < polling.indexOf('workspacePollAction('));
 });
 
 test('settings arriving on every poll are applied only when they actually changed', () => {
   // The poll runs twice a second. Reassigning unconditionally would redraw the viewport
   // continuously and reset the select and tolerance field out from under a user mid-edit.
   const applying = javascript.slice(javascript.indexOf('function applyWorkspaceSettings('), javascript.indexOf('function applyWorkspace('));
-  assert.match(applying, /workspace\.plate !== \(meshViewport\.plate\?\.id \?\? ''\)/);
   assert.match(applying, /tolerance !== readTolerance\(\)/);
 });
 
@@ -619,7 +501,7 @@ test('the MCP panel is reachable from the toolbar and never invents its own endp
   assert.match(javascript, /function mcpEndpointUrl\(\) \{\s*return `\$\{location\.origin\}\/mcp`;/);
   // A hardcoded dev host would be wrong the moment this is deployed. The one surviving
   // mention is prose explaining why Claude Desktop's connector UI rejects loopback.
-  assert.equal(javascript.match(/127\.0\.0\.1:5173/g), null);
+  assert.equal(javascript.match(/127\.0\.0\.1:5180/g), null);
   assert.equal(html.match(/127\.0\.0\.1|localhost/g), null);
 });
 
@@ -652,22 +534,78 @@ test('the smoke test and the tool list come from the live server, not from a cop
 });
 
 test('per-client setup snippets match the shape each client actually documents', () => {
-  const clients = javascript.slice(javascript.indexOf('const MCP_CLIENTS = ['), javascript.indexOf('function selectedMcpClient()'));
+  const clients = javascript.slice(javascript.indexOf('const MCP_CLIENTS = ['), javascript.indexOf('function storedMcpClientId()'));
   // Claude Code's CLI transport keyword is `http`, not `streamable-http`.
   assert.match(clients, /claude mcp add --scope user --transport http reopenscad/);
   // VS Code's top-level key is `servers`; using mcpServers there silently does nothing.
-  assert.match(clients, /JSON\.stringify\(\{ servers: \{ reopenscad: \{ type: 'http', url: endpoint \} \} \}/);
+  assert.match(clients, /JSON\.stringify\(\{ servers: \{ reopenscad: \{ type: 'http', url: ctx\.endpoint \} \} \}/);
   // Cursor identifies a remote server by the presence of `url`; `type` is stdio-only.
-  assert.match(clients, /JSON\.stringify\(\{ mcpServers: \{ reopenscad: \{ url: endpoint \} \} \}/);
+  assert.match(clients, /JSON\.stringify\(\{ mcpServers: \{ reopenscad: \{ url: ctx\.endpoint \} \} \}/);
   // Windsurf and Gemini CLI each use their own key name for the same URL.
-  assert.match(clients, /serverUrl: endpoint/);
-  assert.match(clients, /httpUrl: endpoint/);
+  assert.match(clients, /serverUrl: ctx\.endpoint/);
+  assert.match(clients, /httpUrl: ctx\.endpoint/);
+  // Codex takes a URL directly; OpenCode marks the entry as remote.
+  assert.match(clients, /codex mcp add reopenscad --url \$\{ctx\.endpoint\}/);
+  assert.match(clients, /type: 'remote', url: ctx\.endpoint/);
+  assert.match(clients, /amp mcp add reopenscad \$\{ctx\.endpoint\}/);
+  // Pi has no built-in MCP; the panel names the community adapter it relies on.
+  assert.match(clients, /pi install npm:pi-mcp-adapter/);
   // Claude Desktop's config file has no url field at all, so it needs a stdio bridge —
   // and the panel has to say that the bridge is not an Anthropic-documented tool.
   assert.match(clients, /'mcp-remote'/);
   assert.match(clients, /community bridge/);
-  // Every snippet is built from the live endpoint.
-  assert.equal(clients.match(/https?:\/\/(?!code\.claude|cursor|code\.visualstudio|modelcontextprotocol)/g), null);
+  // Cursor's install link carries the inner config as base64 JSON.
+  assert.match(clients, /cursor:\/\/anysphere\.cursor-deeplink\/mcp\/install\?name=reopenscad&config=\$\{encodeURIComponent\(mcpBase64Json\(\{ url: ctx\.endpoint \}\)\)\}/);
+  // Every snippet is built from the live endpoint; the only absolute URLs are vendor pages.
+  const vendors = /^https:\/\/(code\.claude\.com|support\.claude\.com|claude\.ai|archestra\.ai|developers\.openai\.com|opencode\.ai|docs\.x\.ai|grok\.com|chatgpt\.com|cursor\.com|hermes-agent\.nousresearch\.com|ampcode\.com|pi\.dev|docs\.openclaw\.ai|modelcontextprotocol\.io)\//;
+  for (const [url] of clients.matchAll(/https?:\/\/[^\s'"`<]+/g)) assert.match(url, vendors, url);
+});
+
+test('the connect panel is a grid of agents with logos and plain-language steps', () => {
+  const clients = javascript.slice(javascript.indexOf('const MCP_CLIENTS = ['), javascript.indexOf('function storedMcpClientId()'));
+  const ids = [...clients.matchAll(/^    id: '([a-z-]+)',$/gm)].map((match) => match[1]);
+  assert.deepEqual(ids, ['archestra', 'claude-code', 'claude', 'codex', 'opencode', 'amp', 'pi', 'grok', 'dot', 'cursor', 'hermes', 'openclaw', 'other']);
+  // Every logo is a small file served from the web root, and shipped by the image.
+  for (const [, logo] of clients.matchAll(/logo: '\/(logos\/[a-z]+\.(?:svg|png))'/g)) {
+    const file = new URL(`../${logo}`, import.meta.url);
+    assert.ok(fs.existsSync(file), logo);
+    assert.ok(fs.statSync(file).size < 8 * 1024, `${logo} is too large`);
+  }
+  assert.match(fs.readFileSync(new URL('../Dockerfile', import.meta.url), 'utf8'), /^COPY logos \/app\/web\/logos$/m);
+  // Raw config sits behind a disclosure, not in the steps.
+  assert.match(html, /<details class="connect-details">/);
+  assert.match(javascript, /<details class="connect-more">/);
+});
+
+test('the landing page offers every agent and each opens its walkthrough', () => {
+  const hero = html.slice(html.indexOf('<section class="landing-hero">'), html.indexOf('</section>', html.indexOf('<section class="landing-hero">')));
+  // The agent grid is the call to action; a blank design is the quiet alternative after it.
+  assert.ok(hero.indexOf('id="landingAgents"') < hero.indexOf('id="landingNew"'));
+  assert.match(hero, /<h2 id="landingAgentsLabel">Connect your agent<\/h2>/);
+  // No generic "Connect AI agent" button that only re-opens the same list in a popup.
+  assert.doesNotMatch(hero, /landingConnect/);
+  assert.doesNotMatch(javascript, /landingConnect/);
+  assert.doesNotMatch(css, /\.landing-connect/);
+  // The catch-all entry gets a title that reads as a sentence.
+  assert.match(javascript, /title: 'Connect any MCP client',/);
+  assert.match(javascript, /\$\('#mcpTitle'\)\.textContent = client\.title \|\| `Connect \$\{client\.label\}`;/);
+  // No "More agents" detour: the grid lists every client the connect panel knows.
+  assert.doesNotMatch(hero, /landingMoreAgents/);
+  assert.doesNotMatch(javascript, /landingMoreAgents/);
+  const clients = javascript.slice(javascript.indexOf('const MCP_CLIENTS = ['), javascript.indexOf('function storedMcpClientId()'));
+  const clientIds = [...clients.matchAll(/^    id: '([a-z-]+)',$/gm)].map((match) => match[1]);
+  const landingIds = [...javascript.match(/const LANDING_AGENT_IDS = \[([^\]]+)\];/)[1].matchAll(/'([a-z-]+)'/g)].map((match) => match[1]);
+  assert.deepEqual([...landingIds].sort(), [...clientIds].sort());
+  assert.deepEqual(landingIds.slice(0, 6), ['claude-code', 'claude', 'codex', 'cursor', 'archestra', 'opencode']);
+  // Logos keep their brand colours: real images, not masks tinted to the text colour.
+  assert.match(javascript.slice(javascript.indexOf('function renderLandingAgents()'), javascript.indexOf('function renderMcpTools(')), /<span class="agent-mark"[^`]*><img src="\$\{escapeHtml\(client\.logo\)\}"/);
+  assert.doesNotMatch(css, /\.landing-agent-grid \.agent-mark \{[^}]*mask:/);
+  assert.match(javascript, /\$\('#landingAgents'\)\.addEventListener\('click'[\s\S]{0,160}openMcpPanel\(agent\.dataset\.agent\)/);
+  assert.match(javascript, /function openMcpPanel\(agentId\) \{[\s\S]{0,300}if \(agentId\) showMcpClient\(agentId\);/);
+  // The demo video slot keeps a placeholder until web/media/ holds the ad.
+  assert.match(hero, /<div class="landing-video" id="landingVideoFrame" data-state="loading">/);
+  assert.match(hero, /<video id="landingVideo" muted playsinline/);
+  assert.match(css, /\.landing-video:not\(\[data-state="ready"\]\):not\(\[data-state="loading"\]\) \.landing-video-play \{ display: none; \}/);
 });
 
 test('the workspace id is surfaced so it can be handed to an agent', () => {
@@ -675,7 +613,11 @@ test('the workspace id is surfaced so it can be handed to an agent', () => {
   // out of the address bar and guess which part is the id.
   assert.match(javascript, /\$\('#mcpWorkspaceId'\)\.textContent = workspaceId \|\| 'not created yet'/);
   assert.match(javascript, /function mcpAgentBriefing\(endpoint, workspace\)/);
-  assert.match(javascript, /My workspace id is \$\{workspace\}/);
+  assert.match(javascript, /My design id is \$\{workspace\}/);
+  // Starter prompts are plain language: no endpoint URL, no tool names.
+  const briefing = javascript.slice(javascript.indexOf('function mcpAgentBriefing('), javascript.indexOf('// base64 of UTF-8 JSON'));
+  assert.match(briefing, /Use reopenscad to design a toy car, then give me the design link so I can check it\./);
+  assert.doesNotMatch(briefing, /\$\{endpoint\}|get_design_code|check_intersections|tolerance/);
 });
 
 test('the header carries workspace identity and nothing else', () => {
@@ -686,13 +628,13 @@ test('the header carries workspace identity and nothing else', () => {
   assert.match(header, /class="brand-credit"/);
   assert.match(css, /\.brand-credit \{[^}]*font: 400 8px/);
   assert.match(css, /\.brand-credit \{ display: none; \}/);
-  // The workspace explainer sentence and its animated "point up here" arrow explained
-  // the address bar to the address bar. Nobody asked for either.
+  // The old explainer paragraph and its animated arrow stay gone; the one-line URL hint
+  // replaced them and does not move.
   assert.doesNotMatch(header, /workspace-explainer|explainer-more/);
   assert.doesNotMatch(css, /workspace-explainer|explainer-more|@keyframes pointUp/);
-  // What is left: the brand, the copyable workspace link, the sync state, the engine pill.
+  // What is left: the brand, the URL hint, the sync state, the engine pill.
   assert.match(header, /class="brand"/);
-  assert.match(header, /id="copyWorkspaceLink"/);
+  assert.match(header, /class="url-hint"/);
   assert.match(header, /id="syncState"/);
   assert.match(header, /id="enginePill"/);
 });
@@ -700,7 +642,7 @@ test('the header carries workspace identity and nothing else', () => {
 test('the status bar states, in visible text, that this is not the OpenSCAD project', () => {
   const footer = html.slice(html.indexOf('<footer class="status-bar">'), html.indexOf('</footer>'));
   // "Inspired by OpenSCAD" in the header reads as a nod; it does not deny a
-  // relationship. The disclaimer is its own always-on-screen line, and it is
+  // relationship. The attribution is its own always-on-screen line, and it is
   // text content, not a title= tooltip nobody hovers.
   assert.match(footer, /class="status-attribution"/);
   assert.match(footer, /Independent reimplementation[^<]*not affiliated with or endorsed by the/);
@@ -727,15 +669,15 @@ test('the engine pill stays silent while the compiler is healthy', () => {
   assert.doesNotMatch(html, /ReOpenSCAD 0\.1|id="engineVersion"/);
 });
 
-test('the header elides the workspace id instead of growing past its 42px row', () => {
+test('the header URL hint elides instead of growing past its 42px row', () => {
   // Nothing here may make the header taller: the shell pins the row.
   assert.match(css, /\.app-shell \{ display: grid; grid-template-rows: 42px /);
   assert.match(css, /\.workspace-identity \{[^}]*min-width: 0/);
   assert.match(css, /\.engine-pill \{ flex: none/);
-  // A 40-character workspace id would otherwise push the engine pill off the window.
-  assert.match(css, /\.workspace-link \{ flex: 0 1 auto; min-width: 0/);
-  assert.match(css, /\.workspace-link #workspaceName \{[^}]*text-overflow: ellipsis/);
-  // The sync state is what gives way first on a narrow window; the link itself survives.
+  // The hint would otherwise push the engine pill off a narrow window.
+  assert.match(css, /\.url-hint \{ flex: 0 1 auto; min-width: 0/);
+  assert.match(css, /\.url-hint span \{[^}]*text-overflow: ellipsis/);
+  // The sync state is what gives way first on a narrow window.
   const narrow = css.slice(css.indexOf('@media (max-width: 900px)'), css.indexOf('@media (max-width: 720px)'));
   assert.match(narrow, /\.sync-state \{ display: none; \}/);
 });
@@ -754,11 +696,18 @@ test('no orphaned element ids or unreachable CSS classes accumulate in the shell
   assert.deepEqual(orphanClasses, [], 'CSS rules that can never match');
 });
 
-test('the copy-link button survived the header rework', () => {
-  assert.match(html, /id="copyWorkspaceLink" class="workspace-link" title="[^"]+"/);
-  assert.match(html, /id="workspaceName"/);
-  assert.match(javascript, /navigator\.clipboard\.writeText\(location\.href\)/);
-  assert.match(javascript, /label\.textContent = 'link copied'/);
+test('the header points at the address bar instead of repeating the design id', () => {
+  const header = html.slice(html.indexOf('<header class="app-header">'), html.indexOf('</header>'));
+  assert.match(header, /<p class="url-hint"[^>]*>\s*<svg[^>]*aria-hidden="true"/);
+  assert.match(header, /Use this URL to access your design at any time/);
+  // The id chip and its copy button are gone; the Share popover's edit link copies the URL.
+  assert.doesNotMatch(`${html}\n${javascript}`, /copyWorkspaceLink|workspaceName|workspace-link/);
+  assert.match(html, /data-copy="shareEditLink"/);
+  assert.match(javascript, /\$\('#shareEditLink'\)\.value = workspaceEditUrl\(\)/);
+  // A read-only viewer's URL is not an edit key, and a phone has no room for the line.
+  assert.match(css, /body\.read-only \.url-hint \{ display: none; \}/);
+  const phone = css.slice(css.indexOf('@media (max-width: 720px)'), css.indexOf('@media (any-pointer: coarse)'));
+  assert.match(phone, /\.url-hint \{ display: none; \}/);
 });
 
 // --- Long renders -------------------------------------------------------------------
@@ -857,14 +806,15 @@ test('the render overlay counts real elapsed time and invents no progress', () =
   assert.match(ticker, /if \(activeRender !== request\) \{ stopRenderElapsed\(\); return; \}/);
   // No fabricated completion signal anywhere in the overlay.
   assert.doesNotMatch(javascript, /progressBar|percentComplete|\.progress\s*=\s*\d/);
-  assert.doesNotMatch(html, /<progress|role="progressbar"/);
+  const overlay = html.slice(html.indexOf('id="renderOverlay"'), html.indexOf('id="renderFailure"'));
+  assert.doesNotMatch(overlay, /<progress|role="progressbar"/);
   // The ticker is always retired with the render that owns it.
   assert.match(javascript, /stopRenderElapsed\(\);\n      renderOverlay\.hidden = true;/);
 });
 
 test('a long render is abortable from the overlay that is covering the viewport', () => {
   assert.match(html, /id="overlayCancel"/);
-  assert.match(javascript, /\$\('#overlayCancel'\)\.addEventListener\('click', \(\) => cancelRender\(\)\)/);
+  assert.match(javascript, /\$\('#overlayCancel'\)\.addEventListener\('click', cancelRenderByUser\)/);
   // Both affordances reach the same abort: the local fetch AND the server-side flag.
   const cancel = javascript.slice(javascript.indexOf('function cancelRender('), javascript.indexOf('function downloadBlob('));
   assert.match(cancel, /request\.controller\.abort\(\)/);
@@ -885,106 +835,12 @@ test('render response geometry is decoded once, not once per copy', () => {
   assert.match(javascript, /triangles: decoded\.triangles, min: decoded\.min, max: decoded\.max/);
 });
 
-test('the first-use disclaimer states the terms it exists to state', () => {
-  const dialog = html.slice(html.indexOf('<div class="mcp-modal disclaimer-modal"'), html.indexOf('<script src="/app.js"'));
-  assert.match(dialog, /hobby project/i);
-  assert.match(dialog, /demonstration purposes/i);
-  assert.match(dialog, /<b>as is<\/b>/);
-  assert.match(dialog, /<b>no warranty<\/b>/);
-  assert.match(dialog, /<b>no liability<\/b>/);
-  assert.match(dialog, /<b>Workspaces are not private\.<\/b>/);
-  assert.match(dialog, /the URL is the only key/);
-  // The retention paragraph is gone with the policy it described. Workspaces
-  // no longer expire on a clock, so a dialog still saying they are "deleted
-  // automatically after two weeks" would be warning about something that
-  // cannot happen — and a false warning is worse than none, because it is the
-  // one someone would act on.
-  assert.doesNotMatch(dialog, /deleted automatically/);
-  assert.doesNotMatch(dialog, /two weeks/);
-  assert.doesNotMatch(dialog, /does not keep it alive/);
-  assert.doesNotMatch(dialog, /only the \d+ most recent are kept/);
-  assert.match(dialog, /Verify it before you print or manufacture/);
-});
-
-test('the disclaimer reuses the status bar non-affiliation sentence instead of restating it', () => {
-  const dialog = html.slice(html.indexOf('<div class="mcp-modal disclaimer-modal"'), html.indexOf('<script src="/app.js"'));
-  // The dialog ships an empty slot; the wording is lifted out of the status bar
-  // at open time, so there is exactly one copy of the sentence in the product.
-  assert.match(dialog, /<p class="disclaimer-affiliation" id="disclaimerAffiliation"><\/p>/);
-  assert.doesNotMatch(dialog, /not affiliated/i);
-  assert.match(javascript, /\$\('#disclaimerAffiliation'\)\.textContent = \$\('\.status-attribution > span'\)\?\.textContent\.trim\(\)/);
-  assert.equal((html.match(/not affiliated with or endorsed by/g) || []).length, 1);
-});
-
-test('the disclaimer is acknowledged once, under a versioned key', () => {
-  assert.match(javascript, /const DISCLAIMER_REVISION = \d+;/);
-  assert.match(javascript, /const DISCLAIMER_STORAGE_KEY = `reopenscad\.disclaimerAck\.v\$\{DISCLAIMER_REVISION\}`;/);
-  const gate = javascript.slice(javascript.indexOf('function disclaimerAcknowledged'), javascript.indexOf('function openDisclaimer'));
-  assert.match(gate, /localStorage\.getItem\(DISCLAIMER_STORAGE_KEY\) === '1'/);
-  // Storage is unavailable in some contexts; neither reading nor writing it may
-  // throw out of bootstrap.
-  assert.match(gate, /catch \{\s*return false;/);
-  const accept = javascript.slice(javascript.indexOf('function acceptDisclaimer'), javascript.indexOf('function disclaimerFocusables'));
-  assert.match(accept, /try \{\s*localStorage\.setItem\(DISCLAIMER_STORAGE_KEY, '1'\);\s*\} catch/);
-  assert.match(accept, /closeDisclaimer\(\)/);
-});
-
-test('dismissing the disclaimer takes a deliberate press of its one button', () => {
-  const dialog = html.slice(html.indexOf('<div class="mcp-modal disclaimer-modal"'), html.indexOf('<script src="/app.js"'));
-  assert.match(dialog, /id="acceptDisclaimer">I understand</);
-  // No close glyph and, unlike #mcpScrim, no id on the scrim to hang a
-  // click-to-dismiss listener from.
-  assert.doesNotMatch(dialog, /mcp-close/);
-  assert.match(dialog, /<div class="mcp-scrim"><\/div>/);
-  assert.match(javascript, /\$\('#acceptDisclaimer'\)\.addEventListener\('click', acceptDisclaimer\)/);
-  // Escape closes the MCP panel and must not close this one: a reflex keypress
-  // is not an acknowledgement.
-  const wiring = javascript.slice(javascript.indexOf('// ---- First-use disclaimer'), javascript.indexOf("const syncControl = $('#syncState')"));
-  assert.doesNotMatch(wiring, /'Escape'/);
-});
-
-test('the disclaimer is a labelled modal that traps focus and gives it back', () => {
-  const dialog = html.slice(html.indexOf('<div class="mcp-modal disclaimer-modal"'), html.indexOf('<script src="/app.js"'));
-  assert.match(dialog, /role="dialog" aria-modal="true" aria-labelledby="disclaimerTitle" aria-describedby="disclaimerBody"/);
-  assert.match(dialog, /<h2 id="disclaimerTitle">/);
-  const open = javascript.slice(javascript.indexOf('function openDisclaimer'), javascript.indexOf('function closeDisclaimer'));
-  assert.match(open, /disclaimerReturnFocus = document\.activeElement/);
-  assert.match(open, /\$\('#acceptDisclaimer'\)\.focus\(\)/);
-  const close = javascript.slice(javascript.indexOf('function closeDisclaimer'), javascript.indexOf('function acceptDisclaimer'));
-  assert.match(close, /restore\.isConnected && restore !== document\.body\) restore\.focus\(\)/);
-  assert.match(close, /else editor\.focus\(\)/);
-  // Tab wraps inside the dialog, and a focusin backstop catches focus the app
-  // moves programmatically while the dialog is up.
-  const wiring = javascript.slice(javascript.indexOf('// ---- First-use disclaimer'), javascript.indexOf("const syncControl = $('#syncState')"));
-  assert.match(wiring, /if \(event\.key !== 'Tab'\) return;/);
-  assert.match(wiring, /event\.preventDefault\(\); last\.focus\(\);/);
-  assert.match(wiring, /event\.preventDefault\(\); first\.focus\(\);/);
-  assert.match(wiring, /document\.addEventListener\('focusin'/);
-});
-
-test('the disclaimer never blocks the boot path, and can be reopened later', () => {
+test('booting opens the routed workspace without creating one', () => {
   const boot = javascript.slice(javascript.indexOf('async function bootstrap()'), javascript.indexOf('// Back/forward moves between workspaces'));
-  // Fire-and-forget: not awaited, and it precedes nothing it could reorder.
-  assert.match(boot, /^ {2}showDisclaimerIfUnacknowledged\(\);$/m);
-  assert.doesNotMatch(boot, /await showDisclaimerIfUnacknowledged/);
-  assert.ok(boot.indexOf('showDisclaimerIfUnacknowledged()') < boot.indexOf('createWorkspace'));
-  assert.match(boot, /await createWorkspace\(''\)/);
+  // Booting never creates a workspace: "/" is the landing page.
+  assert.doesNotMatch(boot, /createWorkspace\(/);
+  assert.match(boot, /await openWorkspaceRoute\(\)/);
   assert.match(boot, /setTimeout\(\(\) => render\('preview'\), 180\)/);
-  // Dismissal is not irreversible: the status bar keeps a way back to it.
-  assert.match(html, /id="showDisclaimer"/);
-  assert.match(javascript, /\$\('#showDisclaimer'\)\.addEventListener\('click', openDisclaimer\)/);
-});
-
-test('the disclaimer borrows the MCP modal shell rather than adding a second one', () => {
-  const dialog = html.slice(html.indexOf('<div class="mcp-modal disclaimer-modal"'), html.indexOf('<script src="/app.js"'));
-  assert.match(dialog, /class="mcp-modal disclaimer-modal"/);
-  assert.match(dialog, /class="mcp-dialog disclaimer-dialog"/);
-  assert.match(dialog, /class="mcp-body disclaimer-body"/);
-  assert.match(css, /\.disclaimer-dialog \{ grid-template-rows: auto minmax\(0, 1fr\) auto;/);
-  // It sits above the MCP modal's z-index so it can never be buried.
-  assert.match(css, /\.disclaimer-modal \{ z-index: 60; \}/);
-  // Reading width, not the MCP panel's 960px workbench.
-  assert.match(css, /\.disclaimer-dialog \{[^}]*width: min\(520px, 100%\)/);
 });
 
 // The camera maths is pulled out of the source and run for real rather than pattern
@@ -1002,6 +858,7 @@ function cameraModule() {
     const view = new View();
     view.center = [4, -6, 3];
     view.radius = 50;
+    view.orthoRadius = 50;
     view.draw = () => {};
     // Deliberately a 2x device pixel ratio: with device px equal to CSS px, dividing by
     // canvas.height instead of clientHeight would pass the 1:1 check below unnoticed.
@@ -1093,14 +950,14 @@ test('each projection supplies its own screen-to-world scale', () => {
   // 32 degree vertical field of view, measured in the plane through the pivot.
   assert.ok(Math.abs(perspective.worldPerPixel() - 2 * 140 * Math.tan(16 * Math.PI / 180) / 600) < 1e-9);
   const orthographic = make(camera, 'orthographic').view;
-  assert.ok(Math.abs(orthographic.worldPerPixel() - 2 * Math.max(50 * 1.35, 140 * 0.36) / 600) < 1e-9);
+  assert.ok(Math.abs(orthographic.worldPerPixel() - 2 * Math.max(50 * 0.007, 140 * 0.36) / 600) < 1e-9);
   // Getting the two confused is the classic pan bug, so they must actually differ here.
   assert.notEqual(perspective.worldPerPixel(), orthographic.worldPerPixel());
   // Each frame constant has exactly one definition, shared by the projection matrix, the
   // grid's view span and the pan scale: three copies of the field of view is how a pan
   // silently stops tracking the cursor.
   const viewport = javascript.slice(javascript.indexOf('class MeshViewport'), javascript.indexOf('const meshViewport = new MeshViewport'));
-  assert.equal((viewport.match(/this\.radius \* 1\.35, camera\[6\] \* 0\.36/g) || []).length, 1);
+  assert.equal((viewport.match(/this\.orthoRadius \* 0\.007, camera\[6\] \* 0\.36/g) || []).length, 1);
   assert.equal((javascript.match(/32 \* Math\.PI \/ 180/g) || []).length, 1, 'the field of view is a named constant, not a repeated literal');
   assert.match(viewport, /orthoHalfHeight\(\) \{/);
   assert.match(viewport, /frameHeight\(\) \{/);
@@ -1142,7 +999,7 @@ test('pan uses the bindings CAD users already have, and orbit keeps the plain dr
   assert.match(javascript, /function isPanGesture\(event\) \{[\s\S]*?\(event\.button === 1 && !event\.shiftKey\)/);
   assert.match(javascript, /function isPanGesture\(event\) \{[\s\S]*?event\.button === 2/);
   assert.doesNotMatch(javascript, /function isPanGesture\(event\) \{[\s\S]*?event\.button === 0 && event\.shiftKey/);
-  const pointer = javascript.slice(javascript.indexOf("renderCanvas.addEventListener('pointerdown'"), javascript.indexOf("$('#customizerButton').addEventListener"));
+  const pointer = javascript.slice(javascript.indexOf("renderCanvas.addEventListener('pointerdown'"), javascript.indexOf("$('#clearConsole').addEventListener"));
   // One press can only ever mean one gesture, and a second pointer cannot hijack a live one.
   assert.match(pointer, /if \(orbitStart \|\| panStart\) return;/);
   // The middle button is admitted even when it is not a pan, because Shift + middle
@@ -1166,7 +1023,7 @@ test('pan uses the bindings CAD users already have, and orbit keeps the plain dr
   assert.match(wheel, /panView\(\[camera\[0\], camera\[1\], camera\[2\]\], -event\.deltaX \* unit, -event\.deltaY \* unit\);/);
   // Firefox reports wheel deltas in lines, and panView is defined in pixels.
   assert.match(wheel, /event\.deltaMode === 1 \? 16 : event\.deltaMode === 2 \? renderCanvas\.clientHeight : 1/);
-  assert.match(wheel, /camera\[6\] = Math\.max\(meshViewport\.radius \* 1\.15/);
+  assert.match(wheel, /camera\[6\] = Math\.max\(meshViewport\.radius \* 0\.02/);
   // Discoverable, and the mode is visible while it is happening.
   const viewHint = html.slice(html.indexOf('<div class="view-hint">'), html.indexOf('<div class="viewport-fab">'));
   // The hint names every binding the handlers actually accept, and no others.
@@ -1263,13 +1120,20 @@ test('no outbound link may carry the workspace URL in its Referer', () => {
   assert.deepEqual(leaking, []);
 });
 
-test('the disclaimer and the copy affordance both say the link is the key', () => {
-  assert.match(html, /<b>Workspaces are not private\.<\/b>/);
-  assert.match(html, /the URL is the only key/);
-  assert.match(html, /id="copyWorkspaceLink"[^>]*title="[^"]*only key/);
+test('the URL hint says the link is the key', () => {
+  assert.match(html, /class="url-hint"[^>]*title="[^"]*only key/);
 });
 
 test('nothing writes a workspace id to the console', () => {
   // console.* survives into shared screens, extensions and crash reporters.
   assert.doesNotMatch(javascript, /console\.(log|info|warn|error|debug)\s*\(/);
+});
+
+test('an object painted in several colours draws each colour run with its own material', () => {
+  // `faceColors` (palette + [first, count, slot] runs) becomes batch.runs, one pass per run.
+  assert.match(javascript, /this\.createMeshBatch\(object\.id, object\.mesh, object\.faceColors\)/);
+  assert.match(javascript, /batch\.runs\.map\(\(run\) => \(\{ batch, object, material: meshMaterial\(object, batch\.id, run\.color\), first: run\.first, count: run\.count \}\)\)/);
+  assert.match(javascript, /gl\.drawArrays\(gl\.TRIANGLES, first \* 3, count \* 3\)/);
+  // A run's own colour (null = default material) overrides the object's.
+  assert.match(javascript, /const stated = faceColor === undefined \? object\?\.color : faceColor;/);
 });

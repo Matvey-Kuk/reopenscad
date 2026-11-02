@@ -30,12 +30,13 @@ module stake_outline() {
              [-stake_width/2,-shoulder_length]]);
 }
 
-union() {
+color("#89c454") union() {
     linear_extrude(thickness) union() {
         label_outline();
         stake_outline();
     }
-    translate([0,label_height/2,thickness-cut_extra])
+    // Raised lettering in a second colour, still one printed part.
+    color("#d9dde2") translate([0,label_height/2,thickness-cut_extra])
         linear_extrude(letter_height+cut_extra)
             text(label,size=letter_size,font=font_name,halign="center",valign="center");
 }

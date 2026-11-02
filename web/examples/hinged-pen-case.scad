@@ -1,5 +1,6 @@
 // Long pen case with a spring-button detent latch and captive conical knuckle hinge.
-// Print fully open, both outer faces on the bed; flex the gaps free when cool.
+// Print fully open, both outer faces on the bed; flex the gaps free when cool,
+// then cut the small ties that split each spring slot into short bridges.
 inner_length = 154; // Clear length, mm [120:2:180]
 inner_width = 26; // Clear width, mm [24:2:40]
 half_height = 14; // Height of each shell, mm [13:1:20]
@@ -28,6 +29,7 @@ button_width = 30; // Flexible bridge span, mm [28:2:40]
 button_height = 8; // Bridge height, mm [7:0.5:9]
 button_bottom = 3; // Bridge lower elevation, mm [2.5:0.5:4]
 button_gap = 0.4; // Slots above and below bridge, mm [0.2:0.05:0.4]
+slot_tie = 0.8; // Breakaway ties splitting each slot into short bridges, mm [0.6:0.1:1.2]
 latch_clearance = 0.3; // Skirt-to-button clearance, mm [0.2:0.05:0.4]
 recess_width = 42; // Recess width, mm [40:2:50]
 recess_corner = 3; // Recess chamfer, mm [2:0.5:4]
@@ -41,12 +43,18 @@ skirt_bottom = 1.6; // Skirt lower elevation when closed, mm [1.2:0.2:2]
 skirt_corner = 2.5; // Skirt corner chamfer, mm [2:0.5:3]
 window_width = 16; // Tooth window width, mm [16:1:20]
 window_corner = 0.8; // Tooth window chamfer, mm [0.4:0.2:1]
+window_rib = 2; // Rib splitting the catch window and tooth in two, mm [1.6:0.2:3]
 window_bottom = 5.4; // Catch window lower edge, mm [5.2:0.1:5.5]
 window_top = 10.2; // Catch window upper edge, mm [10:0.2:11]
 latch_side_web = 1.6; // Material beside recessed latch, mm [1.2:0.2:2]
 recess_depth = wall+latch_clearance; // Derived spring face position, mm
 front_depth = recess_depth+button_thickness; // Front boss thickness, mm
 front_extra = front_depth-wall; // Extra front clearance, mm
+max_print_bridge = 9.5; // Longest flat ceiling left to bridge when printed, mm
+slot_spans = ceil((button_width+slot_tie)/(max_print_bridge+slot_tie)); // Bridges per slot
+slot_span = (button_width-(slot_spans-1)*slot_tie)/slot_spans; // Each slot bridge, mm
+window_half = (window_width-window_rib)/2; // Each catch window, mm
+tooth_gap = window_rib+window_width-hook_width; // Gap between the two teeth, mm
 
 // Same alternating conical boss/socket hinge and 45-degree buttress as
 // web/backend/tests/fixtures/hard-geometry/hinge-box-narrow.scad.
@@ -83,30 +91,38 @@ assert(window_bottom < hook_bottom && window_top > hook_bottom+hook_face+hook_pr
 assert(button_bottom+button_height+button_gap < half_height-wall,
        "Button slots must not reach the rim");
 assert(window_bottom-skirt_bottom > 2+window_corner, "Catch strip is too thin");
+assert(window_half <= max_print_bridge && hook_width > tooth_gap+2,
+       "Each window half must bridge in print and each tooth needs width");
 
 module front_panel(width,bottom,top,chamfer,depth,y=0) {
     translate([centre_x-width/2,y+depth,bottom]) rotate([90,0,0])
         linear_extrude(depth) chamfer_rectangle(width,top-bottom,chamfer,chamfer);
 }
 
+// Each slot is cut as short spans between breakaway ties, so no slot ceiling
+// prints as one long bridge; cut the ties once printed.
 module spring_slots() {
-    for (z=[button_bottom-button_gap,button_bottom+button_height])
-        translate([centre_x-button_width/2,recess_depth-cut_extra,z])
-            cube([button_width,button_thickness+2*cut_extra,button_gap]);
+    for (z=[button_bottom-button_gap,button_bottom+button_height], i=[0:slot_spans-1])
+        translate([centre_x-button_width/2+i*(slot_span+slot_tie),recess_depth-cut_extra,z])
+            cube([slot_span,button_thickness+2*cut_extra,button_gap]);
 }
 
+// Two teeth, one through each half of the split window.
 module catch_tooth() {
-    side_polygon(centre_x-hook_width/2,hook_width,
-        [[recess_depth+cut_extra,hook_bottom-hook_projection],[recess_depth-hook_projection,hook_bottom],
-         [recess_depth-hook_projection,hook_bottom+hook_face],
-         [recess_depth+cut_extra,hook_bottom+hook_face+hook_projection]]);
+    for (x=[centre_x-hook_width/2,centre_x+tooth_gap/2])
+        side_polygon(x,(hook_width-tooth_gap)/2,
+            [[recess_depth+cut_extra,hook_bottom-hook_projection],[recess_depth-hook_projection,hook_bottom],
+             [recess_depth-hook_projection,hook_bottom+hook_face],
+             [recess_depth+cut_extra,hook_bottom+hook_face+hook_projection]]);
 }
 
 module catch_skirt() {
     difference() {
         front_panel(skirt_width,skirt_bottom,half_height+skirt_corner,skirt_corner,wall);
-        front_panel(window_width,window_bottom,window_top,window_corner,
-                    wall+2*cut_extra,-cut_extra);
+        // Split by a rib: printed upside down, each half's catch edge is a short bridge.
+        for (side=[-1,1]) translate([side*(window_rib+window_half)/2,0,0])
+            front_panel(window_half,window_bottom,window_top,window_corner,
+                        wall+2*cut_extra,-cut_extra);
     }
 }
 
@@ -227,9 +243,10 @@ module hollow_lid() {
     }
 }
 
+// Print layout: the lid lies flipped beside the base, hinge pin through both.
 module print_layout() {
-    base();
-    translate([0,2*axis_y,total_height]) rotate([180,0,0]) lid();
+    color("#5ccfc0") base();
+    color("#b48ef0") translate([0,2*axis_y,total_height]) rotate([180,0,0]) lid();
 }
 
 print_layout();

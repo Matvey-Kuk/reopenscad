@@ -14,6 +14,8 @@
 //! * [`hull`] – 3D and 2D convex hulls.
 
 pub mod bsp;
+pub mod cleanup;
+pub mod heal;
 pub mod hull;
 pub mod mesh;
 pub mod planar;

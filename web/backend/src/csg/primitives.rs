@@ -17,31 +17,6 @@ use super::mesh::{Matrix4, Vec3};
 use super::poly2d::{Point2, Region2d};
 use super::solid::Solid;
 
-/// Upper bound on the fragments generated for one curve, mirroring the
-/// evaluator's own clamp so that pathological `$fn` values cannot explode.
-pub const MAX_FRAGMENTS: usize = 10_000;
-
-/// OpenSCAD's fragment rule.
-///
-/// `$fn > 0` wins outright; otherwise the count is
-/// `ceil(min(360 / $fa, r * 2 * pi / $fs))` with a floor of 5 fragments.
-pub fn fragments_for_radius(radius: f64, fn_value: f64, fa_value: f64, fs_value: f64) -> usize {
-    if radius < 1.0e-6 {
-        return 3;
-    }
-    let fragments = if fn_value > 0.0 {
-        fn_value.max(3.0).floor()
-    } else {
-        let fa = fa_value.max(0.01);
-        let fs = fs_value.max(0.01);
-        (360.0 / fa)
-            .min(radius * 2.0 * std::f64::consts::PI / fs)
-            .max(5.0)
-            .ceil()
-    };
-    (fragments as usize).clamp(3, MAX_FRAGMENTS)
-}
-
 /// The `n` points of OpenSCAD's generated circle of radius `r`, CCW from +X.
 pub fn circle_points(radius: f64, fragments: usize) -> Vec<Point2> {
     (0..fragments)
@@ -259,43 +234,6 @@ pub fn circle(radius: f64, fragments: usize) -> Region2d {
         return Region2d::default();
     }
     Region2d::new(vec![circle_points(radius, fragments)])
-}
-
-/// `polygon(points, paths)`.
-///
-/// With no `paths` the point list is a single closed contour. With `paths`,
-/// each path indexes into `points`; the first path is the outline and the rest
-/// are holes. Winding is normalised by nesting depth, so callers do not have to
-/// get it right — this is what the SDF evaluator could not do at all.
-pub fn polygon(points: &[Point2], paths: Option<&[Vec<usize>]>) -> Result<Region2d, String> {
-    let contours = match paths {
-        None => {
-            if points.len() < 3 {
-                return Ok(Region2d::default());
-            }
-            vec![points.to_vec()]
-        }
-        Some(paths) => {
-            let mut contours = Vec::with_capacity(paths.len());
-            for (index, path) in paths.iter().enumerate() {
-                if path.len() < 3 {
-                    continue;
-                }
-                let mut contour = Vec::with_capacity(path.len());
-                for point_index in path {
-                    let point = points.get(*point_index).ok_or_else(|| {
-                        format!("polygon path {index} references point {point_index}")
-                    })?;
-                    contour.push(*point);
-                }
-                contours.push(contour);
-            }
-            contours
-        }
-    };
-    let mut region = Region2d::new(contours);
-    region.normalize();
-    Ok(region)
 }
 
 /// `linear_extrude(height, center, twist, scale, slices)` of a 2D region.
@@ -556,6 +494,7 @@ pub fn minkowski(left: &Solid, right: &Solid) -> Result<Solid, String> {
     let mut result = Solid::default();
     for left_piece in &left_pieces {
         for right_piece in &right_pieces {
+            super::bsp::check_interrupt();
             let mut points = Vec::with_capacity(left_piece.len() * right_piece.len());
             for a in left_piece {
                 for b in right_piece {
@@ -671,19 +610,6 @@ mod tests {
                 polygon.plane.normal
             );
         }
-    }
-
-    #[test]
-    fn the_fragment_rule_matches_openscad() {
-        assert_eq!(fragments_for_radius(10.0, 8.0, 12.0, 2.0), 8);
-        assert_eq!(fragments_for_radius(10.0, 2.0, 12.0, 2.0), 3);
-        // $fa-limited: 360/12 = 30 fragments, circumference rule gives 31.4.
-        assert_eq!(fragments_for_radius(10.0, 0.0, 12.0, 2.0), 30);
-        // $fs-limited.
-        assert_eq!(fragments_for_radius(1.0, 0.0, 12.0, 2.0), 5);
-        assert_eq!(fragments_for_radius(0.0, 0.0, 12.0, 2.0), 3);
-        assert_eq!(fragments_for_radius(100.0, 0.0, 12.0, 2.0), 30);
-        assert_eq!(fragments_for_radius(5.0, 0.0, 1.0, 0.1), 315);
     }
 
     #[test]

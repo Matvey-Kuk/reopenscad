@@ -13,6 +13,7 @@
 //! index and consumers reject meshes whose facets do not share vertices.
 
 use crate::engine::{Mesh, Vec3};
+use crate::export::{channel, filament_slots, hex_color, ExportBody, DEFAULT_COLOR};
 use std::collections::HashMap;
 
 /// Coordinate quantisation used for both vertex welding and text output.
@@ -24,12 +25,25 @@ const COORDINATE_SCALE: f64 = 1.0e6;
 const CONTENT_TYPES_PATH: &str = "[Content_Types].xml";
 const RELS_PATH: &str = "_rels/.rels";
 const MODEL_PATH: &str = "3D/3dmodel.model";
+/// Bambu Studio / OrcaSlicer per-part settings (names, filament slots).
+const MODEL_SETTINGS_PATH: &str = "Metadata/model_settings.config";
 
 const CONTENT_TYPES_XML: &str = concat!(
     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n",
     "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">",
     "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\" />",
     "<Default Extension=\"model\" ContentType=\"application/vnd.ms-package.3dmanufacturing-3dmodel+xml\" />",
+    "</Types>\r\n"
+);
+
+/// As [`CONTENT_TYPES_XML`], plus a type for the `.config` settings part:
+/// OPC requires every part in the package to have one.
+const CONTENT_TYPES_WITH_CONFIG_XML: &str = concat!(
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n",
+    "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">",
+    "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\" />",
+    "<Default Extension=\"model\" ContentType=\"application/vnd.ms-package.3dmanufacturing-3dmodel+xml\" />",
+    "<Default Extension=\"config\" ContentType=\"text/xml\" />",
     "</Types>\r\n"
 );
 
@@ -46,6 +60,9 @@ const RELS_XML: &str = concat!(
 pub struct IndexedMesh {
     pub vertices: Vec<Vec3>,
     pub triangles: Vec<[u32; 3]>,
+    /// The index in the source mesh of every kept triangle, so per-triangle
+    /// data (colours) can follow the weld past the facets it dropped.
+    pub sources: Vec<usize>,
 }
 
 impl IndexedMesh {
@@ -71,7 +88,8 @@ impl IndexedMesh {
         let mut vertices = Vec::new();
         let mut triangles = Vec::new();
         let mut lookup: HashMap<[i64; 3], u32> = HashMap::new();
-        for triangle in &mesh.triangles {
+        let mut sources = Vec::new();
+        for (source, triangle) in mesh.triangles.iter().enumerate() {
             let mut indices = [0u32; 3];
             for (slot, vertex) in triangle.vertices.iter().enumerate() {
                 let key = quantized_key(*vertex, scale);
@@ -96,10 +114,12 @@ impl IndexedMesh {
                 indices.swap(1, 2);
             }
             triangles.push(indices);
+            sources.push(source);
         }
         Self {
             vertices,
             triangles,
+            sources,
         }
     }
 }
@@ -166,9 +186,8 @@ fn format_coordinate(value: f64) -> String {
     text
 }
 
-/// Serialise `3D/3dmodel.model` for a welded mesh.
-pub fn model_xml(mesh: &IndexedMesh, title: &str) -> String {
-    let mut xml = String::with_capacity(64 * mesh.vertices.len() + 48 * mesh.triangles.len() + 512);
+/// The model element and its metadata, shared by every package this writes.
+fn open_model(xml: &mut String, title: &str) {
     xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n");
     xml.push_str(
         "<model unit=\"millimeter\" xml:lang=\"en-US\" \
@@ -178,7 +197,20 @@ pub fn model_xml(mesh: &IndexedMesh, title: &str) -> String {
     xml.push_str("<metadata name=\"Title\">");
     xml.push_str(&escape_xml(title));
     xml.push_str("</metadata>\r\n");
-    xml.push_str("<resources>\r\n<object id=\"1\" type=\"model\">\r\n<mesh>\r\n<vertices>\r\n");
+}
+
+/// `<mesh>…</mesh>` for one welded body.
+fn push_mesh(xml: &mut String, mesh: &IndexedMesh) {
+    push_painted_mesh(xml, mesh, None);
+}
+
+/// [`push_mesh`], with each triangle's base-material index from group `pid`
+/// when the body is painted per face (`(pid, indices)`, one per triangle).
+/// A triangle's `pid`/`p1` override the object's default material — 3MF
+/// core's own way of colouring part of a mesh.
+fn push_painted_mesh(xml: &mut String, mesh: &IndexedMesh, paint: Option<(usize, &[usize])>) {
+    xml.reserve(64 * mesh.vertices.len() + 48 * mesh.triangles.len());
+    xml.push_str("<mesh>\r\n<vertices>\r\n");
     for vertex in &mesh.vertices {
         xml.push_str("<vertex x=\"");
         xml.push_str(&format_coordinate(vertex.x));
@@ -189,17 +221,251 @@ pub fn model_xml(mesh: &IndexedMesh, title: &str) -> String {
         xml.push_str("\" />\r\n");
     }
     xml.push_str("</vertices>\r\n<triangles>\r\n");
-    for triangle in &mesh.triangles {
+    for (index, triangle) in mesh.triangles.iter().enumerate() {
         xml.push_str("<triangle v1=\"");
         xml.push_str(&triangle[0].to_string());
         xml.push_str("\" v2=\"");
         xml.push_str(&triangle[1].to_string());
         xml.push_str("\" v3=\"");
         xml.push_str(&triangle[2].to_string());
+        if let Some((pid, indices)) = paint {
+            xml.push_str("\" pid=\"");
+            xml.push_str(&pid.to_string());
+            xml.push_str("\" p1=\"");
+            xml.push_str(&indices[index].to_string());
+        }
         xml.push_str("\" />\r\n");
     }
-    xml.push_str("</triangles>\r\n</mesh>\r\n</object>\r\n</resources>\r\n");
+    xml.push_str("</triangles>\r\n</mesh>\r\n");
+}
+
+/// Serialise `3D/3dmodel.model` for a welded mesh.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn model_xml(mesh: &IndexedMesh, title: &str) -> String {
+    named_model_xml(mesh, title, title, None)
+}
+
+/// One object named `name` (the model keeps `title` as its metadata title),
+/// optionally with a single base material carrying its colour and name.
+fn named_model_xml(
+    mesh: &IndexedMesh,
+    title: &str,
+    name: &str,
+    color: Option<[f64; 4]>,
+) -> String {
+    let mut xml = String::with_capacity(512);
+    open_model(&mut xml, title);
+    xml.push_str("<resources>\r\n");
+    match color {
+        // The material group takes id 2 so the object keeps id 1, exactly as
+        // an uncoloured export has it.
+        Some(color) => {
+            xml.push_str("<basematerials id=\"2\">\r\n");
+            push_base(&mut xml, name, color);
+            xml.push_str("</basematerials>\r\n");
+            xml.push_str(&format!(
+                "<object id=\"1\" type=\"model\" name=\"{}\" pid=\"2\" pindex=\"0\">\r\n",
+                escape_xml(name)
+            ));
+        }
+        None => xml.push_str(&format!(
+            "<object id=\"1\" type=\"model\" name=\"{}\">\r\n",
+            escape_xml(name)
+        )),
+    }
+    push_mesh(&mut xml, mesh);
+    xml.push_str("</object>\r\n</resources>\r\n");
     xml.push_str("<build>\r\n<item objectid=\"1\" />\r\n</build>\r\n</model>\r\n");
+    xml
+}
+
+/// [`named_model_xml`] for a lone body painted per face: one base material
+/// per distinct colour, the object's default the colour covering the most
+/// surface, and every triangle naming its own.
+fn painted_model_xml(
+    mesh: &IndexedMesh,
+    title: &str,
+    name: &str,
+    color: Option<[f64; 4]>,
+    faces: &[Option<[f64; 4]>],
+) -> String {
+    let mut xml = String::with_capacity(512);
+    open_model(&mut xml, title);
+    xml.push_str("<resources>\r\n");
+    let mut palette = BasePalette::default();
+    let (pindex, indices) = body_materials(&mut palette, name, color, Some(faces));
+    // The material group takes id 2 so the object keeps id 1, as everywhere.
+    palette.push(&mut xml, 2);
+    xml.push_str(&format!(
+        "<object id=\"1\" type=\"model\" name=\"{}\" pid=\"2\" pindex=\"{}\">\r\n",
+        escape_xml(name),
+        pindex.unwrap_or(0)
+    ));
+    push_painted_mesh(&mut xml, mesh, indices.as_deref().map(|indices| (2, indices)));
+    xml.push_str("</object>\r\n</resources>\r\n");
+    xml.push_str("<build>\r\n<item objectid=\"1\" />\r\n</build>\r\n</model>\r\n");
+    xml
+}
+
+fn push_base(xml: &mut String, name: &str, color: [f64; 4]) {
+    xml.push_str("<base name=\"");
+    xml.push_str(&escape_xml(name));
+    xml.push_str("\" displaycolor=\"");
+    xml.push_str(&hex_color(color));
+    xml.push_str("\" />\r\n");
+}
+
+/// Object ids in a multi-body package: bodies are `2..=n+1` (id 1 is the
+/// material group), and the assembly that groups them is `n + 2`.
+fn body_object_id(index: usize) -> usize {
+    index + 2
+}
+
+/// A body to write: name, object colour, per-triangle colours (aligned with
+/// the welded mesh's triangles) when painted per face, and the mesh.
+type PaintedBody<'a> = (&'a str, Option<[f64; 4]>, Option<Vec<Option<[f64; 4]>>>, &'a IndexedMesh);
+
+/// Distinct colours in first-use order, each named after the body that first
+/// used it: the entries of one `<basematerials>` group.
+#[derive(Default)]
+struct BasePalette<'a> {
+    entries: Vec<([u8; 4], [f64; 4], &'a str)>,
+    lookup: HashMap<[u8; 4], usize>,
+}
+
+impl<'a> BasePalette<'a> {
+    fn index(&mut self, color: [f64; 4], name: &'a str) -> usize {
+        let key = color.map(channel);
+        let entries = &mut self.entries;
+        *self.lookup.entry(key).or_insert_with(|| {
+            entries.push((key, color, name));
+            entries.len() - 1
+        })
+    }
+
+    fn push(&self, xml: &mut String, id: usize) {
+        if self.entries.is_empty() {
+            return;
+        }
+        xml.push_str(&format!("<basematerials id=\"{id}\">\r\n"));
+        for (_, color, name) in &self.entries {
+            push_base(xml, name, *color);
+        }
+        xml.push_str("</basematerials>\r\n");
+    }
+}
+
+/// The object's default material index and, for a body painted per face,
+/// every triangle's. A per-face body's uncoloured triangles take the
+/// default colour, since a 3MF triangle cannot opt out of its object's
+/// material once its neighbours carry one.
+fn body_materials<'a>(
+    palette: &mut BasePalette<'a>,
+    name: &'a str,
+    color: Option<[f64; 4]>,
+    faces: Option<&[Option<[f64; 4]>]>,
+) -> (Option<usize>, Option<Vec<usize>>) {
+    match faces {
+        None => (color.map(|color| palette.index(color, name)), None),
+        Some(faces) => {
+            let object = palette.index(color.unwrap_or(DEFAULT_COLOR), name);
+            let indices = faces
+                .iter()
+                .map(|face| palette.index(face.unwrap_or(DEFAULT_COLOR), name))
+                .collect();
+            (Some(object), Some(indices))
+        }
+    }
+}
+
+/// Serialise several bodies as one model with separate parts.
+///
+/// Each body is its own mesh `<object>`, named, with its colour as a base
+/// material. One parent object lists them all as `<components>` and is the
+/// only build item, so a slicer sees *one* model made of several parts —
+/// which is what lets Bambu Studio / OrcaSlicer assign a filament per part —
+/// while any core-spec consumer still finds plain meshes with identity
+/// transforms, so world coordinates are kept.
+/// `None` as soon as the text passes `budget` bytes.
+fn bodies_model_xml_within(bodies: &[PaintedBody], title: &str, budget: usize) -> Option<String> {
+    let mut xml = String::with_capacity(1024);
+    open_model(&mut xml, title);
+    xml.push_str("<resources>\r\n");
+    // One base per distinct colour, in first-use order.
+    let mut palette = BasePalette::default();
+    let mut materials = Vec::with_capacity(bodies.len());
+    for (name, color, faces, _) in bodies {
+        materials.push(body_materials(&mut palette, name, *color, faces.as_deref()));
+    }
+    palette.push(&mut xml, 1);
+    for (index, ((name, _, _, mesh), (pindex, faces))) in bodies.iter().zip(&materials).enumerate() {
+        xml.push_str(&format!(
+            "<object id=\"{}\" type=\"model\" name=\"{}\"",
+            body_object_id(index),
+            escape_xml(name)
+        ));
+        if let Some(pindex) = pindex {
+            xml.push_str(&format!(" pid=\"1\" pindex=\"{pindex}\""));
+        }
+        xml.push_str(">\r\n");
+        push_painted_mesh(&mut xml, mesh, faces.as_deref().map(|faces| (1, faces)));
+        xml.push_str("</object>\r\n");
+        if xml.len() > budget {
+            return None;
+        }
+    }
+    let assembly = body_object_id(bodies.len());
+    xml.push_str(&format!(
+        "<object id=\"{assembly}\" type=\"model\" name=\"{}\">\r\n<components>\r\n",
+        escape_xml(title)
+    ));
+    for index in 0..bodies.len() {
+        xml.push_str(&format!(
+            "<component objectid=\"{}\" />\r\n",
+            body_object_id(index)
+        ));
+    }
+    xml.push_str("</components>\r\n</object>\r\n</resources>\r\n");
+    xml.push_str(&format!(
+        "<build>\r\n<item objectid=\"{assembly}\" />\r\n</build>\r\n</model>\r\n"
+    ));
+    Some(xml)
+}
+
+/// `Metadata/model_settings.config`, the per-object/per-part settings file
+/// Bambu Studio and OrcaSlicer read alongside the model: it names the parts
+/// and assigns each a filament slot, one slot per distinct colour. Other
+/// consumers ignore it.
+fn model_settings_config(names: &[&str], slots: &[usize], title: &str) -> String {
+    let assembly = body_object_id(names.len());
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<config>\n");
+    xml.push_str(&format!("  <object id=\"{assembly}\">\n"));
+    xml.push_str(&format!(
+        "    <metadata key=\"name\" value=\"{}\"/>\n",
+        escape_xml(title)
+    ));
+    xml.push_str(&format!(
+        "    <metadata key=\"extruder\" value=\"{}\"/>\n",
+        slots.first().copied().unwrap_or(1)
+    ));
+    for (index, (name, slot)) in names.iter().zip(slots).enumerate() {
+        xml.push_str(&format!(
+            "    <part id=\"{}\" subtype=\"normal_part\">\n",
+            body_object_id(index)
+        ));
+        xml.push_str(&format!(
+            "      <metadata key=\"name\" value=\"{}\"/>\n",
+            escape_xml(name)
+        ));
+        xml.push_str(
+            "      <metadata key=\"matrix\" value=\"1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1\"/>\n",
+        );
+        xml.push_str(&format!(
+            "      <metadata key=\"extruder\" value=\"{slot}\"/>\n"
+        ));
+        xml.push_str("    </part>\n");
+    }
+    xml.push_str("  </object>\n</config>\n");
     xml
 }
 
@@ -222,13 +488,64 @@ fn escape_xml(text: &str) -> String {
 }
 
 /// Build a complete 3MF package for `mesh`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn write(mesh: &Mesh, title: &str) -> Vec<u8> {
-    let indexed = IndexedMesh::weld(mesh);
-    let model = model_xml(&indexed, title);
+    package(&model_xml(&IndexedMesh::weld(mesh), title), None)
+}
+
+/// Build a 3MF package for several bodies.
+///
+/// A single body is written exactly as [`write`] writes it, plus a base
+/// material when it states a colour. Several bodies become separate named,
+/// coloured parts of one model; see [`bodies_model_xml_within`].
+///
+/// `None` once the model part passes `budget` bytes: it is checked after each
+/// body's mesh is written, before the package copies it.
+pub fn write_bodies(bodies: &[ExportBody], title: &str, budget: usize) -> Option<Vec<u8>> {
+    let welded: Vec<IndexedMesh> = bodies.iter().map(|body| IndexedMesh::weld(&body.mesh)).collect();
+    // A body painted per face carries each kept triangle's colour along.
+    let faces = |body: &ExportBody, indexed: &IndexedMesh| {
+        body.face_colors.as_ref().map(|_| {
+            indexed
+                .sources
+                .iter()
+                .map(|source| body.triangle_color(*source))
+                .collect::<Vec<_>>()
+        })
+    };
+    if let [body] = bodies {
+        let indexed = &welded[0];
+        // The lone object keeps its own name; the document title stays the
+        // model's metadata title.
+        let name = if body.name.trim().is_empty() { title } else { body.name.as_str() };
+        let model = match faces(body, indexed) {
+            None => named_model_xml(indexed, title, name, body.color),
+            Some(faces) => painted_model_xml(indexed, title, name, body.color, &faces),
+        };
+        return (model.len() <= budget).then(|| package(&model, None));
+    }
+    let painted: Vec<PaintedBody> = bodies
+        .iter()
+        .zip(&welded)
+        .map(|(body, indexed)| (body.name.as_str(), body.color, faces(body, indexed), indexed))
+        .collect();
+    let model = bodies_model_xml_within(&painted, title, budget)?;
+    let names: Vec<&str> = bodies.iter().map(|body| body.name.as_str()).collect();
+    let settings = model_settings_config(&names, &filament_slots(bodies), title);
+    Some(package(&model, Some(&settings)))
+}
+
+fn package(model: &str, settings: Option<&str>) -> Vec<u8> {
     let mut zip = ZipWriter::default();
-    zip.add(CONTENT_TYPES_PATH, CONTENT_TYPES_XML.as_bytes());
+    match settings {
+        None => zip.add(CONTENT_TYPES_PATH, CONTENT_TYPES_XML.as_bytes()),
+        Some(_) => zip.add(CONTENT_TYPES_PATH, CONTENT_TYPES_WITH_CONFIG_XML.as_bytes()),
+    }
     zip.add(RELS_PATH, RELS_XML.as_bytes());
     zip.add(MODEL_PATH, model.as_bytes());
+    if let Some(settings) = settings {
+        zip.add(MODEL_SETTINGS_PATH, settings.as_bytes());
+    }
     zip.finish()
 }
 

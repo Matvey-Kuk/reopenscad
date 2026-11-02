@@ -1,53 +1,189 @@
 {
-  "note": "Kick-start models shown above an empty editor. Each entry has <slug>.scad next to this file and <slug>.png, a preview rendered by ReOpenSCAD's own viewer. Kept in step with the directory by web/tests/examples.test.mjs.",
+  "note": "Example catalogue shown on the landing page, in display order. Each entry has <slug>.scad next to this file and <slug>.png, a preview rendered by ReOpenSCAD's own viewer (see README.md). Kept in step with the directory by web/tests/examples.test.mjs and web/backend/tests/examples_compile.rs.",
   "categories": [
     {
-      "id": "mounts",
-      "name": "Mounts and brackets",
-      "blurb": "Parts that hold something else still.",
+      "id": "gridfinity",
+      "name": "Gridfinity",
+      "blurb": "Modular workshop storage on a 42 mm grid.",
       "examples": [
         {
-          "slug": "vesa-adapter-plate",
-          "name": "VESA adapter plate",
-          "blurb": "Ribbed 75-to-100 mm plate for a monitor arm.",
-          "hint": "difference() · linear_extrude()"
+          "slug": "gridfinity-baseplate",
+          "name": "Gridfinity baseplate",
+          "blurb": "Backed grid with optional magnet pockets and countersunk mounting holes.",
+          "hint": "difference() · rotate_extrude()"
         },
         {
-          "slug": "desk-headphone-hook",
-          "name": "Desk headphone hook",
-          "blurb": "Screws under a desk edge; teardrop bores need no support.",
+          "slug": "gridfinity-bin",
+          "name": "Gridfinity bin",
+          "blurb": "Divided storage with a stacking lip, label shelf, and optional magnets.",
           "hint": "polygon() · linear_extrude()"
         },
         {
-          "slug": "pegboard-driver-rack",
-          "name": "Pegboard driver rack",
-          "blurb": "Four sockets on a standard 25.4 mm pegboard pitch.",
+          "slug": "gridfinity-hex-bit-holder",
+          "name": "Gridfinity hex-bit holder",
+          "blurb": "Chamfered quarter-inch bit sockets with adjustable spacing and depth.",
+          "hint": "for() · cylinder($fn=6)"
+        }
+      ]
+    },
+    {
+      "id": "skadis",
+      "name": "IKEA SKÅDIS pegboard",
+      "blurb": "Parametric hooks and organizers with adjustable pegboard fit.",
+      "examples": [
+        {
+          "slug": "skadis-hook",
+          "name": "SKÅDIS J-hook",
+          "blurb": "A flat-printing hook for keys, scissors or cable coils.",
+          "hint": "polygon() · linear_extrude()"
+        },
+        {
+          "slug": "skadis-shelf",
+          "name": "SKÅDIS small tray",
+          "blurb": "A shallow tray that slides onto two removable hook brackets.",
+          "hint": "for() · linear_extrude()"
+        },
+        {
+          "slug": "skadis-tool-holder",
+          "name": "SKÅDIS screwdriver holder",
+          "blurb": "A configurable row of tool bores on removable hook brackets.",
           "hint": "for() · difference()"
+        },
+        {
+          "slug": "skadis-cable-clip",
+          "name": "SKÅDIS cable clip",
+          "blurb": "An adjustable C-shaped keeper for a flexible cable.",
+          "hint": "difference() · linear_extrude()"
+        }
+      ]
+    },
+    {
+      "id": "modular-walls",
+      "name": "openGrid and Multiboard",
+      "blurb": "Boards and accessories for modular workshop storage.",
+      "examples": [
+        {
+          "slug": "opengrid-tile",
+          "name": "openGrid tile",
+          "blurb": "Parametric Lite or Full board with a reinforced perimeter.",
+          "hint": "intersection() · linear_extrude(scale=)"
+        },
+        {
+          "slug": "opengrid-bin-shelf",
+          "name": "openGrid bin shelf",
+          "blurb": "Gridfinity-sized tray mounted with M3 screw snaps.",
+          "hint": "difference() · for()"
+        },
+        {
+          "slug": "opengrid-hook",
+          "name": "openGrid hook",
+          "blurb": "Light-duty hook with two screw-snap mounting points.",
+          "hint": "polygon() · linear_extrude()"
+        },
+        {
+          "slug": "multiboard-bin",
+          "name": "Multiboard bin",
+          "blurb": "Small-parts bin mounted using official Small Thread bolts.",
+          "hint": "difference() · for()"
+        },
+        {
+          "slug": "multiboard-peg-hook",
+          "name": "Multiboard peg hook",
+          "blurb": "Slide-down cable hook for adjacent small holes.",
+          "hint": "polygon() · linear_extrude()"
         }
       ]
     },
     {
       "id": "threads",
       "name": "Threads",
-      "blurb": "Real helical threads, swept by twisting a profile.",
+      "blurb": "Practical screw threads and captured-nut hardware.",
       "examples": [
         {
-          "slug": "screw-top-jar",
-          "name": "Screw-top jar",
-          "blurb": "Jar and lid on a coarse trapezoidal thread.",
-          "hint": "linear_extrude(twist=)"
+          "slug": "metric-bolt-and-nut",
+          "name": "Metric bolt and nut",
+          "blurb": "Matching metric coarse threads from M3 to M24.",
+          "hint": "linear_extrude(twist=) · let()"
         },
         {
-          "slug": "trapezoid-bolt-and-nut",
-          "name": "Bolt and nut",
-          "blurb": "M12-scale bolt with a matching hex nut.",
-          "hint": "intersection() · twist"
+          "slug": "metric-threaded-container",
+          "name": "Metric threaded container",
+          "blurb": "Small-parts container with an M24×3 screw lid.",
+          "hint": "linear_extrude(twist=) · difference()"
         },
         {
-          "slug": "threaded-bottle-spout",
-          "name": "Bottle spout",
-          "blurb": "Screw-on pouring spout and its matching neck.",
-          "hint": "difference() · twist"
+          "slug": "tripod-mount-1-4-20",
+          "name": "1/4-20 tripod mount",
+          "blurb": "UNC threaded accessory plate with M3 mounting holes.",
+          "hint": "polygon() · linear_extrude(twist=)"
+        },
+        {
+          "slug": "captive-nut-knob",
+          "name": "Captive nut knob",
+          "blurb": "Scalloped hand knob for a real DIN 934 hex nut.",
+          "hint": "difference() · for()"
+        }
+      ]
+    },
+    {
+      "id": "din-rail",
+      "name": "DIN rail",
+      "blurb": "Printable snap-on clips, board carriers and labels for TS35 rail.",
+      "examples": [
+        {
+          "slug": "din-rail-clip",
+          "name": "DIN rail clip",
+          "blurb": "A spring clip with two support-free M3 mounting holes.",
+          "hint": "polygon() · linear_extrude()"
+        },
+        {
+          "slug": "din-rail-raspberry-pi",
+          "name": "DIN rail Raspberry Pi carrier",
+          "blurb": "A ventilated Pi 4/5 carrier with standoffs and a separate snap clip.",
+          "hint": "for() · difference()"
+        },
+        {
+          "slug": "din-rail-arduino-uno",
+          "name": "DIN rail Arduino Uno carrier",
+          "blurb": "An Uno R3 carrier with its asymmetric mounting pattern and a separate snap clip.",
+          "hint": "for() · cylinder()"
+        },
+        {
+          "slug": "din-rail-label-holder",
+          "name": "DIN rail label holder",
+          "blurb": "A snap-on holder with a recessed adhesive-label bed.",
+          "hint": "polygon() · difference()"
+        }
+      ]
+    },
+    {
+      "id": "maker-hardware",
+      "name": "Maker hardware",
+      "blurb": "Printable fittings for extrusion frames, motors and bearings.",
+      "examples": [
+        {
+          "slug": "extrusion-2020-corner-bracket",
+          "name": "2020 corner bracket",
+          "blurb": "Flat corner gusset for 20 mm rails and M5 or M3 T-nuts.",
+          "hint": "polygon() · difference()"
+        },
+        {
+          "slug": "extrusion-2020-end-cap",
+          "name": "2020 end cap",
+          "blurb": "Slip-over extrusion cover with adjustable clearance.",
+          "hint": "hull() · difference()"
+        },
+        {
+          "slug": "nema17-mount",
+          "name": "NEMA 17 motor mount",
+          "blurb": "Reinforced motor bracket with a 31 mm M3 pattern.",
+          "hint": "linear_extrude() · for()"
+        },
+        {
+          "slug": "bearing-608-pillow-block",
+          "name": "608 bearing pillow block",
+          "blurb": "Shouldered housing with a tunable 22 mm bearing seat.",
+          "hint": "difference() · cylinder()"
         }
       ]
     },
@@ -79,7 +215,7 @@
     {
       "id": "text",
       "name": "Lettering",
-      "blurb": "text() draws with this engine's own built-in font.",
+      "blurb": "text() lettering, drawn with real outline fonts.",
       "examples": [
         {
           "slug": "raised-nameplate",

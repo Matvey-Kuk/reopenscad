@@ -193,6 +193,17 @@ fn rands_has_the_requested_length_bounds_and_seed_stability() {
     }
 }
 
+/// Unseeded `rands()` marks a compile nondeterministic so neither the
+/// in-process memo nor the stored-render cache freezes one draw; a seeded
+/// call is reproducible and stays cacheable.
+#[test]
+fn unseeded_rands_marks_the_compile_nondeterministic() {
+    let unseeded = compile_parts("cube(rands(1, 2, 1)[0]);", Quality::Preview, None).unwrap();
+    assert!(unseeded.nondeterministic);
+    let seeded = compile_parts("cube(rands(1, 2, 1, 7)[0]);", Quality::Preview, None).unwrap();
+    assert!(!seeded.nondeterministic);
+}
+
 #[test]
 fn len_and_concat_handle_strings_lists_and_scalar_arguments() {
     for expression in [

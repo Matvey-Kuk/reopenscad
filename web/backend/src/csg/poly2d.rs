@@ -194,10 +194,13 @@ fn dedup_ring(points: &mut Vec<Point2>, tolerance: f64) {
 /// Never reduces the ring below three points.
 fn remove_collinear(points: &mut Vec<Point2>, tolerance: f64) {
     let mut changed = true;
+    // Each removal shifts the tail, so a long collinear run is quadratic.
+    let mut polls = 0usize;
     while changed && points.len() > 3 {
         changed = false;
         let mut index = 0;
         while index < points.len() && points.len() > 3 {
+            super::bsp::poll_interrupt(&mut polls, 1024);
             let count = points.len();
             let previous = points[(index + count - 1) % count];
             let current = points[index];
@@ -234,6 +237,8 @@ fn nesting_depths(contours: &[Vec<Point2>]) -> Vec<usize> {
         contours.iter().map(|c| representative_point(c)).collect();
     (0..contours.len())
         .map(|index| {
+            // Contours x contours x vertices: poll once per contour.
+            super::bsp::check_interrupt();
             let Some(point) = representatives[index] else {
                 return 0;
             };
@@ -380,6 +385,7 @@ impl Region2d {
             // contains. Because contours never intersect, that pair of
             // conditions identifies the immediate parent uniquely.
             let mut holes: Vec<Vec<Point2>> = Vec::new();
+            super::bsp::check_interrupt();
             for (other, candidate) in region.contours.iter().enumerate() {
                 if other == index || depths[other] != depths[index] + 1 {
                     continue;
@@ -433,30 +439,385 @@ impl Region2d {
         if delta.abs() <= POINT_EPSILON {
             return source;
         }
+        if delta < 0.0 {
+            return source.erode(-delta, rounded, fragments);
+        }
 
+        // Grow: every contour's raw offset (outers grow, holes shrink, a hole
+        // narrower than 2 * delta folds over itself), then keep where the
+        // winding is positive, as polygon clippers do for offsets. Folded
+        // parts of a closing hole and the overlaps of grown neighbours
+        // resolve exactly; no vertex pruning that could distort a contour.
         let mut result = Region2d::default();
         for contour in &source.contours {
-            let original_area = signed_area(contour);
-            let mut offsetted = offset_contour_resolved(contour, delta, rounded, fragments);
+            let (mut offsetted, _) = offset_contour(contour, delta, rounded, fragments);
             dedup_ring(&mut offsetted, POINT_EPSILON);
-            if offsetted.len() < 3 {
-                continue;
+            if offsetted.len() >= 3 {
+                result.contours.push(offsetted);
             }
-            remove_collinear(&mut offsetted, COLLINEAR_EPSILON);
-            if offsetted.len() < 3 {
-                continue;
-            }
-            let area = signed_area(&offsetted);
-            if area.abs() <= AREA_EPSILON {
-                continue;
-            }
-            // Winding flipped => the contour turned itself inside out, which
-            // means the feature was consumed by the offset. Drop it.
-            if (area > 0.0) != (original_area > 0.0) {
-                continue;
-            }
-            result.contours.push(offsetted);
         }
+        // Each contour was offset on its own, so grown neighbours can overlap
+        // and a concave stroke can cross itself; resolve to the nonzero
+        // region so the result is a set of simple, disjoint contours.
+        let mut resolved = Region2d::new(resolve_nonzero(&result.contours));
+        resolved.normalize();
+        resolved
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Nonzero-winding resolution
+// ---------------------------------------------------------------------------
+
+/// Most segments (input or after splitting) [`resolve_nonzero`] works on.
+const MAX_RESOLVE_SEGMENTS: usize = 400_000;
+/// Most candidate segment pairs it tests for intersections.
+const MAX_RESOLVE_PAIR_TESTS: usize = 200_000_000;
+
+/// Resolves contours that overlap each other or cross themselves into simple
+/// contours bounding the region of nonzero winding number (CCW outers, CW
+/// holes), the planar clipping pass a local offset needs.
+///
+/// Every segment is split where it meets another (crossings, T-junctions,
+/// collinear overlaps), coincident edges are merged with their net
+/// multiplicity, and an edge is kept when the winding number is positive on
+/// exactly one side of it (found by casting an axis-aligned ray from its
+/// midpoint into its left side). The kept edges, oriented with the region on
+/// their left, are linked into loops taking the tightest turn at each
+/// vertex (the sharpest left turn), which separates loops that touch at a
+/// point.
+///
+/// Grown glyphs that run into each other merge, a cursive stroke whose
+/// grown outline crosses itself becomes a clean outline, and the inverted
+/// lobes a shrink can leave (negative winding) disappear.
+pub fn resolve_nonzero(contours: &[Vec<Point2>]) -> Vec<Vec<Point2>> {
+    use std::collections::HashMap;
+
+    let mut minimum = [f64::INFINITY; 2];
+    let mut maximum = [f64::NEG_INFINITY; 2];
+    for point in contours.iter().flatten() {
+        for axis in 0..2 {
+            minimum[axis] = minimum[axis].min(point[axis]);
+            maximum[axis] = maximum[axis].max(point[axis]);
+        }
+    }
+    if !minimum[0].is_finite() {
+        return Vec::new();
+    }
+    let scale = length(sub(maximum, minimum)).max(1e-9);
+    let snap = scale * 1e-10;
+    let tolerance = scale * 1e-11;
+
+    // Vertices, interned on a grid of `snap` so a point computed twice is
+    // one vertex.
+    let mut points: Vec<Point2> = Vec::new();
+    let mut ids: HashMap<(i64, i64), usize> = HashMap::new();
+    // Keys relative to the bounding box, so coordinates far from the origin
+    // cannot overflow the integer grid.
+    let mut intern = |point: Point2, points: &mut Vec<Point2>| -> usize {
+        let key = (
+            ((point[0] - minimum[0]) / snap).round() as i64,
+            ((point[1] - minimum[1]) / snap).round() as i64,
+        );
+        *ids.entry(key).or_insert_with(|| {
+            points.push(point);
+            points.len() - 1
+        })
+    };
+
+    // Directed input segments.
+    struct Segment {
+        a: Point2,
+        b: Point2,
+        splits: Vec<(f64, Point2)>,
+    }
+    let mut segments: Vec<Segment> = Vec::new();
+    for contour in contours {
+        let count = contour.len();
+        if count < 3 {
+            continue;
+        }
+        for index in 0..count {
+            let (a, b) = (contour[index], contour[(index + 1) % count]);
+            if distance(a, b) > tolerance {
+                segments.push(Segment { a, b, splits: Vec::new() });
+            }
+        }
+    }
+
+    // Work limits: past them (or the build deadline) the contours are
+    // returned unresolved, as the offset produced them, rather than holding
+    // an evaluator for an unbounded time on hostile input.
+    let unresolved = || contours.iter().filter(|contour| contour.len() >= 3).cloned().collect::<Vec<_>>();
+    if segments.len() > MAX_RESOLVE_SEGMENTS {
+        return unresolved();
+    }
+    let mut pair_tests = 0usize;
+
+    // Pairwise intersections, swept along x.
+    let mut order: Vec<usize> = (0..segments.len()).collect();
+    let min_x = |segment: &Segment| segment.a[0].min(segment.b[0]);
+    let max_x = |segment: &Segment| segment.a[0].max(segment.b[0]);
+    order.sort_by(|x, y| min_x(&segments[*x]).total_cmp(&min_x(&segments[*y])));
+    let mut found: Vec<(usize, f64, Point2)> = Vec::new();
+    for (position, &i) in order.iter().enumerate() {
+        let (a, b) = (segments[i].a, segments[i].b);
+        let reach = max_x(&segments[i]) + tolerance;
+        let (low_y, high_y) = (a[1].min(b[1]) - tolerance, a[1].max(b[1]) + tolerance);
+        for &j in &order[position + 1..] {
+            if min_x(&segments[j]) > reach {
+                break;
+            }
+            pair_tests += 1;
+            if pair_tests % 65_536 == 0
+                && (pair_tests > MAX_RESOLVE_PAIR_TESTS || super::bsp::deadline_passed())
+            {
+                return unresolved();
+            }
+            let (c, d) = (segments[j].a, segments[j].b);
+            if c[1].max(d[1]) < low_y || c[1].min(d[1]) > high_y {
+                continue;
+            }
+            let (first, second) = (sub(b, a), sub(d, c));
+            let (length_first, length_second) = (length(first), length(second));
+            let denominator = cross(first, second);
+            // A split strictly inside a segment (not at its ends).
+            let inside = |t: f64, size: f64| t * size > tolerance && (1.0 - t) * size > tolerance;
+            if denominator.abs() > 1e-12 * length_first * length_second {
+                let t = cross(sub(c, a), second) / denominator;
+                let u = cross(sub(c, a), first) / denominator;
+                let slack_t = tolerance / length_first;
+                let slack_u = tolerance / length_second;
+                if t < -slack_t || t > 1.0 + slack_t || u < -slack_u || u > 1.0 + slack_u {
+                    continue;
+                }
+                let point = [a[0] + t * first[0], a[1] + t * first[1]];
+                if inside(t, length_first) {
+                    found.push((i, t, point));
+                }
+                if inside(u, length_second) {
+                    found.push((j, u, point));
+                }
+            } else {
+                // Parallel: collinear overlaps split at each other's ends.
+                if (cross(first, sub(c, a)) / length_first).abs() > tolerance {
+                    continue;
+                }
+                for (owner, start, direction, size, point) in [
+                    (i, a, first, length_first, c),
+                    (i, a, first, length_first, d),
+                    (j, c, second, length_second, a),
+                    (j, c, second, length_second, b),
+                ] {
+                    let t = dot(sub(point, start), direction) / (size * size);
+                    if inside(t, size) {
+                        found.push((owner, t, point));
+                    }
+                }
+            }
+        }
+    }
+    if found.len() > MAX_RESOLVE_SEGMENTS {
+        return unresolved();
+    }
+    for (owner, t, point) in found {
+        segments[owner].splits.push((t, point));
+    }
+
+    // Split edges, merged by endpoints with their net direction count.
+    let mut edges: HashMap<(usize, usize), i64> = HashMap::new();
+    for segment in &mut segments {
+        segment.splits.sort_by(|x, y| x.0.total_cmp(&y.0));
+        let mut previous = intern(segment.a, &mut points);
+        let mut chain: Vec<Point2> = segment.splits.iter().map(|(_, point)| *point).collect();
+        chain.push(segment.b);
+        for point in chain {
+            let next = intern(point, &mut points);
+            if next != previous {
+                let (key, sign) = if previous < next { ((previous, next), 1) } else { ((next, previous), -1) };
+                *edges.entry(key).or_insert(0) += sign;
+            }
+            previous = next;
+        }
+    }
+    let mut edges: Vec<(usize, usize, i64)> = edges
+        .into_iter()
+        .filter(|(_, count)| *count != 0)
+        .map(|((a, b), count)| (a, b, count))
+        .collect();
+    // HashMap order is arbitrary; the loops must not depend on it.
+    edges.sort_unstable();
+    if edges.is_empty() {
+        return Vec::new();
+    }
+
+    // Buckets of edges by y span (for rays along x) and x span (along y).
+    let buckets = ((edges.len() as f64).sqrt().ceil() as usize).clamp(1, 1024);
+    let bucket_of = |value: f64, axis: usize| -> usize {
+        let span = (maximum[axis] - minimum[axis]).max(1e-12);
+        (((value - minimum[axis]) / span * buckets as f64) as isize).clamp(0, buckets as isize - 1) as usize
+    };
+    let mut by_axis: [Vec<Vec<usize>>; 2] = [vec![Vec::new(); buckets], vec![Vec::new(); buckets]];
+    for (index, &(a, b, _)) in edges.iter().enumerate() {
+        for axis in 0..2 {
+            let (low, high) = (points[a][axis].min(points[b][axis]), points[a][axis].max(points[b][axis]));
+            for bucket in bucket_of(low, axis)..=bucket_of(high, axis) {
+                by_axis[axis][bucket].push(index);
+            }
+        }
+    }
+    // Winding number just to the left of each edge.
+    let mut kept: Vec<(usize, usize)> = Vec::new();
+    for (index, &(a, b, count)) in edges.iter().enumerate() {
+        if index % 4096 == 4095 && super::bsp::deadline_passed() {
+            return unresolved();
+        }
+        let (pa, pb) = (points[a], points[b]);
+        let middle = [(pa[0] + pb[0]) * 0.5, (pa[1] + pb[1]) * 0.5];
+        let direction = sub(pb, pa);
+        let left = [-direction[1], direction[0]];
+        // Cast along x when the left normal is mostly horizontal, else y;
+        // `ray_axis` is the axis the ray runs along, `fixed` the other.
+        let ray_axis = if left[0].abs() >= left[1].abs() { 0 } else { 1 };
+        let fixed = 1 - ray_axis;
+        let sign = if left[ray_axis] >= 0.0 { 1.0 } else { -1.0 };
+        let mut ray_winding = 0i64;
+        for &other in &by_axis[fixed][bucket_of(middle[fixed], fixed)] {
+            if other == index {
+                continue;
+            }
+            let (c, d, other_count) = edges[other];
+            let (pc, pd) = (points[c], points[d]);
+            if (pc[fixed] > middle[fixed]) == (pd[fixed] > middle[fixed]) {
+                continue;
+            }
+            let hit = pc[ray_axis]
+                + (middle[fixed] - pc[fixed]) * (pd[ray_axis] - pc[ray_axis]) / (pd[fixed] - pc[fixed]);
+            if (hit - middle[ray_axis]) * sign <= 0.0 {
+                continue;
+            }
+            // A CCW loop around the ray's origin counts +1: for a ray along
+            // +x that is an edge going up (+y); along +y, an edge going -x.
+            let rising = pd[fixed] > pc[fixed];
+            let crossing = if ray_axis == 0 {
+                if rising { 1 } else { -1 }
+            } else if rising {
+                -1
+            } else {
+                1
+            };
+            ray_winding += crossing * other_count * sign as i64;
+        }
+        let left_winding = ray_winding;
+        let right_winding = left_winding - count;
+        match (left_winding > 0, right_winding > 0) {
+            (true, false) => kept.push((a, b)),
+            (false, true) => kept.push((b, a)),
+            _ => {}
+        }
+    }
+
+    // Link into loops.
+    let mut outgoing: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (index, (from, _)) in kept.iter().enumerate() {
+        outgoing.entry(*from).or_default().push(index);
+    }
+    let mut used = vec![false; kept.len()];
+    let mut loops = Vec::new();
+    for start in 0..kept.len() {
+        if used[start] {
+            continue;
+        }
+        let mut contour = Vec::new();
+        let mut current = start;
+        let mut closed = false;
+        loop {
+            used[current] = true;
+            let (from, to) = kept[current];
+            contour.push(points[from]);
+            if to == kept[start].0 {
+                closed = true;
+                break;
+            }
+            let incoming = sub(points[to], points[from]);
+            let next = outgoing.get(&to).and_then(|candidates| {
+                candidates
+                    .iter()
+                    .filter(|candidate| !used[**candidate])
+                    // The sharpest left turn: with the region on the left
+                    // that hugs the current face, so two shapes touching at
+                    // a vertex come out as two loops, not one figure-eight.
+                    .max_by(|x, y| {
+                        let turn = |edge: usize| {
+                            let out = sub(points[kept[edge].1], points[kept[edge].0]);
+                            cross(incoming, out).atan2(dot(incoming, out))
+                        };
+                        turn(**x).total_cmp(&turn(**y)).then(y.cmp(x))
+                    })
+                    .copied()
+            });
+            match next {
+                Some(next) => current = next,
+                None => break,
+            }
+        }
+        // An open walk means the boundary was inconsistent there; drop it
+        // rather than emit an unclosed contour.
+        if closed && contour.len() >= 3 && signed_area(&contour).abs() > AREA_EPSILON {
+            loops.push(contour);
+        }
+    }
+    // Deterministic order: outers (largest first), then holes.
+    loops.sort_by(|a, b| signed_area(b).total_cmp(&signed_area(a)));
+    loops
+}
+
+impl Region2d {
+    /// Shrinks a normalised region by `distance`, as the complement of the
+    /// grown complement: a frame around the region minus the region is
+    /// grown by `distance` (the robust direction: grow, then resolve), and
+    /// what that leaves uncovered inside the frame is the result. Features
+    /// thinner than `2 * distance` vanish cleanly, with no crossed necks or
+    /// spikes, and the region's concave corners come out rounded under
+    /// `rounded` exactly as `offset(r = -distance)` defines them (they are
+    /// the complement's convex corners).
+    fn erode(&self, distance: f64, rounded: bool, fragments: usize) -> Region2d {
+        let Some((low, high)) = self.bounds() else {
+            return Region2d::default();
+        };
+        let margin = 2.0 * distance + 1.0;
+        let frame = vec![
+            [low[0] - margin, low[1] - margin],
+            [high[0] + margin, low[1] - margin],
+            [high[0] + margin, high[1] + margin],
+            [low[0] - margin, high[1] + margin],
+        ];
+        let mut complement = Region2d::new(
+            std::iter::once(frame).chain(self.contours.iter().cloned()).collect(),
+        );
+        complement.normalize();
+        let grown = complement.offset(distance, rounded, fragments);
+        // The grown frame is the contour reaching furthest out; every other
+        // contour bounds what is left of the region.
+        let outermost = grown
+            .contours
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                let left = |contour: &Vec<Point2>| contour.iter().map(|point| point[0]).fold(f64::INFINITY, f64::min);
+                left(a).total_cmp(&left(b))
+            })
+            .map(|(index, _)| index);
+        let mut result = Region2d::new(
+            grown
+                .contours
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| Some(*index) != outermost)
+                .map(|(_, contour)| contour)
+                .collect(),
+        );
+        result.normalize();
         result
     }
 }
@@ -464,59 +825,6 @@ impl Region2d {
 // ---------------------------------------------------------------------------
 // Offsetting
 // ---------------------------------------------------------------------------
-
-/// Offsets a contour, pruning features the offset consumed.
-///
-/// [`offset_contour`] reports, per source edge, whether that edge survived the
-/// corner joins. A reversed edge means the offset ate straight through the
-/// feature it belonged to, and leaving it in would produce a crossed contour.
-/// Rather than emit garbage, *both* endpoints of every consumed edge are
-/// deleted from the source contour (an edge that vanished takes its two
-/// corners with it), the remainder is re-simplified, and the offset is
-/// retried. A thin arm therefore erodes away over a few rounds — the seam it
-/// leaves behind is a run of collinear points that `remove_collinear` folds
-/// back into the surviving wall — and a shape whose inradius is smaller than
-/// `|delta|` erodes to nothing.
-///
-/// Each round deletes at least one source vertex, so the loop is bounded by
-/// the vertex count and cannot spin.
-fn offset_contour_resolved(
-    contour: &[Point2],
-    delta: f64,
-    rounded: bool,
-    fragments: usize,
-) -> Vec<Point2> {
-    let mut work: Vec<Point2> = contour.to_vec();
-    for _ in 0..=contour.len() {
-        if work.len() < 3 {
-            return Vec::new();
-        }
-        let (points, survives) = offset_contour(&work, delta, rounded, fragments);
-        if survives.iter().all(|kept| *kept) {
-            return points;
-        }
-        let mut keep = vec![true; work.len()];
-        for (index, kept) in survives.iter().enumerate() {
-            if !kept {
-                keep[index] = false;
-                keep[(index + 1) % work.len()] = false;
-            }
-        }
-        let mut pruned: Vec<Point2> = work
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| keep[*index])
-            .map(|(_, point)| *point)
-            .collect();
-        if pruned.len() == work.len() {
-            return Vec::new(); // no progress: give up rather than loop
-        }
-        dedup_ring(&mut pruned, POINT_EPSILON);
-        remove_collinear(&mut pruned, COLLINEAR_EPSILON);
-        work = pruned;
-    }
-    Vec::new()
-}
 
 /// Offsets a single contour, preserving its winding.
 ///
@@ -610,6 +918,16 @@ fn offset_contour(
                         delta.abs(),
                         fragments,
                     );
+                } else if turn * delta < 0.0 {
+                    // The offset edges overlap here. Route through the
+                    // original corner (as polygon clippers do): the little
+                    // bow-tie it makes is cut away by the positive-winding
+                    // resolve, which leaves exactly the mitre, and a shape
+                    // shrunk past its centre then cancels out instead of
+                    // reappearing point-mirrored with its own orientation.
+                    output.push(start);
+                    output.push(corner);
+                    output.push(end);
                 } else {
                     match miter_point(corner, incoming_normal, outgoing_normal, delta) {
                         Some(point) => output.push(point),
@@ -818,6 +1136,8 @@ fn triangulate_with_holes_inner(outer: &[Point2], holes: &[Vec<Point2>]) -> Vec<
     // contours. Whichever passes wins; bridging wins ties.
     let mut bridged = ring.clone();
     for hole in &prepared {
+        // Each bridge scans the whole (growing) ring.
+        super::bsp::check_interrupt();
         bridge_hole(&mut bridged, hole);
     }
     let bridged = ear_clip(&bridged);
@@ -862,6 +1182,7 @@ fn prune_spurs(contour: &mut Vec<Point2>) {
         if contour.len() < 3 {
             return;
         }
+        super::bsp::check_interrupt();
         let count = contour.len();
         let tip = (0..count).find(|index| {
             let before = contour[(index + count - 1) % count];
@@ -1051,7 +1372,10 @@ fn monotone_pieces(outer: &[Point2], holes: &[Vec<Point2>]) -> Option<Vec<Vec<Po
     let mut status: Vec<(usize, usize)> = Vec::new();
     let mut diagonals: Vec<(usize, usize)> = Vec::new();
 
+    let mut polls = 0usize;
     for &vertex in &order {
+        // The status scan is linear, so the sweep is quadratic at worst.
+        super::bsp::poll_interrupt(&mut polls, 256);
         let height = points[vertex][1];
         let left_of = |status: &Vec<(usize, usize)>| -> Option<usize> {
             let mut best: Option<(f64, usize)> = None;
@@ -1148,7 +1472,9 @@ fn subdivision_faces(
 
     let mut used = vec![false; edges.len()];
     let mut faces: Vec<Vec<Point2>> = Vec::new();
+    let mut polls = 0usize;
     for start in 0..edges.len() {
+        super::bsp::poll_interrupt(&mut polls, 1024);
         if used[start] {
             continue;
         }
@@ -1484,8 +1810,20 @@ fn ear_clip(polygon: &[Point2]) -> Vec<[Point2; 3]> {
         vertices.reverse();
     }
 
+    if let Some(triangles) = convex_fan(&vertices) {
+        return triangles;
+    }
+    ear_clip_general(vertices)
+}
+
+/// [`ear_clip`] without the convex fast path, on a CCW ring.
+fn ear_clip_general(mut vertices: Vec<Point2>) -> Vec<[Point2; 3]> {
     let mut triangles: Vec<[Point2; 3]> = Vec::new();
     let maximum_iterations = vertices.len() * 3 + 16;
+    // Ear clipping is quadratic (cubic on adversarial rings), so a
+    // 100k-vertex outline is billions of point tests: poll for cancellation
+    // and deadlines every few thousand of them rather than once per call.
+    let mut polls = 0usize;
     let mut iterations = 0usize;
     // Flat vertices the loop below drops to keep making progress, as
     // `[before, dropped, after]`. Dropping one is harmless for *area* and
@@ -1514,6 +1852,7 @@ fn ear_clip(polygon: &[Point2]) -> Vec<[Point2; 3]> {
             }
             let mut valid = true;
             for other in 0..count {
+                super::bsp::poll_interrupt(&mut polls, 4096);
                 if other == before || other == index || other == after {
                     continue;
                 }
@@ -1549,6 +1888,7 @@ fn ear_clip(polygon: &[Point2]) -> Vec<[Point2; 3]> {
 
         let mut removed = false;
         for index in 0..count {
+            super::bsp::poll_interrupt(&mut polls, 4096);
             let before = (index + count - 1) % count;
             let after = (index + 1) % count;
             let a = vertices[before];
@@ -1586,6 +1926,48 @@ fn ear_clip(polygon: &[Point2]) -> Vec<[Point2; 3]> {
     }
     restore_dropped_vertices(&mut triangles, &dropped);
     triangles
+}
+
+/// The triangulation [`ear_clip`] produces for a strictly convex CCW ring,
+/// in linear time instead of quadratic, or `None` when the ring is not one.
+///
+/// On a strictly convex ring the clipper's first candidate, vertex 0, is
+/// always an ear, so it clips `[last, v0, v1]`, then `[last, v1, v2]`, and so
+/// on: a fan from the last vertex, finished by the remaining three through
+/// `push_triangle`. This emits exactly that sequence. "Strictly convex" here
+/// means every corner turns left by more than [`AREA_EPSILON`] (so there are
+/// no flat or repeated vertices to drop) and the turns add up to one full
+/// revolution (so the ring does not wind around twice). A circle of
+/// `$fn = 100000` is such a ring and used to take minutes.
+fn convex_fan(vertices: &[Point2]) -> Option<Vec<[Point2; 3]>> {
+    let count = vertices.len();
+    if count < 4 {
+        return None;
+    }
+    let mut turning = 0.0f64;
+    for index in 0..count {
+        let a = vertices[(index + count - 1) % count];
+        let b = vertices[index];
+        let c = vertices[(index + 1) % count];
+        let incoming = sub(b, a);
+        let outgoing = sub(c, b);
+        let turn = cross(incoming, outgoing);
+        if turn <= AREA_EPSILON {
+            return None;
+        }
+        turning += turn.atan2(dot(incoming, outgoing));
+    }
+    // Exactly 2*pi for a simple ring, 4*pi or more for one wound twice.
+    if !(turning > std::f64::consts::PI && turning < 3.0 * std::f64::consts::PI) {
+        return None;
+    }
+    let last = vertices[count - 1];
+    let mut triangles = Vec::with_capacity(count - 2);
+    for index in 0..count - 3 {
+        triangles.push([last, vertices[index], vertices[index + 1]]);
+    }
+    push_triangle(&mut triangles, vertices[count - 3], vertices[count - 2], last);
+    Some(triangles)
 }
 
 /// Puts back the flat vertices [`ear_clip`] dropped, without moving anything.
@@ -1968,6 +2350,48 @@ mod tests {
     }
 
     #[test]
+    fn nonzero_resolution_merges_overlaps_and_untwists_bow_ties() {
+        // Two overlapping squares: one outline of the union.
+        let merged = resolve_nonzero(&[square(10.0), rectangle(5.0, 5.0, 15.0, 15.0)]);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert!((signed_area(&merged[0]) - 175.0).abs() < 1e-9);
+        // A bow-tie (self-crossing): its CCW lobe survives, the CW lobe
+        // (negative winding) does not.
+        let bow = resolve_nonzero(&[vec![[0.0, 0.0], [10.0, 10.0], [10.0, 0.0], [0.0, 10.0]]]);
+        assert_eq!(bow.len(), 1, "{bow:?}");
+        assert!((signed_area(&bow[0]) - 25.0).abs() < 1e-9, "{bow:?}");
+        // A square with a hole stays a square with a hole.
+        let holed = resolve_nonzero(&[square(10.0), vec![[3.0, 3.0], [3.0, 7.0], [7.0, 7.0], [7.0, 3.0]]]);
+        assert_eq!(holed.len(), 2);
+        assert!((holed.iter().map(|c| signed_area(c)).sum::<f64>() - 84.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resolution_keeps_corner_touching_squares_apart_and_handles_far_coordinates() {
+        let touching = resolve_nonzero(&[square(1.0), rectangle(1.0, 1.0, 2.0, 2.0)]);
+        assert_eq!(touching.len(), 2, "{touching:?}");
+        assert!(touching.iter().all(|contour| contour.len() == 4), "{touching:?}");
+        let far = resolve_nonzero(&[rectangle(1e10, 0.0, 1e10 + 1.0, 1.0)]);
+        assert_eq!(far.len(), 1);
+        assert!((signed_area(&far[0]) - 1.0).abs() < 1e-3, "{far:?}");
+    }
+
+    #[test]
+    fn grown_neighbours_merge_into_simple_contours() {
+        // Two squares 1 apart grown by 1: they merge into one outline.
+        let mut region = Region2d::new(vec![square(10.0), rectangle(11.0, 0.0, 21.0, 10.0)]);
+        region.normalize();
+        let grown = region.offset(1.0, false, 32);
+        assert_eq!(grown.contours.len(), 1, "{:?}", grown.contours);
+        assert!((grown.area() - 23.0 * 12.0).abs() < 1e-6, "got {}", grown.area());
+        // Shrinking back is a closing: the 1 mm gap stays fused into one
+        // 21 x 10 block.
+        let back = grown.offset(-1.0, false, 32);
+        assert_eq!(back.contours.len(), 1, "{:?}", back.contours);
+        assert!((back.area() - 210.0).abs() < 1e-6, "got {}", back.area());
+    }
+
+    #[test]
     fn offset_preserves_holes() {
         let mut region = Region2d::new(vec![square(20.0), rectangle(8.0, 8.0, 12.0, 12.0)]);
         region.normalize();
@@ -2204,5 +2628,101 @@ mod tests {
         let mut collapsed = Region2d::new(vec![vec![[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]]);
         collapsed.normalize();
         assert!(collapsed.contours.is_empty());
+    }
+
+    fn ring_of(count: usize, radius: f64, jitter: impl Fn(usize) -> f64) -> Vec<Point2> {
+        (0..count)
+            .map(|index| {
+                let angle = std::f64::consts::TAU * index as f64 / count as f64;
+                let r = radius * jitter(index);
+                [r * angle.cos(), r * angle.sin()]
+            })
+            .collect()
+    }
+
+    /// The fan is not a different triangulation, it is the clipper's own one
+    /// computed in linear time: same triangles, same order, same bits.
+    #[test]
+    fn the_convex_fan_is_exactly_what_the_ear_clipper_produces() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut rings: Vec<Vec<Point2>> = [3usize, 4, 5, 8, 30, 100, 777, 2000]
+            .iter()
+            .map(|count| ring_of(*count, 10.0, |_| 1.0))
+            .collect();
+        for _ in 0..200 {
+            // Random convex polygons: sorted random angles on an ellipse,
+            // shifted and scaled.
+            let count = 4 + (random() * 60.0) as usize;
+            let mut angles: Vec<f64> = (0..count).map(|_| random() * std::f64::consts::TAU).collect();
+            angles.sort_by(f64::total_cmp);
+            let (sx, sy, ox, oy) = (0.1 + random() * 50.0, 0.1 + random() * 50.0, random() * 1e3, -random() * 1e3);
+            rings.push(angles.iter().map(|a| [ox + sx * a.cos(), oy + sy * a.sin()]).collect());
+        }
+        let mut fast_paths = 0;
+        for ring in &rings {
+            let mut ccw = ring.clone();
+            if signed_area(&ccw) < 0.0 {
+                ccw.reverse();
+            }
+            let general = ear_clip_general(ccw.clone());
+            if let Some(fan) = convex_fan(&ccw) {
+                fast_paths += 1;
+                assert_eq!(fan.len(), general.len());
+                let bits = |t: &[[Point2; 3]]| -> Vec<u64> { t.iter().flatten().flatten().map(|v| v.to_bits()).collect() };
+                assert_eq!(bits(&fan), bits(&general), "ring of {}", ccw.len());
+            }
+            assert!((total_area(&ear_clip(&ccw)) - signed_area(&ccw)).abs() <= signed_area(&ccw).abs() * 1e-9);
+        }
+        assert!(fast_paths > 150, "{fast_paths}");
+        // Not convex, or wound twice: no fast path.
+        assert!(convex_fan(&ring_of(40, 10.0, |i| if i % 2 == 0 { 1.0 } else { 0.5 })).is_none());
+        let twice: Vec<Point2> = (0..40)
+            .map(|i| {
+                let a = 2.0 * std::f64::consts::TAU * i as f64 / 40.0;
+                [a.cos(), a.sin()]
+            })
+            .collect();
+        assert!(convex_fan(&twice).is_none());
+    }
+
+    #[test]
+    fn a_hundred_thousand_segment_circle_triangulates_in_linear_time() {
+        let circle = ring_of(100_000, 100.0, |_| 1.0);
+        let started = std::time::Instant::now();
+        let triangles = Region2d::new(vec![circle.clone()]).triangulate();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+        assert_eq!(triangles.len(), 99_998);
+        assert!((total_area(&triangles) - signed_area(&circle)).abs() < 1e-6);
+    }
+
+    /// A 100k-point star has no fast path; the clipper must notice a cancel
+    /// in the middle of its quadratic scan rather than after it.
+    #[test]
+    fn a_cancelled_ear_clip_stops_promptly() {
+        let star = ring_of(100_000, 100.0, |i| if i % 2 == 0 { 1.0 } else { 0.98 });
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _scope = super::super::bsp::cancellation_scope(std::sync::Arc::clone(&flag));
+        let tripper = {
+            let flag = std::sync::Arc::clone(&flag);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                flag.store(true, std::sync::atomic::Ordering::Release);
+                std::time::Instant::now()
+            })
+        };
+        let caught = std::panic::catch_unwind(|| Region2d::new(vec![star]).triangulate());
+        let finished = std::time::Instant::now();
+        let tripped = tripper.join().unwrap();
+        let payload = caught.expect_err("a cancelled triangulation must abort");
+        let message = payload.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(message.ends_with("Render cancelled."), "{message}");
+        let overrun = finished.saturating_duration_since(tripped);
+        assert!(overrun < std::time::Duration::from_secs(1), "ran {overrun:?} past the cancel");
     }
 }

@@ -1,4 +1,10 @@
-//! The built-in single-stroke font `text()` draws with.
+//! The built-in single-stroke face, selected with
+//! `text(font = "ReOpenSCAD Stroke")`.
+//!
+//! `text()` now sets type in the bundled outline fonts of
+//! [`super::typeface`] by default (Liberation Sans, as in OpenSCAD). This
+//! monoline face is kept for engraving and pen plotting, where one stroke per
+//! letter is the point. The notes below date from when it was the only face.
 //!
 //! # Why there is a font in here at all
 //!

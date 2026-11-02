@@ -55,7 +55,7 @@ pub(super) fn call(name: &str, arguments: &[Value]) -> Option<BuiltinResult> {
         "is_list" => predicate(name, arguments, |value| matches!(value, Value::Vector(_))),
         "is_function" => predicate(name, arguments, |value| matches!(value, Value::Function(_))),
         "version" => exact(name, arguments, 0).map(|_| {
-            Value::Vector(vec![
+            Value::vector(vec![
                 Value::Number(2021.0),
                 Value::Number(1.0),
                 Value::Number(0.0),
@@ -171,7 +171,7 @@ fn cross(arguments: &[Value]) -> BuiltinResult {
     let right = numeric_vector("cross", &arguments[1])?;
     match (left.as_slice(), right.as_slice()) {
         ([ax, ay], [bx, by]) => Ok(Value::Number(ax * by - ay * bx)),
-        ([ax, ay, az], [bx, by, bz]) => Ok(Value::Vector(vec![
+        ([ax, ay, az], [bx, by, bz]) => Ok(Value::vector(vec![
             Value::Number(ay * bz - az * by),
             Value::Number(az * bx - ax * bz),
             Value::Number(ax * by - ay * bx),
@@ -218,10 +218,27 @@ fn rands(arguments: &[Value]) -> BuiltinResult {
         let unit = ((state >> 11) as f64) * (1.0 / ((1_u64 << 53) as f64));
         values.push(Value::Number(minimum + (maximum - minimum) * unit));
     }
-    Ok(Value::Vector(values))
+    Ok(Value::vector(values))
+}
+
+thread_local! {
+    /// Set when this thread's evaluation called `rands()` without a seed, so
+    /// the result differs run to run and must not be memoised.
+    static NONDETERMINISTIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Clears the flag; called before an evaluation starts.
+pub(super) fn reset_nondeterminism() {
+    NONDETERMINISTIC.with(|flag| flag.set(false));
+}
+
+/// Whether anything since the last reset drew unseeded randomness.
+pub(super) fn nondeterminism_observed() -> bool {
+    NONDETERMINISTIC.with(std::cell::Cell::get)
 }
 
 fn unseeded_random_state() -> u64 {
+    NONDETERMINISTIC.with(|flag| flag.set(true));
     static PROCESS_SEED: OnceLock<u64> = OnceLock::new();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -253,7 +270,7 @@ fn concat(arguments: &[Value]) -> BuiltinResult {
             value => result.push(value.clone()),
         }
     }
-    Ok(Value::Vector(result))
+    Ok(Value::vector(result))
 }
 
 fn stringify(arguments: &[Value]) -> BuiltinResult {
@@ -291,7 +308,7 @@ fn value_string(value: &Value) -> String {
 fn chr(arguments: &[Value]) -> BuiltinResult {
     exact("chr", arguments, 1)?;
     let values = match &arguments[0] {
-        Value::Vector(values) => values.clone(),
+        Value::Vector(values) => values.to_vec(),
         Value::Range { start, step, end } => range_values("chr", *start, *step, *end)?
             .into_iter()
             .map(Value::Number)
@@ -329,7 +346,7 @@ fn lookup(arguments: &[Value]) -> BuiltinResult {
         return Err(invalid("lookup", "expected a table."));
     };
     let mut table = Vec::with_capacity(rows.len());
-    for row in rows {
+    for row in rows.iter() {
         let Value::Vector(columns) = row else {
             return Err(invalid("lookup", "expected two-column table rows."));
         };
@@ -393,7 +410,7 @@ fn search(arguments: &[Value]) -> BuiltinResult {
             .chars()
             .map(|c| Value::String(c.to_string()))
             .collect(),
-        Value::Vector(values) => values.clone(),
+        Value::Vector(values) => values.to_vec(),
         value => vec![value.clone()],
     };
     let mut result = Vec::with_capacity(matches.len());
@@ -416,10 +433,10 @@ fn search(arguments: &[Value]) -> BuiltinResult {
                 result.push(index);
             }
         } else {
-            result.push(Value::Vector(indexes));
+            result.push(Value::vector(indexes));
         }
     }
-    Ok(Value::Vector(result))
+    Ok(Value::vector(result))
 }
 
 fn search_one(needle: &Value, target: &Value, column: usize) -> Result<Vec<usize>, String> {
@@ -517,7 +534,7 @@ mod tests {
             ("min", vec![Value::Number(2.0), Value::Number(f64::NAN)]),
             (
                 "max",
-                vec![Value::Vector(vec![
+                vec![Value::vector(vec![
                     Value::Number(f64::NAN),
                     Value::Number(2.0),
                 ])],
@@ -535,9 +552,9 @@ mod tests {
 
     #[test]
     fn lookup_propagates_nan_without_panicking() {
-        let table = Value::Vector(vec![
-            Value::Vector(vec![Value::Number(0.0), Value::Number(1.0)]),
-            Value::Vector(vec![Value::Number(1.0), Value::Number(2.0)]),
+        let table = Value::vector(vec![
+            Value::vector(vec![Value::Number(0.0), Value::Number(1.0)]),
+            Value::vector(vec![Value::Number(1.0), Value::Number(2.0)]),
         ]);
         let Value::Number(result) = call("lookup", &[Value::Number(f64::NAN), table])
             .expect("known builtin")
@@ -547,9 +564,9 @@ mod tests {
         };
         assert!(result.is_nan());
 
-        let table_with_nan_key = Value::Vector(vec![
-            Value::Vector(vec![Value::Number(0.0), Value::Number(1.0)]),
-            Value::Vector(vec![Value::Number(f64::NAN), Value::Number(2.0)]),
+        let table_with_nan_key = Value::vector(vec![
+            Value::vector(vec![Value::Number(0.0), Value::Number(1.0)]),
+            Value::vector(vec![Value::Number(f64::NAN), Value::Number(2.0)]),
         ]);
         let Value::Number(result) = call("lookup", &[Value::Number(0.5), table_with_nan_key])
             .expect("known builtin")

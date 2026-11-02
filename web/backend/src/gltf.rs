@@ -32,8 +32,10 @@
 //! honest rendering of a polyhedral B-rep — the facets are the geometry, not an
 //! approximation of a smooth surface.
 
-use crate::engine::{Mesh, Vec3};
 use crate::csg::mesh::FastMap;
+use crate::engine::{Mesh, Vec3};
+use crate::export::ExportBody;
+use std::fmt::Write as _;
 
 /// Millimetres to metres, glTF's unit.
 const MILLIMETRES_PER_METRE: f64 = 1000.0;
@@ -209,81 +211,243 @@ fn geometric_normal(vertices: [Vec3; 3]) -> Option<[f64; 3]> {
 /// the three `u32` sizes in the GLB header from wrapping: a header claiming a
 /// 4 GiB file is twelve bytes long is a corrupt download, where a rejection is
 /// an error the caller can report.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn write(mesh: &Mesh, title: &str, budget: usize) -> Option<Vec<u8>> {
-    let primitive = build(mesh);
+    write_primitives(&[(title, vec![(None, build(mesh))])], title, budget)
+}
 
-    // Buffer layout: positions, normals, then indices. Every accessor's offset
-    // has to be a multiple of its component size (4 bytes here) and every
-    // buffer view a multiple of 4, which holds because all three arrays are
-    // made of 4-byte components.
-    let positions_length = primitive.positions.len() * 12;
-    let normals_length = primitive.normals.len() * 12;
-    let indices_length = primitive.indices.len() * 4;
-    if positions_length + normals_length + indices_length
-        > budget.min(u32::MAX as usize - GLB_OVERHEAD_CEILING)
-    {
+/// One body's primitives: a single one in its colour, or — for a body painted
+/// per face — one per colour, each with its own material, under the body's
+/// one mesh. glTF has no per-triangle material, and this is its idiom for it.
+fn body_primitives(body: &ExportBody) -> Vec<(Option<[f64; 4]>, Primitive)> {
+    let Some(colors) = &body.face_colors else {
+        return vec![(body.color, build(&body.mesh))];
+    };
+    let mut split: Vec<Mesh> = vec![Mesh::default(); colors.palette.len()];
+    for (index, triangle) in body.mesh.triangles.iter().enumerate() {
+        if let Some(mesh) = colors.faces.get(index).and_then(|slot| split.get_mut(usize::from(*slot))) {
+            mesh.triangles.push(triangle.clone());
+        }
+    }
+    colors
+        .palette
+        .iter()
+        .zip(split)
+        .filter(|(_, mesh)| !mesh.triangles.is_empty())
+        .map(|(color, mesh)| (*color, build(&mesh)))
+        .collect()
+}
+
+/// Build a `.glb` with one node, mesh and material per body.
+///
+/// A single body is laid out exactly as [`write`] lays out a mesh (one node),
+/// named after the body, with its stated colour as the base colour. Several bodies
+/// hang as named children under one root node named `title`, each with its own
+/// mesh and its own material, so a viewer lists them separately and nothing is
+/// merged. A body painted in several colours is still one node and one mesh,
+/// with a primitive and material per colour.
+pub fn write_bodies(bodies: &[ExportBody], title: &str, budget: usize) -> Option<Vec<u8>> {
+    // Every index is 4 bytes and every triangle has three, so this is a floor
+    // on the binary chunk: an export certainly over budget is refused before
+    // any per-body buffer is built.
+    let triangles: usize = bodies.iter().map(|body| body.mesh.triangles.len()).sum();
+    if triangles.saturating_mul(12) > budget {
         return None;
     }
-    let mut binary = Vec::with_capacity(positions_length + normals_length + indices_length);
-    for position in &primitive.positions {
-        for value in position {
-            binary.extend_from_slice(&value.to_le_bytes());
-        }
+    if let [body] = bodies {
+        // The lone body keeps its own name (node, mesh and material), not the
+        // document title: a single named object must not export anonymous.
+        let name = if body.name.trim().is_empty() { title } else { body.name.as_str() };
+        return write_primitives(&[(name, body_primitives(body))], title, budget);
     }
-    for normal in &primitive.normals {
-        for value in normal {
-            binary.extend_from_slice(&value.to_le_bytes());
-        }
+    let primitives: Vec<BodyPrimitives> = bodies
+        .iter()
+        .map(|body| (body.name.as_str(), body_primitives(body)))
+        .collect();
+    write_primitives(&primitives, title, budget)
+}
+
+type BodyPrimitives<'a> = (&'a str, Vec<(Option<[f64; 4]>, Primitive)>);
+
+/// sRGB (what `color()` states) to the linear factor glTF's base colour is.
+fn linear(channel: f64) -> f64 {
+    let channel = channel.clamp(0.0, 1.0);
+    if channel <= 0.04045 {
+        channel / 12.92
+    } else {
+        ((channel + 0.055) / 1.055).powf(2.4)
     }
-    for index in &primitive.indices {
-        binary.extend_from_slice(&index.to_le_bytes());
+}
+
+fn material_json(name: &str, color: Option<[f64; 4]>) -> String {
+    let (factor, blend) = match color {
+        None => ("[0.95,0.77,0.29,1]".to_string(), false),
+        Some([r, g, b, a]) => {
+            let render = |value: f64| float_text(value as f32);
+            (
+                format!(
+                    "[{},{},{},{}]",
+                    render(linear(r)),
+                    render(linear(g)),
+                    render(linear(b)),
+                    render(a.clamp(0.0, 1.0))
+                ),
+                a < 1.0,
+            )
+        }
+    };
+    format!(
+        "{{\"name\":{},\"doubleSided\":false,{}\
+         \"pbrMetallicRoughness\":{{\"baseColorFactor\":{factor},\
+         \"metallicFactor\":0,\"roughnessFactor\":0.55}}}}",
+        json_string(name),
+        if blend { "\"alphaMode\":\"BLEND\"," } else { "" },
+    )
+}
+
+fn write_primitives(primitives: &[BodyPrimitives], title: &str, budget: usize) -> Option<Vec<u8>> {
+    // Buffer layout, per primitive with geometry: positions, normals, then
+    // indices. Every accessor's offset has to be a multiple of its component
+    // size (4 bytes here) and every buffer view a multiple of 4, which holds
+    // because all three arrays are made of 4-byte components.
+    let total: usize = primitives
+        .iter()
+        .flat_map(|(_, parts)| parts.iter())
+        .map(|(_, p)| p.positions.len() * 24 + p.indices.len() * 4)
+        .sum();
+    if total > budget.min(u32::MAX as usize - GLB_OVERHEAD_CEILING) {
+        return None;
+    }
+    let mut binary = Vec::with_capacity(total);
+    let mut meshes = Vec::new();
+    let mut materials = Vec::new();
+    let mut accessors = Vec::new();
+    let mut views = Vec::new();
+    // Mesh index per body, `None` for a body without geometry.
+    let mut mesh_of = Vec::with_capacity(primitives.len());
+    for (name, parts) in primitives {
+        let painted = parts.len() > 1;
+        let mut entries = Vec::with_capacity(parts.len());
+        for (color, primitive) in parts {
+            let vertex_count = primitive.positions.len();
+            let index_count = primitive.indices.len();
+            if vertex_count == 0 || index_count == 0 {
+                continue;
+            }
+            let positions_offset = binary.len();
+            for position in &primitive.positions {
+                for value in position {
+                    binary.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+            let normals_offset = binary.len();
+            for normal in &primitive.normals {
+                for value in normal {
+                    binary.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+            let indices_offset = binary.len();
+            for index in &primitive.indices {
+                binary.extend_from_slice(&index.to_le_bytes());
+            }
+            let first = accessors.len();
+            let material = materials.len();
+            // A body in several colours names each material after its colour too,
+            // so the outline of a viewer tells them apart.
+            let material_name = match (painted, color) {
+                (true, Some(color)) => format!("{name} {}", crate::export::hex_color(*color)),
+                _ => (*name).to_string(),
+            };
+            materials.push(material_json(&material_name, *color));
+            entries.push(format!(
+                "{{\"attributes\":{{\"POSITION\":{first},\"NORMAL\":{}}},\"indices\":{},\"material\":{material}}}",
+                first + 1,
+                first + 2
+            ));
+            accessors.push(format!(
+                "{{\"bufferView\":{first},\"componentType\":{COMPONENT_FLOAT},\"count\":{vertex_count},\
+                 \"type\":\"VEC3\",\"min\":{},\"max\":{}}}",
+                float_array(&primitive.min),
+                float_array(&primitive.max)
+            ));
+            accessors.push(format!(
+                "{{\"bufferView\":{},\"componentType\":{COMPONENT_FLOAT},\"count\":{vertex_count},\
+                 \"type\":\"VEC3\"}}",
+                first + 1
+            ));
+            accessors.push(format!(
+                "{{\"bufferView\":{},\"componentType\":{COMPONENT_UNSIGNED_INT},\"count\":{index_count},\
+                 \"type\":\"SCALAR\"}}",
+                first + 2
+            ));
+            views.push(format!(
+                "{{\"buffer\":0,\"byteOffset\":{positions_offset},\"byteLength\":{},\
+                 \"target\":{TARGET_ARRAY_BUFFER}}}",
+                normals_offset - positions_offset
+            ));
+            views.push(format!(
+                "{{\"buffer\":0,\"byteOffset\":{normals_offset},\"byteLength\":{},\
+                 \"target\":{TARGET_ARRAY_BUFFER}}}",
+                indices_offset - normals_offset
+            ));
+            views.push(format!(
+                "{{\"buffer\":0,\"byteOffset\":{indices_offset},\"byteLength\":{},\
+                 \"target\":{TARGET_ELEMENT_ARRAY_BUFFER}}}",
+                binary.len() - indices_offset
+            ));
+        }
+        if entries.is_empty() {
+            mesh_of.push(None);
+            continue;
+        }
+        mesh_of.push(Some(meshes.len()));
+        meshes.push(format!(
+            "{{\"name\":{},\"primitives\":[{}]}}",
+            json_string(name),
+            entries.join(",")
+        ));
     }
 
-    let vertex_count = primitive.positions.len();
-    let index_count = primitive.indices.len();
-    let json = if vertex_count == 0 || index_count == 0 {
-        // glTF forbids an empty `meshes`/`accessors` array, so a model with no
-        // geometry becomes a scene with an empty node rather than a file no
-        // viewer will open.
-        format!(
-            "{{\"asset\":{{\"version\":\"2.0\",\"generator\":\"ReOpenSCAD\"}},\
-             \"scene\":0,\"scenes\":[{{\"nodes\":[0]}}],\
-             \"nodes\":[{{\"name\":{}}}]}}",
-            json_string(title)
-        )
-    } else {
-        format!(
-            "{{\"asset\":{{\"version\":\"2.0\",\"generator\":\"ReOpenSCAD\"}},\
-             \"scene\":0,\
-             \"scenes\":[{{\"nodes\":[0]}}],\
-             \"nodes\":[{{\"name\":{name},\"mesh\":0}}],\
-             \"meshes\":[{{\"name\":{name},\"primitives\":[{{\"attributes\":\
-             {{\"POSITION\":0,\"NORMAL\":1}},\"indices\":2,\"material\":0}}]}}],\
-             \"materials\":[{{\"name\":\"ReOpenSCAD\",\"doubleSided\":false,\
-             \"pbrMetallicRoughness\":{{\"baseColorFactor\":[0.95,0.77,0.29,1],\
-             \"metallicFactor\":0,\"roughnessFactor\":0.55}}}}],\
-             \"accessors\":[\
-             {{\"bufferView\":0,\"componentType\":{COMPONENT_FLOAT},\"count\":{vertex_count},\
-             \"type\":\"VEC3\",\"min\":{min},\"max\":{max}}},\
-             {{\"bufferView\":1,\"componentType\":{COMPONENT_FLOAT},\"count\":{vertex_count},\
-             \"type\":\"VEC3\"}},\
-             {{\"bufferView\":2,\"componentType\":{COMPONENT_UNSIGNED_INT},\"count\":{index_count},\
-             \"type\":\"SCALAR\"}}],\
-             \"bufferViews\":[\
-             {{\"buffer\":0,\"byteOffset\":0,\"byteLength\":{positions_length},\
-             \"target\":{TARGET_ARRAY_BUFFER}}},\
-             {{\"buffer\":0,\"byteOffset\":{positions_length},\"byteLength\":{normals_length},\
-             \"target\":{TARGET_ARRAY_BUFFER}}},\
-             {{\"buffer\":0,\"byteOffset\":{normals_offset},\"byteLength\":{indices_length},\
-             \"target\":{TARGET_ELEMENT_ARRAY_BUFFER}}}],\
-             \"buffers\":[{{\"byteLength\":{buffer_length}}}]}}",
-            name = json_string(title),
-            min = float_array(&primitive.min),
-            max = float_array(&primitive.max),
-            normals_offset = positions_length + normals_length,
-            buffer_length = binary.len(),
-        )
+    let node = |name: &str, mesh: Option<usize>| match mesh {
+        Some(mesh) => format!("{{\"name\":{},\"mesh\":{mesh}}}", json_string(name)),
+        None => format!("{{\"name\":{}}}", json_string(name)),
     };
+    let nodes = if primitives.len() == 1 {
+        vec![node(primitives[0].0, mesh_of[0])]
+    } else {
+        let children: Vec<String> = (1..=primitives.len()).map(|i| i.to_string()).collect();
+        let mut nodes = vec![format!(
+            "{{\"name\":{},\"children\":[{}]}}",
+            json_string(title),
+            children.join(",")
+        )];
+        for ((name, _), mesh) in primitives.iter().zip(&mesh_of) {
+            nodes.push(node(name, *mesh));
+        }
+        nodes
+    };
+    let mut json = format!(
+        "{{\"asset\":{{\"version\":\"2.0\",\"generator\":\"ReOpenSCAD\"}},\
+         \"scene\":0,\"scenes\":[{{\"nodes\":[0]}}],\
+         \"nodes\":[{}]",
+        nodes.join(",")
+    );
+    // glTF forbids an empty `meshes`/`accessors` array, so a model with no
+    // geometry becomes a scene with empty nodes rather than a file no viewer
+    // will open.
+    if !meshes.is_empty() {
+        let _ = write!(
+            json,
+            ",\"meshes\":[{}],\"materials\":[{}],\"accessors\":[{}],\"bufferViews\":[{}],\
+             \"buffers\":[{{\"byteLength\":{}}}]",
+            meshes.join(","),
+            materials.join(","),
+            accessors.join(","),
+            views.join(","),
+            binary.len()
+        );
+    }
+    json.push('}');
 
     // Both chunks are padded to four bytes: JSON with spaces (still valid
     // JSON), BIN with zeros (unreferenced trailing bytes).
@@ -311,22 +475,23 @@ pub fn write(mesh: &Mesh, title: &str, budget: usize) -> Option<Vec<u8>> {
     Some(output)
 }
 
+fn float_text(value: f32) -> String {
+    if value.is_finite() {
+        format!("{value}")
+    } else {
+        "0".into()
+    }
+}
+
 /// `f32` rendered so that JSON keeps it a number: `Display` on a whole float
 /// prints `1`, which is a valid JSON number, and never reaches for exponent
 /// notation, so nothing else needs fixing up.
 fn float_array(values: &[f32; 3]) -> String {
-    let render = |value: f32| {
-        if value.is_finite() {
-            format!("{value}")
-        } else {
-            "0".into()
-        }
-    };
     format!(
         "[{},{},{}]",
-        render(values[0]),
-        render(values[1]),
-        render(values[2])
+        float_text(values[0]),
+        float_text(values[1]),
+        float_text(values[2])
     )
 }
 

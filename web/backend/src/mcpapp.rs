@@ -286,7 +286,7 @@ const VIEWER_TEMPLATE: &str = r##"<!doctype html>
 <body>
 <header>
   <h1>__TITLE__</h1>
-  <span class="meta">workspace __WORKSPACE_ID__ &middot; revision __REVISION__</span>
+  <span class="meta">design __WORKSPACE_ID__ &middot; revision __REVISION__</span>
 </header>
 <main>
   <div id="stage"><canvas id="view"></canvas><div id="hint">Drag to orbit &middot; scroll to zoom</div></div>
@@ -415,7 +415,7 @@ const VIEWER_TEMPLATE: &str = r##"<!doctype html>
     fail('Could not decode the preview mesh.');
     return;
   }
-  if (!mesh.indices.length) { fail('This workspace has no 3D geometry to preview.'); return; }
+  if (!mesh.indices.length) { fail('This design has no 3D geometry to preview.'); return; }
 
   var canvas = document.getElementById('view');
   var gl = canvas.getContext('webgl', { antialias: true, alpha: false });
@@ -614,7 +614,7 @@ mod tests {
             7,
             &output.parts,
             &preview,
-            "http://host/workspaces/silly-otter-1",
+            "http://host/designs/silly-otter-1",
             "http://host/export.stl",
             "http://host/export.3mf",
         );
@@ -631,7 +631,7 @@ mod tests {
         assert!(html.contains("<meta name=\"referrer\" content=\"no-referrer\" />"));
         assert!(html.contains("<meta name=\"robots\" content=\"noindex, nofollow, noarchive\" />"));
         // The only outbound link leaves without one either way.
-        assert!(html.contains("href=\"http://host/workspaces/silly-otter-1\" target=\"_blank\" rel=\"noreferrer\""));
+        assert!(html.contains("href=\"http://host/designs/silly-otter-1\" target=\"_blank\" rel=\"noreferrer\""));
         // The hostile name must not be able to close the script or the markup.
         assert!(!html.contains("</script><img"));
         assert!(!html.contains("<img src=x>"));

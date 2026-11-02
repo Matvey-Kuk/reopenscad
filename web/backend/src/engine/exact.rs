@@ -31,21 +31,11 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::{
-    check_cancelled, CompileOutput, EngineError, Evaluator, Lexer, Mesh, Parser, Quality, Shape,
+    check_cancelled, CompileOutput, EngineError, Evaluator, FaceColors, Lexer, Mesh, Parser, Shape,
     ShapeDimension, Transform, Triangle, Vec3,
 };
 use crate::csg;
 use crate::csg::mesh::Matrix4;
-
-/// Which geometry kernel a compile should use.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Kernel {
-    /// The legacy implicit-surface sampler. Fast, approximate, grid-limited.
-    #[default]
-    Sampled,
-    /// The exact polyhedral CSG kernel.
-    Exact,
-}
 
 /// Facets on the ball used for the legacy dilation fallback, which is reached
 /// only when a `MinkowskiDilation` node arrives without its second operand.
@@ -151,7 +141,11 @@ where
     let panic: std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>> =
         std::sync::Mutex::new(None);
     let next = AtomicUsize::new(0);
-    let run = || loop {
+    // The workers inherit this thread's kernel deadline and cancellation
+    // flag; both are thread-local, so a boolean run on a worker would
+    // otherwise ignore them and keep its request's slot busy to the end.
+    csg::bsp::Interrupts::with_current(|interrupts| {
+    let run = || interrupts.install(|| loop {
         let index = next.fetch_add(1, Ordering::AcqRel);
         if index >= count {
             return;
@@ -171,7 +165,7 @@ where
                 return;
             }
         }
-    };
+    });
     std::thread::scope(|scope| {
         for _ in 0..claim.count {
             scope.spawn(run);
@@ -179,6 +173,7 @@ where
         // The requesting thread is a worker too, so a claim of one extra
         // thread still gives two-way parallelism.
         run();
+    });
     });
     if let Some(payload) = panic
         .into_inner()
@@ -206,10 +201,35 @@ where
 ///
 /// `parallel_unions_match_the_kernels_reduction` pins the equivalence.
 pub(super) fn union_all_parallel(solids: Vec<csg::Solid>) -> csg::Solid {
-    let mut level: Vec<csg::Solid> = solids
+    let level: Vec<csg::Solid> = solids
         .into_iter()
         .filter(|solid| !solid.is_empty())
         .collect();
+    fold_union_levels(level)
+}
+
+/// [`union_all_parallel`] over borrowed operands.
+///
+/// The owned fold's first level already copies every operand (`Solid::union`
+/// takes both sides by reference), so borrowing loses nothing there and spares
+/// the caller an up-front copy of the whole input — which matters when several
+/// folds over overlapping slices of one solid list run at once. Same pairing,
+/// same operations, same result.
+pub(super) fn union_all_parallel_ref(solids: &[csg::Solid]) -> csg::Solid {
+    let operands: Vec<&csg::Solid> = solids.iter().filter(|solid| !solid.is_empty()).collect();
+    if operands.len() <= 1 {
+        return operands.first().map(|solid| (*solid).clone()).unwrap_or_default();
+    }
+    let mut level = map_indexed(operands.len() / 2, |pair| {
+        operands[2 * pair].union(operands[2 * pair + 1])
+    });
+    if operands.len() % 2 == 1 {
+        level.push(operands[operands.len() - 1].clone());
+    }
+    fold_union_levels(level)
+}
+
+fn fold_union_levels(mut level: Vec<csg::Solid>) -> csg::Solid {
     while level.len() > 1 {
         // An odd level carries its last solid forward untouched, exactly as the
         // kernel's fold does, so the pairing stays identical.
@@ -313,7 +333,14 @@ pub fn compile_exact(
 /// geometry is not safe to feed back into a boolean. See the module docs in
 /// [`crate::csg::solid`].
 pub fn solid_to_mesh(solid: &csg::Solid) -> Mesh {
-    let indexed = solid.sealed().to_indexed_mesh();
+    solid_to_mesh_noted(solid).0
+}
+
+/// [`solid_to_mesh`], plus the repair report when the boolean result did not
+/// come out closed and [`csg::heal::heal`] had to step in.
+pub fn solid_to_mesh_noted(solid: &csg::Solid) -> (Mesh, Option<csg::heal::HealReport>) {
+    let mut indexed = solid.sealed().to_indexed_mesh();
+    let report = csg::heal::heal(&mut indexed, &mut Vec::new());
     let mut triangles = Vec::with_capacity(indexed.triangles.len());
     for index in 0..indexed.triangles.len() {
         let [a, b, c] = indexed.triangle_points(index);
@@ -323,7 +350,112 @@ pub fn solid_to_mesh(solid: &csg::Solid) -> Mesh {
             normal: engine_vec(normal),
         });
     }
-    Mesh { triangles }
+    (Mesh { triangles }, report)
+}
+
+/// [`solid_to_mesh`] for an object whose faces carry more than one colour.
+///
+/// The faces are merged with [`csg::Solid::sealed_by_color`], so no output
+/// polygon straddles a colour seam, then triangulated colour by colour: the
+/// triangles of one colour are contiguous, and `FaceColors::faces` names each
+/// triangle's palette slot. `None` when every face has the same colour; the
+/// caller then meshes with [`solid_to_mesh`], which keeps the facet set
+/// bit-identical to an uncoloured object's.
+/// Also returns the repair report when the result had to be healed (see
+/// [`solid_to_mesh_noted`]).
+pub fn solid_to_colored_mesh_noted(
+    solid: &csg::Solid,
+) -> Option<(Mesh, FaceColors, Option<csg::heal::HealReport>)> {
+    let first = solid.polygons.first()?.color;
+    if solid.polygons.iter().all(|polygon| polygon.color == first) {
+        return None;
+    }
+    let sealed = solid.sealed_by_color();
+    let mut palette: Vec<Option<[u8; 4]>> = Vec::new();
+    let mut slots: std::collections::HashMap<Option<[u8; 4]>, usize> = Default::default();
+    let mut by_color: Vec<Vec<csg::Polygon>> = Vec::new();
+    for polygon in sealed.polygons {
+        let slot = *slots.entry(polygon.color).or_insert_with(|| {
+            palette.push(polygon.color);
+            by_color.push(Vec::new());
+            palette.len() - 1
+        });
+        by_color[slot].push(polygon);
+    }
+    // A slot is a `u16`. A model painted in more distinct colours than that is
+    // a gradient, not a set of parts: it keeps one colour rather than wrapping.
+    if palette.len() > usize::from(u16::MAX) {
+        return None;
+    }
+    let mut triangles = Vec::new();
+    let mut faces = Vec::new();
+    for (slot, polygons) in by_color.into_iter().enumerate() {
+        let indexed = csg::Solid { polygons }.to_indexed_mesh();
+        for index in 0..indexed.triangles.len() {
+            let [a, b, c] = indexed.triangle_points(index);
+            let normal = b.sub(a).cross(c.sub(a)).normalized();
+            triangles.push(Triangle {
+                vertices: [engine_vec(a), engine_vec(b), engine_vec(c)],
+                normal: engine_vec(normal),
+            });
+            faces.push(slot as u16);
+        }
+    }
+    let palette = palette
+        .into_iter()
+        .map(|color| color.map(|rgba| rgba.map(|channel| f64::from(channel) / 255.0)))
+        .collect();
+    // Each colour was meshed on its own, so only the whole surface can say
+    // whether it is closed: weld it once and let the repair look.
+    let (mut welded, kept) = csg::cleanup::weld_triangles_tracked(
+        triangles.iter().map(|triangle| triangle.vertices.map(kernel_vec)),
+    );
+    let mut tags: Vec<u32> = kept.iter().map(|index| u32::from(faces[*index])).collect();
+    let report = csg::heal::heal(&mut welded, &mut tags);
+    if report.as_ref().is_some_and(|report| report.defects_after < report.defects_before) {
+        triangles.clear();
+        faces.clear();
+        for (index, tag) in tags.iter().enumerate() {
+            let [a, b, c] = welded.triangle_points(index);
+            let normal = b.sub(a).cross(c.sub(a)).normalized();
+            triangles.push(Triangle {
+                vertices: [engine_vec(a), engine_vec(b), engine_vec(c)],
+                normal: engine_vec(normal),
+            });
+            faces.push(*tag as u16);
+        }
+    }
+    Some((Mesh { triangles }, FaceColors { palette, faces }, report))
+}
+
+/// The one colour every face of `solid` carries, when they all carry the
+/// same one. This sees colour wherever the kernel kept it — through an
+/// intersection, a resize, a mix of shapes — which `Shape::stated_color`,
+/// reading the tree, cannot always.
+pub fn uniform_color(solid: &csg::Solid) -> Option<[f64; 4]> {
+    let first = solid.polygons.first()?.color?;
+    solid
+        .polygons
+        .iter()
+        .all(|polygon| polygon.color == Some(first))
+        .then(|| first.map(|channel| f64::from(channel) / 255.0))
+}
+
+/// A colour as the kernel stores it on a face: 8-bit sRGBA, the precision
+/// every colour-carrying export format writes anyway.
+fn color_key(rgba: [f64; 4]) -> [u8; 4] {
+    rgba.map(crate::export::channel)
+}
+
+fn paint_unpainted(solid: &mut csg::Solid, color: Option<[u8; 4]>) {
+    if color.is_none() {
+        return;
+    }
+    for polygon in &mut solid.polygons {
+        if polygon.color.is_none() {
+            polygon.color = color;
+        }
+    }
 }
 
 fn engine_vec(point: csg::Vec3) -> Vec3 {
@@ -356,7 +488,13 @@ pub(super) fn shape_to_solid(
         } => Ok(csg::primitives::cylinder(
             *height, *radius1, *radius2, *center, *fragments,
         )),
-        Shape::Color { shape, .. } => shape_to_solid(shape, cancellation),
+        // The colour paints every face its subtree left unpainted, so an inner
+        // `color()` wins over an outer one, as in OpenSCAD's preview.
+        Shape::Color { shape, rgba } => {
+            let mut solid = shape_to_solid(shape, cancellation)?;
+            paint_unpainted(&mut solid, Some(color_key(*rgba)));
+            Ok(solid)
+        }
         Shape::Transform { shape, transform } => {
             Ok(shape_to_solid(shape, cancellation)?.transformed(matrix_of(transform)))
         }
@@ -369,9 +507,13 @@ pub(super) fn shape_to_solid(
             slices,
         } => {
             let region = shape_to_region(shape, cancellation)?;
-            Ok(csg::primitives::linear_extrude(
+            let mut solid = csg::primitives::linear_extrude(
                 &region, *height, *center, *twist, *scale, *slices,
-            ))
+            );
+            // A 2D region has no faces to carry a colour, so a `color()` on
+            // the profile is applied to the solid it sweeps.
+            paint_unpainted(&mut solid, shape.stated_color().map(color_key));
+            Ok(solid)
         }
         Shape::RotateExtrude {
             shape,
@@ -379,7 +521,9 @@ pub(super) fn shape_to_solid(
             fragments,
         } => {
             let region = shape_to_region(shape, cancellation)?;
-            Ok(csg::primitives::rotate_extrude(&region, *angle, *fragments))
+            let mut solid = csg::primitives::rotate_extrude(&region, *angle, *fragments);
+            paint_unpainted(&mut solid, shape.stated_color().map(color_key));
+            Ok(solid)
         }
         // The evaluator carries the hull as the cloud its children
         // contributed, so this is `csg::primitives::hull`'s second half: run
@@ -396,6 +540,7 @@ pub(super) fn shape_to_solid(
             let points = points.iter().copied().map(kernel_vec).collect::<Vec<_>>();
             csg::primitives::polyhedron(&points, faces).map_err(EngineError::new)
         }
+        Shape::Mesh { mesh, .. } => Ok(mesh_to_solid(mesh)),
         Shape::Resize {
             shape,
             newsize,
@@ -404,6 +549,12 @@ pub(super) fn shape_to_solid(
             let solid = shape_to_solid(shape, cancellation)?;
             Ok(csg::primitives::resize(&solid, kernel_vec(*newsize), *auto))
         }
+        Shape::Sweep { shape, points, .. } => {
+            let base = shape_to_solid(shape, cancellation)?;
+            let mut solid = sweep_solid(&base, points, cancellation)?;
+            paint_unpainted(&mut solid, shape.stated_color().map(color_key));
+            Ok(solid)
+        }
         Shape::MinkowskiDilation {
             shape,
             offset,
@@ -411,18 +562,28 @@ pub(super) fn shape_to_solid(
             kernel,
         } => {
             let base = shape_to_solid(shape, cancellation)?;
+            // The sum's faces are new, so they take the operand's colour.
+            let color = shape.stated_color().map(color_key);
+            let painted = |mut solid: csg::Solid| {
+                paint_unpainted(&mut solid, color);
+                solid
+            };
             // The real sum whenever the evaluator kept the operand. Only the
             // sampled path is forced to substitute a ball for it.
             if let Some(kernel) = kernel {
                 let tool = shape_to_solid(kernel, cancellation)?;
-                return csg::primitives::minkowski(&base, &tool).map_err(EngineError::new);
+                return csg::primitives::minkowski(&base, &tool)
+                    .map(painted)
+                    .map_err(EngineError::new);
             }
             let translated = base.transformed(Matrix4::translation(kernel_vec(*offset)));
             if *radius <= 0.0 {
                 return Ok(translated);
             }
             let ball = csg::primitives::sphere(*radius, MAX_DILATION_FRAGMENTS);
-            csg::primitives::minkowski(&translated, &ball).map_err(EngineError::new)
+            csg::primitives::minkowski(&translated, &ball)
+                .map(painted)
+                .map_err(EngineError::new)
         }
         Shape::Union { children, .. } => {
             // A union's children are independent of one another, and a model
@@ -442,11 +603,16 @@ pub(super) fn shape_to_solid(
         }
         Shape::Difference { base, subtract, .. } => {
             let mut result = shape_to_solid(base, cancellation)?;
+            // A cut through a body of one colour is that colour: the walls an
+            // uncoloured tool leaves behind take the base's colour rather than
+            // the default material. A tool with its own `color()` keeps it.
+            let base_color = base.stated_color().map(color_key);
             for child in subtract {
                 if result.is_empty() {
                     break;
                 }
-                let tool = shape_to_solid(&child.shape, cancellation)?;
+                let mut tool = shape_to_solid(&child.shape, cancellation)?;
+                paint_unpainted(&mut tool, base_color);
                 result = result.difference(&tool);
             }
             Ok(result)
@@ -467,6 +633,93 @@ pub(super) fn shape_to_solid(
             "2D geometry needs an extrusion before it can be rendered as a solid.",
         )),
     }
+}
+
+/// An imported mesh as a kernel solid.
+///
+/// The asset is already wound the way the kernel wants (counter-clockwise
+/// seen from outside), so each triangle becomes a polygon as it stands — no
+/// reversal and no intermediate face lists, which is what keeps a
+/// several-hundred-thousand-triangle scan cheap to bring in. Degenerate
+/// triangles (no plane) are dropped, as `Solid::from_faces` drops them.
+/// Most hulls (convex pieces of the child times segments) one
+/// `sweep_path()` builds and unions.
+pub(crate) const MAX_SWEEP_HULLS: usize = 1024;
+
+/// Exact `sweep_path()`: the child decomposed once into convex pieces, each
+/// piece hulled with its copy at both ends of every segment (its exact
+/// Minkowski sum with the segment), and all of them unioned.
+fn sweep_solid(
+    base: &csg::Solid,
+    points: &[Vec3],
+    cancellation: Option<&AtomicBool>,
+) -> Result<csg::Solid, EngineError> {
+    let offsets: Vec<csg::Vec3> = points.iter().copied().map(kernel_vec).collect();
+    if base.polygons.is_empty() || offsets.is_empty() {
+        return Ok(csg::Solid::default());
+    }
+    let segments: Vec<[csg::Vec3; 2]> = offsets
+        .windows(2)
+        .filter(|pair| pair[0] != pair[1])
+        .map(|pair| [pair[0], pair[1]])
+        .collect();
+    if segments.is_empty() {
+        return Ok(base.transformed(Matrix4::translation(offsets[0])));
+    }
+    check_cancelled(cancellation)?;
+    let pieces = base.convex_decomposition();
+    if pieces.is_empty() {
+        // The decomposition declines above csg::solid::MAX_CONVEX_CELLS.
+        return Err(EngineError::new(format!(
+            "sweep_path(): the child is too complex to sweep exactly (more than {} convex pieces); sweep a simpler child, e.g. its hull(), or one part at a time",
+            csg::solid::MAX_CONVEX_CELLS
+        )));
+    }
+    let hulls = pieces.len().saturating_mul(segments.len());
+    if hulls > MAX_SWEEP_HULLS {
+        return Err(EngineError::new(format!(
+            "sweep_path(): {} convex pieces x {} segments = {hulls} hulls, above the {MAX_SWEEP_HULLS} limit; use fewer points or a simpler child",
+            pieces.len(),
+            segments.len()
+        )));
+    }
+    let mut solids = Vec::with_capacity(hulls);
+    for [start, end] in &segments {
+        for piece in &pieces {
+            check_cancelled(cancellation)?;
+            csg::bsp::check_interrupt();
+            let mut cloud = Vec::with_capacity(piece.len() * 2);
+            cloud.extend(piece.iter().map(|vertex| vertex.add(*start)));
+            cloud.extend(piece.iter().map(|vertex| vertex.add(*end)));
+            let hulled = csg::Solid {
+                polygons: csg::hull::convex_hull(&cloud),
+            };
+            if !hulled.polygons.is_empty() {
+                solids.push(hulled);
+            }
+        }
+    }
+    Ok(union_all_parallel(solids))
+}
+
+fn mesh_to_solid(mesh: &crate::assets::TriMesh) -> csg::Solid {
+    let vertex = |index: u32| {
+        mesh.points
+            .get(index as usize)
+            .map(|&[x, y, z]| csg::Vec3::new(x, y, z))
+    };
+    let polygons = mesh
+        .triangles
+        .iter()
+        .filter_map(|&[a, b, c]| {
+            let (a, b, c) = (vertex(a)?, vertex(b)?, vertex(c)?);
+            if a == b || b == c || c == a {
+                return None;
+            }
+            csg::Polygon::new(vec![a, b, c])
+        })
+        .collect();
+    csg::Solid { polygons }
 }
 
 /// Turns a planar `Shape` into an exact 2D region.
@@ -595,19 +848,6 @@ pub(super) fn shape_to_region(
     }
 }
 
-/// Compiles with the requested kernel, keeping the sampled path available.
-pub fn compile_with_kernel(
-    source: &str,
-    quality: Quality,
-    cancellation: Option<&AtomicBool>,
-    kernel: Kernel,
-) -> Result<CompileOutput, EngineError> {
-    match kernel {
-        Kernel::Sampled => super::compile_sampled(source, quality, cancellation),
-        Kernel::Exact => compile_exact(source, cancellation),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,11 +894,17 @@ mod tests {
                 solids.insert(2, csg::Solid::default());
             }
             let sequential = csg::solid::union_all(solids.clone());
+            let borrowed = union_all_parallel_ref(&solids);
             let parallel = union_all_parallel(solids);
             assert_eq!(
                 triangle_listing(&solid_to_mesh(&sequential)),
                 triangle_listing(&solid_to_mesh(&parallel)),
                 "union of {count} overlapping cubes"
+            );
+            assert_eq!(
+                triangle_listing(&solid_to_mesh(&sequential)),
+                triangle_listing(&solid_to_mesh(&borrowed)),
+                "borrowed union of {count} overlapping cubes"
             );
         }
     }
@@ -710,13 +956,4 @@ mod tests {
         assert!(compile_exact("square(10);", None).is_err());
     }
 
-    #[test]
-    fn the_kernel_selector_still_reaches_the_sampled_path() {
-        let sampled =
-            compile_with_kernel("cube(20);", Quality::Preview, None, Kernel::Sampled).unwrap();
-        let exact =
-            compile_with_kernel("cube(20);", Quality::Preview, None, Kernel::Exact).unwrap();
-        assert!(sampled.mesh.triangles.len() > exact.mesh.triangles.len());
-        assert_eq!(exact.mesh.triangles.len(), 12);
-    }
 }

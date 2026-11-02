@@ -66,16 +66,27 @@ assert(hinge_margin >= corner, "Keep knuckles on the straight back edge");
 assert((inner_length+2*wall-magnet_spacing-seat_width)/2 >= corner,
        "Move magnet seats inward, clear of the corner cuts");
 
+module outer_shell(is_lid) {
+    if (is_lid) translate([0,0,half_height])
+        shell_solid(outer_length,outer_depth,half_height,corner,0,lid_bevel);
+    else shell_solid(outer_length,outer_depth,half_height,corner,edge_bevel,0);
+}
+
+// Seats are clipped to the outer shell: the lid bevel is deeper than the lid
+// skin, and an unclipped seat would poke a flat ledge out of it.
 module magnet_seats(is_lid) {
-    for (side=[-1,1])
-        translate([centre_x+side*magnet_spacing/2,seat_width/2,0])
-            difference() {
-                translate([-seat_width/2,-seat_width/2,
-                           is_lid ? half_height : floor_thickness-cut_extra])
-                    cube([seat_width,seat_width,half_height-floor_thickness+cut_extra]);
-                translate([0,0,is_lid ? half_height-cut_extra : half_height-pocket_depth])
-                    cylinder(h=pocket_depth+cut_extra,d=pocket_diameter);
-            }
+    intersection() {
+        outer_shell(is_lid);
+        for (side=[-1,1])
+            translate([centre_x+side*magnet_spacing/2,seat_width/2,0])
+                difference() {
+                    translate([-seat_width/2,-seat_width/2,
+                               is_lid ? half_height : floor_thickness-cut_extra])
+                        cube([seat_width,seat_width,half_height-floor_thickness+cut_extra]);
+                    translate([0,0,is_lid ? half_height-cut_extra : half_height-pocket_depth])
+                        cylinder(h=pocket_depth+cut_extra,d=pocket_diameter);
+                }
+    }
 }
 
 module base() {
@@ -164,7 +175,7 @@ module socket_cuts() {
 
 module hollow_base() {
     difference() {
-        shell_solid(outer_length,outer_depth,half_height,corner,edge_bevel,0);
+        outer_shell(false);
         translate([wall,wall,floor_thickness])
             shell_solid(outer_length-2*wall,outer_depth-2*wall,
                         half_height,corner-wall,inner_bevel,0);
@@ -173,8 +184,7 @@ module hollow_base() {
 
 module hollow_lid() {
     difference() {
-        translate([0,0,half_height])
-            shell_solid(outer_length,outer_depth,half_height,corner,0,lid_bevel);
+        outer_shell(true);
         translate([wall,wall,half_height-cut_extra])
             shell_solid(outer_length-2*wall,outer_depth-2*wall,
                         half_height-floor_thickness+cut_extra,
@@ -182,9 +192,10 @@ module hollow_lid() {
     }
 }
 
+// Print layout: the lid lies flipped beside the base, hinge pin through both.
 module print_layout() {
-    base();
-    translate([0,2*axis_y,total_height]) rotate([180,0,0]) lid();
+    color("#b48ef0") base();
+    color("#f59ab8") translate([0,2*axis_y,total_height]) rotate([180,0,0]) lid();
 }
 
 print_layout();

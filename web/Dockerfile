@@ -53,7 +53,9 @@ COPY --from=builder /src/backend/target/release/reopenscad-server /app/reopensca
 # The browser shell. `handle_static` serves these from REOPENSCAD_WEB_ROOT.
 COPY index.html app.js styles.css /app/web/
 COPY legacy-assets /app/web/legacy-assets
-# The kick-start catalogue: eighteen .scad sources, their preview renders and
+COPY logos /app/web/logos
+COPY media /app/web/media
+# The kick-start catalogue: thirty .scad sources, their preview renders and
 # the manifest that lists them. Served straight out of the web root, so an
 # image without them shows an empty-workspace panel with nothing in it.
 COPY examples /app/web/examples

@@ -1,8 +1,65 @@
 # Deploying ReOpenSCAD to Google Cloud Run
 
-Workspaces live in Cloud SQL for PostgreSQL. Rendered meshes and exports are
-never stored — they are recomputed on demand from the workspace source, so the
-database holds only documents, and there is no cache to invalidate.
+Designs live in Cloud SQL for PostgreSQL, alongside a bounded cache of
+render responses (`render_cache`: 4 per design, 16 MiB per entry, 512 MiB
+total, least recently used out) so reopening an unchanged design does not
+recompile it. Its keys include an engine version, so a deploy that changes
+geometry invalidates it by itself; exports are still recomputed on demand.
+
+Uploaded STLs are temporary: deleted 3 hours after upload (`expires_at`, checked
+at read time), by a sweep every 5 minutes on every
+instance. Several instances may sweep at once: each design is settled under its
+row lock with `SKIP LOCKED`. Full-size originals an earlier version kept on an
+instance's disk (`REOPENSCAD_ORIGINALS_DIR`, default the system temp dir) are
+deleted by that instance's sweep; nothing writes them any more. Assets already stored when this ships count from
+their `created_at`, so the first sweep after the upgrade deletes those older
+than 3 hours. Mesh assets (uploaded STL scans) live in `workspace_assets` as cleaned
+binary STL: one per design, and 4 GiB across the deployment
+(`REOPENSCAD_MAX_ASSET_STORAGE_MIB` overrides the total). At the total, an
+upload evicts the assets (not the code) of the least recently used other
+designs instead of failing. Uploads are decimated to 500k triangles by
+default. Each client IP may add 512 MiB of stored assets
+per hour (`REOPENSCAD_ASSET_QUOTA_MIB_PER_HOUR`; counted after cleaning, per
+instance) and send 2 GiB of raw upload bodies per hour
+(`REOPENSCAD_UPLOAD_RAW_MIB_PER_HOUR`). Evicting a
+design cascades to its assets; one-time upload URLs are rows in
+`asset_upload_tokens` (at most 4 pending per design, 8 per client) so any
+instance can accept the PUT. Uploads take a body of up to 128 MiB on their
+routes only (everything else keeps 2 MiB), at most 4 at once per instance and
+2 per client (bodies over 25 MiB: 2 per instance, 1 per client, cleaned one
+at a time — a 2.5M-triangle scan peaks around 700 MB resident while it is
+cleaned, so give the instance at least 2 GiB), admitted on the request head
+(host, rate limit, target) before any body byte; the body must average
+64 KiB/s after 10 s and finish within 300 s — size request timeouts on any
+proxy in front accordingly. Cloud Run caps HTTP/1.1 request bodies at
+32 MiB (its 413 is not ours), so files over 24 MiB go up in chunks: PUTs
+with `Content-Range: bytes first-last/total` of at most 30 MiB each, the
+later ones carrying the `Upload-Id` the first reply returned (the browser
+does this by itself; `create_asset_upload` hands agents a ready shell loop).
+Chunks may land on different instances: each is appended in order to
+`asset_upload_sessions` / `asset_upload_chunks` in Postgres under the
+session's row lock, and the last one assembles the file and runs the normal
+pipeline. Sessions expire after 30 minutes without a chunk (the sweeper drops
+them with their parts); at most 2 per client and per design, 256 MiB declared
+per client and 1 GiB staged across the deployment, so Cloud SQL needs that
+much headroom. Each chunk is admitted, rate limited and billed to the raw-upload
+allowance like a PUT of its size; only the last chunk takes a large upload
+slot and cleans. One request on one instance processes a complete file (a finish
+claim on the session row; a concurrent re-send of the last chunk gets a
+retryable 503 `upload_finishing`), and its reply is kept 10 minutes in
+`asset_upload_receipts` (at most 1024 rows), so a last chunk re-sent because
+its reply was lost gets that reply instead of a 404.
+
+Compute requests whose client disconnects are cancelled. End of stream alone
+is not taken for a disconnect (an HTTP/1.1 client may half-close and still
+read): the server then sends one interim `102 Processing`, and cancels only
+when that send fails or the peer answers it with a reset.
+
+Designs were called workspaces before the rename, and storage kept the old
+names: the `workspaces` table and `REOPENSCAD_MAX_WORKSPACES` below are the
+design store and its cap. Old links keep working — `/workspaces/<id>`
+redirects to `/designs/<id>`, and `/api/workspaces/...` is an alias of every
+`/api/designs/...` route, metered identically.
 
 These commands have been run end to end against a real GCP project
 in `us-central1`. Where the first draft was wrong,
@@ -31,7 +88,8 @@ gcloud auth login
 | `DATABASE_URL` | **yes** | Presence of this selects the Postgres backend. Absent means per-instance local files, which on Cloud Run means silent data loss. |
 | `REOPENSCAD_PUBLIC_ORIGIN` | **yes** | The service's own origin, e.g. `https://reopenscad-abc123-uc.a.run.app`. See below — get this wrong and *every* request is answered 403. |
 | `REOPENSCAD_TRUSTED_PROXY_HOPS` | recommended | `1` behind the `run.app` URL, `2` behind an external HTTPS load balancer — and at `2`, ingress **must** be restricted (see §5). Without it, per-IP rate limiting collapses into a single global bucket. |
-| `REOPENSCAD_MAX_WORKSPACES` | recommended | Global retained-workspace ceiling, default 512. Raise it — see §7, this one can cost users their work. |
+| `REOPENSCAD_IP_*` rate limits | optional | Per-client token buckets; production defaults apply when unset. See "Per-client limits" in §5. |
+| `REOPENSCAD_MAX_WORKSPACES` | recommended | Global retained-design ceiling, default 512. Raise it — see §7, this one can cost users their work. |
 | `REOPENSCAD_SHUTDOWN_GRACE_MS` | optional | Drain window after SIGTERM, default 9000. |
 | `REOPENSCAD_WEB_ROOT` | set in the image | Where the browser shell and icons live. |
 | `REOPENSCAD_DATA_DIR` | unused with Postgres | Only consulted by the filesystem backend. |
@@ -333,6 +391,33 @@ With hops `1` and the `run.app` URL there is no equivalent hole: the rightmost
 entry is always the one Google's front end appended, and nothing the caller
 sends can end up to the right of it.
 
+### Per-client limits
+
+Each client address has three token buckets. Every request costs one
+request token; evaluating routes (render, export, the analysis routes, MCP,
+design writes) also cost 5 compute tokens, and the `/events` and
+`/api/queue` polls cost 1; response bytes are billed after they are sent.
+`diff` charges one more evaluation.
+The defaults are the production limits; each can be retuned without a
+rebuild:
+
+| Variable | Default | Accepted |
+| --- | --- | --- |
+| `REOPENSCAD_IP_REQUEST_BURST` | 300 | 1 – 1,000,000 |
+| `REOPENSCAD_IP_REQUEST_REFILL_PER_SEC` | 60 | 0.01 – 1,000,000 |
+| `REOPENSCAD_IP_HEAVY_BURST` | 60 (12 evaluations) | 5 – 1,000,000 |
+| `REOPENSCAD_IP_HEAVY_REFILL_PER_SEC` | 6 (1.2 evaluations/s) | 0.01 – 1,000,000 |
+| `REOPENSCAD_IP_BYTE_BURST_MIB` | 128 | 1 – 65,536 |
+| `REOPENSCAD_IP_BYTE_REFILL_MIB_PER_SEC` | 16 | 0.01 – 65,536 |
+
+A value that does not parse or is out of range stops the server at startup
+with the variable named, rather than silently running on different limits;
+the effective limits are printed at startup. A refused request is answered
+429 with `bucket` (`requests`, `compute` or `bytes`), `retryAfterSeconds` and
+`retryAfterMs` computed from that bucket's deficit and refill rate, and the
+same wait (rounded up) in `Retry-After`. Raising the limits is meant for local
+or trusted verification loops; a public deployment should keep the defaults.
+
 ### Shutdown
 
 The container handles SIGTERM: it stops accepting new connections, lets
@@ -447,16 +532,16 @@ Retention runs itself: every ten minutes a sweeper thread trims the table to
 the newest `REOPENSCAD_MAX_WORKSPACES`, with one set-based `DELETE`. Nothing is
 deleted for being old — see below.
 
-### Request logs contain workspace credentials
+### Request logs contain design credentials
 
-A workspace URL is the only key to that workspace, and Cloud Run's request log
-records the full request path — so `/workspaces/<id>` and
-`/api/workspaces/<id>` land in Cloud Logging on every hit, readable by anyone
+A design URL is the only key to that design, and Cloud Run's request log
+records the full request path — so `/designs/<id>` and `/api/designs/<id>`
+(and their pre-rename `/workspaces/` forms) land in Cloud Logging on every hit, readable by anyone
 holding `roles/logging.viewer` on the project for the whole retention window
 (30 days by default). The server itself never logs a path, an id or any source
 code; this is the platform's log, not the application's.
 
-Treat project log access as workspace access, and shorten the exposure:
+Treat project log access as design access, and shorten the exposure:
 
 ```sh
 # Drop Cloud Run request logs for this service; the app's own stdout/stderr
@@ -483,8 +568,8 @@ outweighs it. Redact it if project log access ever widens.
 
 The 512 default is inherited from the filesystem store, where it capped one
 developer's disk. In a shared database the cap is **global across every user**,
-workspace creation is **unauthenticated**, and the sweeper evicts the *least
-recently updated* rows. A burst of 512 fresh workspaces — within reach of a
+design creation is **unauthenticated**, and the sweeper evicts the *least
+recently updated* rows. A burst of 512 fresh designs — within reach of a
 distributed client, which per-IP rate limiting only slows — permanently deletes
 other people's work, oldest first, with no undo: the URL was the only handle
 anyone had on it.
@@ -499,10 +584,10 @@ gcloud run services update "$SERVICE" --region="$REGION" \
 
 Pick a number far above any plausible legitimate total and watch
 `SELECT count(*) FROM workspaces` against it. Lowering it below 512 is ignored.
-Beyond a toy deployment, put authentication in front of `POST /api/workspaces`
-rather than relying on a number here.
+Beyond a toy deployment, put authentication in front of `POST /api/designs`
+(and its alias `POST /api/workspaces`) rather than relying on a number here.
 
-There is no idle TTL. Workspaces used to be deleted after fourteen untouched
+There is no idle TTL. Designs used to be deleted after fourteen untouched
 days, which made a bookmarked URL expire silently — the link is the only handle
 anyone has on their work, it looks permanent, and it stopped resolving while
 they were not looking. Capacity is now the only thing that evicts anything, so

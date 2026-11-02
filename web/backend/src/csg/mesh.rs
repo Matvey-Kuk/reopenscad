@@ -282,21 +282,6 @@ impl Plane {
             && (self.offset - other.offset).abs() <= PLANE_OFFSET_EPSILON
     }
 
-    /// Index of the axis the plane is most perpendicular to.
-    pub fn dominant_axis(self) -> usize {
-        let absolute = [
-            self.normal.x.abs(),
-            self.normal.y.abs(),
-            self.normal.z.abs(),
-        ];
-        if absolute[0] >= absolute[1] && absolute[0] >= absolute[2] {
-            0
-        } else if absolute[1] >= absolute[2] {
-            1
-        } else {
-            2
-        }
-    }
 }
 
 /// A planar face. Vertices wind counter-clockwise around `plane.normal`.
@@ -304,16 +289,30 @@ impl Plane {
 pub struct Polygon {
     pub vertices: Vec<Vec3>,
     pub plane: Plane,
+    /// The `color()` this face was painted with, as 8-bit sRGBA, or `None`
+    /// for the default material. Pure appearance data: no boolean reads it,
+    /// every split fragment inherits it, and only the colour-aware merge in
+    /// [`crate::csg::Solid::sealed_by_color`] keeps faces of different
+    /// colours apart.
+    pub color: Option<[u8; 4]>,
 }
 
 impl Polygon {
     pub fn new(vertices: Vec<Vec3>) -> Option<Self> {
         let plane = Plane::from_polygon(&vertices)?;
-        Some(Self { vertices, plane })
+        Some(Self {
+            vertices,
+            plane,
+            color: None,
+        })
     }
 
     pub fn with_plane(vertices: Vec<Vec3>, plane: Plane) -> Self {
-        Self { vertices, plane }
+        Self {
+            vertices,
+            plane,
+            color: None,
+        }
     }
 
     pub fn flip(&mut self) {
@@ -651,19 +650,6 @@ impl IndexedMesh {
             && statistics.unbalanced_edges == 0
             && statistics.degenerate_faces == 0
     }
-
-    pub fn transform(&self, matrix: Matrix4) -> Self {
-        let mut mesh = Self {
-            vertices: self.vertices.iter().map(|p| matrix.apply(*p)).collect(),
-            triangles: self.triangles.clone(),
-        };
-        if matrix.linear_determinant() < 0.0 {
-            for triangle in &mut mesh.triangles {
-                triangle.swap(1, 2);
-            }
-        }
-        mesh
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -699,6 +685,12 @@ impl fmt::Display for MeshStatistics {
 /// corners produced by independent boolean fragments become one index.
 pub struct VertexWelder {
     lattice: FastMap<[i64; 3], u32>,
+    /// Further vertices whose cell was already taken. A cell is `tolerance`
+    /// wide, so two vertices more than `tolerance` apart can share one; with
+    /// a single slot per cell the second used to overwrite the first, which
+    /// made the first unfindable and let an exact copy of it become a new
+    /// vertex — a crack, depending only on the order points arrived in.
+    overflow: FastMap<[i64; 3], Vec<u32>>,
     pub vertices: Vec<Vec3>,
     scale: f64,
 }
@@ -713,6 +705,7 @@ impl VertexWelder {
     pub fn new(tolerance: f64) -> Self {
         Self {
             lattice: FastMap::default(),
+            overflow: FastMap::default(),
             vertices: Vec::new(),
             scale: 1.0 / tolerance,
         }
@@ -739,13 +732,25 @@ impl VertexWelder {
                         if existing.sub(point).length() <= 1.0 / self.scale {
                             return *index;
                         }
+                        if let Some(more) = self.overflow.get(&probe) {
+                            for index in more {
+                                let existing = self.vertices[*index as usize];
+                                if existing.sub(point).length() <= 1.0 / self.scale {
+                                    return *index;
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
         let index = self.vertices.len() as u32;
         self.vertices.push(point);
-        self.lattice.insert(key, index);
+        if self.lattice.contains_key(&key) {
+            self.overflow.entry(key).or_default().push(index);
+        } else {
+            self.lattice.insert(key, index);
+        }
         index
     }
 }
@@ -783,6 +788,24 @@ mod tests {
             first,
             "1e-3 mm is modelled detail and must not be welded away"
         );
+    }
+
+    /// Two vertices in one lattice cell must both stay findable: an exact
+    /// copy of the first used to become a new vertex once the second had
+    /// taken over the cell.
+    #[test]
+    fn a_shared_lattice_cell_keeps_both_vertices_findable() {
+        let mut welder = VertexWelder::default();
+        let cell = WELD_EPSILON;
+        // Same cell (rounded key), more than the tolerance apart.
+        let first = Vec3::new(10.0 * cell - 0.45 * cell, 10.0 * cell - 0.45 * cell, 0.0);
+        let second = Vec3::new(10.0 * cell + 0.45 * cell, 10.0 * cell + 0.45 * cell, 0.0);
+        assert!(first.sub(second).length() > cell);
+        let a = welder.insert(first);
+        let b = welder.insert(second);
+        assert_ne!(a, b);
+        assert_eq!(welder.insert(first), a);
+        assert_eq!(welder.insert(second), b);
     }
 
     /// Welding is what closes a seam, so it has to survive the lattice: two

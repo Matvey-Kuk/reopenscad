@@ -12,6 +12,9 @@ use std::sync::{Arc, Mutex};
 
 mod builtins;
 mod font;
+mod truetype;
+mod typeface;
+mod naming;
 
 #[derive(Debug, Clone)]
 pub struct EngineError {
@@ -132,49 +135,6 @@ impl Mesh {
         }
         output
     }
-
-    pub fn obj(&self) -> Vec<u8> {
-        let mut output = String::from("# ReOpenSCAD native mesh\n");
-        for triangle in &self.triangles {
-            for vertex in triangle.vertices {
-                output.push_str(&format!("v {} {} {}\n", vertex.x, vertex.y, vertex.z));
-            }
-        }
-        for triangle in &self.triangles {
-            output.push_str(&format!(
-                "vn {} {} {}\n",
-                triangle.normal.x, triangle.normal.y, triangle.normal.z
-            ));
-        }
-        for index in 0..self.triangles.len() {
-            let vertex = index * 3 + 1;
-            let normal = index + 1;
-            output.push_str(&format!(
-                "f {vertex}//{normal} {}//{normal} {}//{normal}\n",
-                vertex + 1,
-                vertex + 2
-            ));
-        }
-        output.into_bytes()
-    }
-
-    pub fn off(&self) -> Vec<u8> {
-        let mut output = format!(
-            "OFF\n{} {} 0\n",
-            self.triangles.len() * 3,
-            self.triangles.len()
-        );
-        for triangle in &self.triangles {
-            for vertex in triangle.vertices {
-                output.push_str(&format!("{} {} {}\n", vertex.x, vertex.y, vertex.z));
-            }
-        }
-        for index in 0..self.triangles.len() {
-            let vertex = index * 3;
-            output.push_str(&format!("3 {vertex} {} {}\n", vertex + 1, vertex + 2));
-        }
-        output.into_bytes()
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,6 +157,59 @@ impl Quality {
             Self::Render => "render",
         }
     }
+}
+
+/// One face `text(font = …)` can select.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FontInfo {
+    pub family: &'static str,
+    pub style: &'static str,
+    /// The exact `font` string that selects this face.
+    pub font: String,
+    pub license: &'static str,
+    pub description: &'static str,
+}
+
+/// How `text()` behaves, for the supported-language dictionary.
+pub const TEXT_NOTES: &[&str] = &[
+    "text(text, size = 10, font, halign, valign, spacing, direction, language, script, em) sets outline glyphs from the bundled fonts listed under \"fonts\"; Liberation Sans is the default, as in OpenSCAD.",
+    "font uses OpenSCAD/fontconfig syntax: \"Family\", \"Family:style=Bold\", \"Family:style=Italic\", \":bold\". Generic names sans-serif, serif, monospace, cursive and calligraphy map to bundled families; Arial/Helvetica, Times and Courier map to their metric-compatible Liberation faces with a warning; any other name falls back to Liberation Sans with a warning naming the fallback.",
+    "size is OpenSCAD's: the em is size / 0.72 mm, so capitals are a little under size tall. em sets the em size directly.",
+    "Pair kerning from the font is applied. Ligatures and complex-script shaping are not; script other than latin warns.",
+    "direction: ltr, rtl (reversed glyph order), ttb and btt (glyphs stacked vertically, centred on x = 0). halign uses the advance width; valign top/center/bottom use the inked extent.",
+    "$fn/$fa/$fs control curve subdivision like circle(r = size).",
+    "font = \"ReOpenSCAD Stroke\" selects the built-in single-stroke engraving face (printable ASCII).",
+];
+
+/// How top-level objects are named, for the supported-language dictionary.
+pub const OBJECT_NAMING_NOTES: &[&str] = &[
+    "Each top-level statement that produces geometry is one object; asserts, echoes, assignments and statements that produce nothing are not objects and do not affect other objects' names or IDs.",
+    "Name an object explicitly with a comment directly before its statement: // @name: Lid (or /* @name: Lid */), or with a $name string argument: lid($name = \"Lid\"); color(\"red\", $name = \"Lid\") lid(); let($name = \"Lid\") lid(); Both remain valid OpenSCAD.",
+    "An explicitly named object gets the ID object-<slug of name> (object-lid), stable across edits that do not rename it.",
+    "Otherwise the name is the called module (looking through translate/rotate/color/... and through if/for/let/{} when every geometry statement inside calls the same module) plus an ordinal, e.g. \"lid 3\", with ID object-3; the ordinal counts top-level statements that can make geometry. Calls to modules whose bodies never make geometry (only echo/assert/assignments) or that are not defined do not count; a statement that can make geometry but is empty on this run (a part selector hiding it) keeps its ordinal, so the other objects keep their IDs.",
+];
+
+/// Every bundled face, default first — the engine's answer to OpenSCAD's
+/// Help → Font List.
+pub fn available_fonts() -> Vec<FontInfo> {
+    let mut fonts: Vec<FontInfo> = typeface::FONTS
+        .iter()
+        .map(|entry| FontInfo {
+            family: entry.family,
+            style: entry.style,
+            font: format!("{}:style={}", entry.family, entry.style),
+            license: entry.license,
+            description: entry.description,
+        })
+        .collect();
+    fonts.push(FontInfo {
+        family: typeface::STROKE_FAMILY,
+        style: "Regular",
+        font: typeface::STROKE_FAMILY.to_string(),
+        license: "GPL-3.0-or-later (part of this engine)",
+        description: "Built-in single-stroke (monoline) face for engraving; printable ASCII only.",
+    });
+    fonts
 }
 
 #[derive(Debug)]
@@ -236,14 +249,85 @@ pub struct CompiledPart {
     /// `None` means the object states no color and the viewer should use its
     /// default material. Per §15 of the language spec color is preview data:
     /// it never alters the geometry, and STL cannot carry it, but 3MF/AMF can.
-    /// Only a color wrapping the entire object is reported here; colors on
-    /// individual sub-shapes inside one top-level object are not split out.
+    /// For an object painted in several colors this is the one covering the
+    /// most surface, and [`Self::face_colors`] has the per-triangle detail.
     pub color: Option<[f64; 4]>,
+    /// Per-triangle colors of an object whose surface carries more than one
+    /// `color()` — `color()` inside a module, an `if`, a `for`, or on some of
+    /// a union's children. `None` when the whole object is one color (then
+    /// [`Self::color`] says which). One object stays one part however many
+    /// colors it is painted in.
+    pub face_colors: Option<FaceColors>,
     /// True for a `%`-modified subtree: previewable, but excluded from the
     /// CSG result and from every export.
     pub background: bool,
     quality: Quality,
     shape: Shape,
+}
+
+/// The colors painted on one mesh, triangle by triangle.
+///
+/// The exact kernel carries each face's `color()` through every boolean — a
+/// union keeps each child's, a difference's cut walls take the tool's color
+/// when it states one and the base's otherwise, and an inner `color()` wins
+/// over an outer one — and meshes the object color by color, so the triangles
+/// of one color are contiguous.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FaceColors {
+    /// Distinct colors, RGBA in 0..1; `None` is the default material.
+    pub palette: Vec<Option<[f64; 4]>>,
+    /// One palette slot per triangle of the mesh these colors belong to.
+    pub faces: Vec<u16>,
+}
+
+impl FaceColors {
+    /// The color of triangle `index`, or `None` for the default material.
+    pub fn color_of(&self, index: usize) -> Option<[f64; 4]> {
+        self.faces
+            .get(index)
+            .and_then(|slot| self.palette.get(usize::from(*slot)).copied().flatten())
+    }
+
+    /// Maximal runs of consecutive triangles sharing a color, as
+    /// `(first triangle, triangle count, palette slot)`.
+    pub fn runs(&self) -> Vec<(usize, usize, u16)> {
+        let mut runs: Vec<(usize, usize, u16)> = Vec::new();
+        for (index, slot) in self.faces.iter().enumerate() {
+            match runs.last_mut() {
+                Some((_, count, last)) if *last == *slot => *count += 1,
+                _ => runs.push((index, 1, *slot)),
+            }
+        }
+        runs
+    }
+
+    /// The palette color covering the most of `mesh`'s surface, standing in
+    /// for the object's color wherever only one can be shown (a swatch, a
+    /// filament slot). Ties go to the color painted first.
+    pub fn dominant(&self, mesh: &Mesh) -> Option<[f64; 4]> {
+        let mut areas = vec![0.0f64; self.palette.len()];
+        for (triangle, slot) in mesh.triangles.iter().zip(&self.faces) {
+            if let Some(area) = areas.get_mut(usize::from(*slot)) {
+                let [a, b, c] = triangle.vertices;
+                *area += b.sub(a).cross(c.sub(a)).length();
+            }
+        }
+        let mut best = 0;
+        for (slot, area) in areas.iter().enumerate() {
+            if *area > areas[best] {
+                best = slot;
+            }
+        }
+        self.palette.get(best).copied().flatten()
+    }
+
+    /// The colors kept for the triangles a cleanup pass retained, in order.
+    pub fn retain(&self, kept: &[usize]) -> Self {
+        Self {
+            palette: self.palette.clone(),
+            faces: kept.iter().map(|index| self.faces[*index]).collect(),
+        }
+    }
 }
 
 /// Multipart compilation retains independently rendered objects while also
@@ -257,6 +341,9 @@ pub struct MultipartCompileOutput {
     /// them transparently alongside `parts`.
     pub background_parts: Vec<CompiledPart>,
     pub messages: Vec<String>,
+    /// The source drew unseeded randomness (`rands()` without a seed), so
+    /// another compile of it differs: never memoise or store this result.
+    pub nondeterministic: bool,
 }
 
 /// Read-only access to a workspace/project virtual file system.
@@ -481,23 +568,59 @@ fn parse_resolved_program(source: &str) -> Result<Vec<Stmt>, EngineError> {
     resolve_file_directives(statements, &BUNDLED_LIBRARY, &mut Vec::new(), &mut 0)
 }
 
-/// Tolerance-aware relationship between two visible objects.
-///
-/// A pair of IDs and a depth is not actionable on its own, so the report also
-/// carries *where* the extremum sits: `location` is the sampled world-space
-/// point of deepest penetration (or of closest approach when the parts are
-/// merely near each other), and `overlap` is the intersection of the two
-/// axis-aligned bounds, present only when those bounds actually overlap.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PartIntersection {
-    pub a: String,
-    pub b: String,
-    pub intersects: bool,
-    pub within_tolerance: bool,
-    pub clearance: f64,
-    pub depth: Option<f64>,
-    pub location: Option<Vec3>,
-    pub overlap: Option<PartBounds>,
+use crate::scadsource::line_of;
+
+/// What the object list knows about one top-level statement of the submitted
+/// source. Statements spliced in by `include` have neither.
+#[derive(Clone, Debug, Default)]
+struct TopLevelMeta {
+    range: Option<SourceRange>,
+    /// From a `// @name: …` comment directly before the statement.
+    annotation: Option<String>,
+}
+
+/// [`parse_resolved_program`], plus a [`TopLevelMeta`] for every resolved
+/// top-level statement, aligned by index.
+fn parse_resolved_program_with_meta(
+    source: &str,
+) -> Result<(Vec<Stmt>, Vec<TopLevelMeta>), EngineError> {
+    let LexedSource {
+        tokens,
+        spans,
+        annotations,
+    } = Lexer::new(source).tokenize_with_spans()?;
+    let mut parser = Parser::new(tokens);
+    let statements = parser.parse_program()?;
+    let metas = parser
+        .top_level_spans
+        .iter()
+        .map(|&(start, end)| TopLevelMeta {
+            range: (end > start && end <= spans.len()).then(|| SourceRange {
+                start: spans[start].0,
+                end: spans[end - 1].1,
+            }),
+            annotation: annotations
+                .iter()
+                .rev()
+                .find(|(token, _)| *token == start)
+                .map(|(_, name)| name.clone()),
+        })
+        .collect::<Vec<_>>();
+    let mut resolved = Vec::with_capacity(statements.len());
+    let mut resolved_metas = Vec::with_capacity(statements.len());
+    let (mut active, mut loaded) = (Vec::new(), 0);
+    for (statement, meta) in statements.into_iter().zip(metas) {
+        if matches!(statement, Stmt::FileDirective { .. }) {
+            let expanded =
+                resolve_file_directives(vec![statement], &BUNDLED_LIBRARY, &mut active, &mut loaded)?;
+            resolved_metas.extend(expanded.iter().map(|_| TopLevelMeta::default()));
+            resolved.extend(expanded);
+        } else {
+            resolved.push(statement);
+            resolved_metas.push(meta);
+        }
+    }
+    Ok((resolved, resolved_metas))
 }
 
 /// One meshed shape, and what it cost in fidelity to mesh it.
@@ -506,6 +629,9 @@ struct MeshedShape {
     /// `None` when the exact kernel built the mesh. `Some(reason)` when it
     /// declined and the sampled mesher stood in.
     approximated: Option<String>,
+    /// Warnings from the export-time repair of a result that did not come out
+    /// closed (see [`crate::csg::heal`]).
+    notes: Vec<String>,
 }
 
 /// Meshes one evaluated shape with the exact polyhedral kernel, falling back to
@@ -525,11 +651,12 @@ fn mesh_shape_exact_first(
 ) -> Result<MeshedShape, EngineError> {
     let declined = match exact::shape_to_solid(shape, cancellation) {
         Ok(solid) => {
-            let mesh = exact::solid_to_mesh(&solid);
+            let (mesh, healed) = exact::solid_to_mesh_noted(&solid);
             if !mesh.triangles.is_empty() {
                 return Ok(MeshedShape {
                     mesh,
                     approximated: None,
+                    notes: healed.map(|report| report.message()).into_iter().collect(),
                 });
             }
             "it produced no geometry".to_string()
@@ -538,12 +665,18 @@ fn mesh_shape_exact_first(
             // A cancelled render must abort, not quietly restart on the other
             // path and blow through the deadline twice.
             check_cancelled(cancellation)?;
+            // A sweep the exact kernel refuses is refused outright: the
+            // sampled stand-in would be a different solid, not a coarser one.
+            if error.to_string().starts_with("sweep_path():") {
+                return Err(error);
+            }
             error.to_string()
         }
     };
     let mesh = mesh_shape(shape, resolution, cancellation)?;
     Ok(MeshedShape {
         mesh,
+        notes: Vec::new(),
         approximated: Some(format!(
             "WARNING: the exact kernel declined this model ({declined}); it was \
              meshed by the sampled approximation at resolution {resolution}, so \
@@ -567,6 +700,17 @@ fn mesh_shape_exact_first(
 /// connection thread and the caller sees the socket close with no status at
 /// all. One caught panic is a failed render; the alternative is a request that
 /// simply vanishes.
+/// [`catch_geometry_panic`] with `cancellation` installed as the kernel's
+/// interrupt flag (`csg::bsp::with_cancellation`), so the booleans, face
+/// merges and hulls inside `body` stop as soon as the flag is set rather than
+/// at the next CSG node boundary.
+fn guarded<T>(
+    cancellation: Option<&AtomicBool>,
+    body: impl FnOnce() -> Result<T, EngineError>,
+) -> Result<T, EngineError> {
+    crate::csg::bsp::with_cancellation(cancellation, || catch_geometry_panic(body))
+}
+
 fn catch_geometry_panic<T>(
     body: impl FnOnce() -> Result<T, EngineError>,
 ) -> Result<T, EngineError> {
@@ -601,7 +745,8 @@ pub fn compile(
     quality: Quality,
     cancellation: Option<&AtomicBool>,
 ) -> Result<CompileOutput, EngineError> {
-    catch_geometry_panic(|| compile_unguarded(source, quality, cancellation))
+    builtins::reset_nondeterminism();
+    guarded(cancellation, || compile_unguarded(source, quality, cancellation))
 }
 
 fn compile_unguarded(
@@ -618,16 +763,17 @@ fn compile_unguarded(
     };
     let shape = evaluator.evaluate(&statements)?;
     if shape.dimension() != ShapeDimension::Solid {
-        return Err(EngineError::new("The model contains no 3D geometry."));
+        return Err(evaluator.no_solid_error(true));
     }
     check_cancelled(cancellation)?;
     let resolution = quality.resolution();
     let meshed = mesh_shape_exact_first(&shape, resolution, cancellation)?;
     if meshed.mesh.triangles.is_empty() {
-        return Err(EngineError::new("The model contains no 3D geometry."));
+        return Err(evaluator.no_solid_error(false));
     }
     let mut messages = evaluator.diagnostics;
     messages.push(format!("Parsed {} top-level statements.", statements.len()));
+    messages.extend(meshed.notes.iter().cloned());
     messages.extend(kernel_report(&meshed, resolution));
     Ok(CompileOutput {
         mesh: meshed.mesh,
@@ -660,7 +806,17 @@ fn kernel_report(meshed: &MeshedShape, resolution: usize) -> Vec<String> {
 /// Kept public deliberately. It is the fallback [`compile`] reaches for, the
 /// baseline the parity suite measures the exact kernel against, and the escape
 /// hatch if a model turns out to be one the kernel handles badly.
+#[allow(dead_code)] // the library surface; `exact_kernel_parity` calls it, the server does not
 pub fn compile_sampled(
+    source: &str,
+    quality: Quality,
+    cancellation: Option<&AtomicBool>,
+) -> Result<CompileOutput, EngineError> {
+    guarded(cancellation, || compile_sampled_unguarded(source, quality, cancellation))
+}
+
+#[allow(dead_code)]
+fn compile_sampled_unguarded(
     source: &str,
     quality: Quality,
     cancellation: Option<&AtomicBool>,
@@ -673,13 +829,13 @@ pub fn compile_sampled(
     };
     let shape = evaluator.evaluate(&statements)?;
     if shape.dimension() != ShapeDimension::Solid {
-        return Err(EngineError::new("The model contains no 3D geometry."));
+        return Err(evaluator.no_solid_error(true));
     }
     check_cancelled(cancellation)?;
     let resolution = quality.resolution();
     let mesh = mesh_shape(&shape, resolution, cancellation)?;
     if mesh.triangles.is_empty() {
-        return Err(EngineError::new("The model contains no 3D geometry."));
+        return Err(evaluator.no_solid_error(false));
     }
     let mut messages = evaluator.diagnostics;
     messages.extend([
@@ -731,10 +887,19 @@ pub fn validate(source: &str) -> Result<Vec<String>, EngineError> {
 /// Returns `Ok(None)` when the exact kernel declines any child or yields an
 /// empty mesh, leaving the caller to fall back to the per-shape path that can
 /// substitute the sampled mesher for individual objects.
+/// One object's mesh, its per-face colours when it has several, and the one
+/// colour its faces all share when they share one.
+type PartMesh = (Mesh, Option<FaceColors>, Option<[f64; 4]>);
+
+/// `open_imports` says the model imports an open surface (an upload
+/// that is not a closed solid). A part whose mesh comes out open has no inside to union, so it
+/// joins the combined mesh as it is rather than swallowing what it covers.
 fn exact_multipart_meshes(
     solid_shapes: &[Shape],
     cancellation: Option<&AtomicBool>,
-) -> Result<Option<(Mesh, Vec<Mesh>)>, EngineError> {
+    open_imports: bool,
+    notes: &mut Vec<String>,
+) -> Result<Option<(Mesh, Vec<PartMesh>)>, EngineError> {
     let mut groups: Vec<std::ops::Range<usize>> = Vec::with_capacity(solid_shapes.len());
     let mut children: Vec<&Shape> = Vec::new();
     for shape in solid_shapes {
@@ -765,34 +930,107 @@ fn exact_multipart_meshes(
     // One top-level object *is* the union, so the combined solid is its solid;
     // unioning the group a second time would repeat the whole boolean pass.
     let single = groups.len() == 1;
-    let part_solids = if single {
-        Vec::new()
-    } else {
-        groups
-            .iter()
-            .map(|range| exact::union_all_parallel(solids[range.clone()].to_vec()))
-            .collect::<Vec<_>>()
-    };
+    // The whole-model fold and every part's fold are independent of each
+    // other, and so is meshing each result, so both stages run side by side.
+    // Each task is the same fold (and the same meshing) the serial version
+    // ran, so every solid and triangle is bit-identical. Slot 0 is the
+    // combined union: it is the largest task, so it is claimed first.
     // The combined fold is the whole model's union, which on a grid-built
     // model is hundreds of operands, so it takes the parallel reduction too.
-    let combined_solid = exact::union_all_parallel(solids);
-    let combined = exact::solid_to_mesh(&combined_solid);
+    // The folds borrow `solids` rather than copying it, so running them
+    // together costs no more memory than the operands' first-level copies the
+    // fold makes anyway.
+    let fold_count = if single { 1 } else { groups.len() + 1 };
+    let folded = exact::map_indexed(fold_count, |index| match index {
+        0 => exact::union_all_parallel_ref(&solids),
+        part => exact::union_all_parallel_ref(&solids[groups[part - 1].clone()]),
+    });
+    drop(solids);
+    // The combined mesh is always sealed without regard to colour, so the
+    // whole-model export is the same facet set it has always been. A part
+    // whose faces carry several colours is sealed colour by colour instead
+    // (see `exact::solid_to_colored_mesh_noted`); a single such part is the one
+    // case that seals its solid twice.
+    let healed: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+    let note = |index: usize, report: Option<crate::csg::heal::HealReport>| {
+        if let (Some(report), Ok(mut healed)) = (report, healed.lock()) {
+            healed.push((index, report.message()));
+        }
+    };
+    let mut meshes = exact::map_indexed(folded.len() + usize::from(single), |index| {
+        match index {
+            0 => {
+                let (mesh, report) = exact::solid_to_mesh_noted(&folded[0]);
+                note(0, report);
+                (mesh, None, None)
+            }
+            _ if single => match exact::solid_to_colored_mesh_noted(&folded[0]) {
+                Some((mesh, colors, report)) => {
+                    note(index, report);
+                    (mesh, Some(colors), None)
+                }
+                None => (Mesh::default(), None, exact::uniform_color(&folded[0])),
+            },
+            part => match exact::solid_to_colored_mesh_noted(&folded[part]) {
+                Some((mesh, colors, report)) => {
+                    note(part, report);
+                    (mesh, Some(colors), None)
+                }
+                None => {
+                    let (mesh, report) = exact::solid_to_mesh_noted(&folded[part]);
+                    note(part, report);
+                    (mesh, None, exact::uniform_color(&folded[part]))
+                }
+            },
+        }
+    });
+    let mut healed = healed.into_inner().unwrap_or_default();
+    if open_imports {
+        // Which meshes are open surfaces: their open edges are the upload's
+        // own, which no repair closes and its warning already explains.
+        let open: Vec<bool> = meshes.iter().map(|(mesh, _, _)| mesh_has_open_edges(mesh)).collect();
+        healed.retain(|(index, _)| !open[*index]);
+        if !single && open[1..].iter().any(|&is_open| is_open) {
+            let closed: Vec<crate::csg::Solid> =
+                (1..folded.len()).filter(|&part| !open[part]).map(|part| folded[part].clone()).collect();
+            let (mut combined, report) = if closed.is_empty() {
+                (Mesh::default(), None)
+            } else {
+                exact::solid_to_mesh_noted(&exact::union_all_parallel_ref(&closed))
+            };
+            for part in (1..meshes.len()).filter(|&part| open[part]) {
+                combined.triangles.extend(meshes[part].0.triangles.iter().cloned());
+            }
+            healed.retain(|(index, _)| *index != 0);
+            if let Some(report) = report {
+                healed.push((0, report.message()));
+            }
+            meshes[0].0 = combined;
+        }
+    }
+    notes.extend(healed.into_iter().map(|(_, message)| message));
+    let (combined, _, _) = meshes.remove(0);
     if combined.triangles.is_empty() {
         return Ok(None);
     }
     let parts = if single {
-        vec![combined.clone()]
+        match meshes.pop() {
+            Some((mesh, Some(colors), _)) => vec![(mesh, Some(colors), None)],
+            Some((_, None, uniform)) => vec![(combined.clone(), None, uniform)],
+            None => vec![(combined.clone(), None, None)],
+        }
     } else {
-        part_solids.iter().map(exact::solid_to_mesh).collect()
+        meshes
     };
-    if parts.iter().any(|mesh| mesh.triangles.is_empty()) {
+    if parts.iter().any(|(mesh, _, _)| mesh.triangles.is_empty()) {
         return Ok(None);
     }
     Ok(Some((combined, parts)))
 }
 
 /// Memoised results of [`compile_parts`], keyed by exactly what determines
-/// them: the source and the quality.
+/// them: the source, the quality and the mesh assets `import()` can see
+/// ([`crate::assets::current_digest`], empty without assets).
 ///
 /// One user action compiles a workspace several times over. A preview render
 /// is followed by the clearance check, which compiles the same source again;
@@ -818,14 +1056,19 @@ const COMPILED_PARTS_CACHE_MAX_TRIANGLES: usize = 1_000_000;
 struct CompiledPartsEntry {
     source: String,
     quality: Quality,
+    assets: String,
     output: Arc<MultipartCompileOutput>,
 }
 
-fn cached_compiled_parts(source: &str, quality: Quality) -> Option<Arc<MultipartCompileOutput>> {
+fn cached_compiled_parts(
+    source: &str,
+    quality: Quality,
+    assets: &str,
+) -> Option<Arc<MultipartCompileOutput>> {
     let mut cache = COMPILED_PARTS.lock().ok()?;
-    let index = cache
-        .iter()
-        .position(|entry| entry.quality == quality && entry.source == source)?;
+    let index = cache.iter().position(|entry| {
+        entry.quality == quality && entry.source == source && entry.assets == assets
+    })?;
     // Most-recently-used first, so the eviction below drops the coldest entry.
     let entry = cache.remove(index);
     let output = Arc::clone(&entry.output);
@@ -833,7 +1076,12 @@ fn cached_compiled_parts(source: &str, quality: Quality) -> Option<Arc<Multipart
     Some(output)
 }
 
-fn remember_compiled_parts(source: &str, quality: Quality, output: &Arc<MultipartCompileOutput>) {
+fn remember_compiled_parts(
+    source: &str,
+    quality: Quality,
+    assets: &str,
+    output: &Arc<MultipartCompileOutput>,
+) {
     let triangles = output.mesh.triangles.len()
         + output
             .parts
@@ -847,12 +1095,15 @@ fn remember_compiled_parts(source: &str, quality: Quality, output: &Arc<Multipar
     let Ok(mut cache) = COMPILED_PARTS.lock() else {
         return;
     };
-    cache.retain(|entry| entry.quality != quality || entry.source != source);
+    cache.retain(|entry| {
+        entry.quality != quality || entry.source != source || entry.assets != assets
+    });
     cache.insert(
         0,
         CompiledPartsEntry {
             source: source.to_string(),
             quality,
+            assets: assets.to_string(),
             output: Arc::clone(output),
         },
     );
@@ -869,11 +1120,14 @@ pub fn compile_parts_shared(
     quality: Quality,
     cancellation: Option<&AtomicBool>,
 ) -> Result<Arc<MultipartCompileOutput>, EngineError> {
-    if let Some(output) = cached_compiled_parts(source, quality) {
+    let assets = crate::assets::current_digest();
+    if let Some(output) = cached_compiled_parts(source, quality, &assets) {
         return Ok(output);
     }
     let output = Arc::new(compile_parts(source, quality, cancellation)?);
-    remember_compiled_parts(source, quality, &output);
+    if !output.nondeterministic {
+        remember_compiled_parts(source, quality, &assets, &output);
+    }
     Ok(output)
 }
 
@@ -884,9 +1138,54 @@ pub fn compile_parts_shared(
 /// an unchanged workspace would otherwise each pay the full CSG cost.
 static COMPILED_WHOLE: Mutex<Vec<CompiledWholeEntry>> = Mutex::new(Vec::new());
 
+/// The phrase that marks an imported asset's open-surface warning.
+const OPEN_IMPORT_NOTE: &str = "is an open surface";
+
+/// Open boundary edges of recently imported asset meshes, by SHA-256: a
+/// design re-imports the same mesh on every compile.
+static OPEN_EDGES: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
+const OPEN_EDGES_CACHE_ENTRIES: usize = 64;
+
+/// Whether some edge of a (triangle soup) mesh has a single face.
+fn mesh_has_open_edges(mesh: &Mesh) -> bool {
+    let mut ids: HashMap<[u64; 3], u32> = HashMap::with_capacity(mesh.triangles.len() / 2);
+    let mut edges: HashMap<(u32, u32), u32> = HashMap::with_capacity(mesh.triangles.len() * 3 / 2);
+    for triangle in &mesh.triangles {
+        let corners = triangle.vertices.map(|p| {
+            // + 0.0 folds -0.0 into 0.0, the same position.
+            let key = [(p.x + 0.0).to_bits(), (p.y + 0.0).to_bits(), (p.z + 0.0).to_bits()];
+            let next = ids.len() as u32;
+            *ids.entry(key).or_insert(next)
+        });
+        for slot in 0..3 {
+            let (a, b) = (corners[slot], corners[(slot + 1) % 3]);
+            *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+        }
+    }
+    edges.values().any(|&count| count == 1)
+}
+
+/// How many edges of an asset mesh have a single face (an upload that is an
+/// open surface).
+fn open_edge_count(sha256: &str, mesh: &crate::assets::TriMesh) -> usize {
+    let cached = OPEN_EDGES.lock().ok().and_then(|cache| cache.iter().find(|(key, _)| key == sha256).map(|&(_, count)| count));
+    if let Some(count) = cached {
+        return count;
+    }
+    let count = crate::meshimport::open_edge_count(&mesh.triangles);
+    if let Ok(mut cache) = OPEN_EDGES.lock() {
+        if cache.len() >= OPEN_EDGES_CACHE_ENTRIES {
+            cache.remove(0);
+        }
+        cache.push((sha256.to_string(), count));
+    }
+    count
+}
+
 struct CompiledWholeEntry {
     source: String,
     quality: Quality,
+    assets: String,
     output: Arc<CompileOutput>,
 }
 
@@ -896,11 +1195,12 @@ pub fn compile_shared(
     quality: Quality,
     cancellation: Option<&AtomicBool>,
 ) -> Result<Arc<CompileOutput>, EngineError> {
+    let assets = crate::assets::current_digest();
+    let matches = |entry: &CompiledWholeEntry| {
+        entry.quality == quality && entry.source == source && entry.assets == assets
+    };
     if let Ok(mut cache) = COMPILED_WHOLE.lock() {
-        if let Some(index) = cache
-            .iter()
-            .position(|entry| entry.quality == quality && entry.source == source)
-        {
+        if let Some(index) = cache.iter().position(matches) {
             let entry = cache.remove(index);
             let output = Arc::clone(&entry.output);
             cache.insert(0, entry);
@@ -908,14 +1208,17 @@ pub fn compile_shared(
         }
     }
     let output = Arc::new(compile(source, quality, cancellation)?);
-    if output.mesh.triangles.len() <= COMPILED_PARTS_CACHE_MAX_TRIANGLES {
+    // Read right after the compile, on the thread that evaluated it.
+    let deterministic = !builtins::nondeterminism_observed();
+    if deterministic && output.mesh.triangles.len() <= COMPILED_PARTS_CACHE_MAX_TRIANGLES {
         if let Ok(mut cache) = COMPILED_WHOLE.lock() {
-            cache.retain(|entry| entry.quality != quality || entry.source != source);
+            cache.retain(|entry| !matches(entry));
             cache.insert(
                 0,
                 CompiledWholeEntry {
                     source: source.to_string(),
                     quality,
+                    assets: assets.clone(),
                     output: Arc::clone(&output),
                 },
             );
@@ -935,7 +1238,8 @@ pub fn compile_parts(
     quality: Quality,
     cancellation: Option<&AtomicBool>,
 ) -> Result<MultipartCompileOutput, EngineError> {
-    catch_geometry_panic(|| compile_parts_unguarded(source, quality, cancellation))
+    builtins::reset_nondeterminism();
+    guarded(cancellation, || compile_parts_unguarded(source, quality, cancellation))
 }
 
 fn compile_parts_unguarded(
@@ -943,7 +1247,7 @@ fn compile_parts_unguarded(
     quality: Quality,
     cancellation: Option<&AtomicBool>,
 ) -> Result<MultipartCompileOutput, EngineError> {
-    let statements = parse_resolved_program(source)?;
+    let (statements, metas) = parse_resolved_program_with_meta(source)?;
     let mut evaluator = Evaluator {
         cancellation,
         preview: matches!(quality, Quality::Preview),
@@ -951,12 +1255,52 @@ fn compile_parts_unguarded(
         ..Evaluator::default()
     };
     let shapes = evaluator.evaluate_objects(&statements)?;
-    let solid_shapes = shapes
-        .into_iter()
-        .filter(|shape| shape.dimension() == ShapeDimension::Solid)
-        .collect::<Vec<_>>();
+    let origins = std::mem::take(&mut evaluator.top_level_origins);
+    debug_assert_eq!(origins.len(), shapes.len());
+    let (mut solid_shapes, mut solid_origins) = (Vec::new(), Vec::new());
+    let mut planar_lines = Vec::new();
+    for (shape, origin) in shapes.into_iter().zip(origins) {
+        if shape.dimension() == ShapeDimension::Solid {
+            solid_shapes.push(shape);
+            solid_origins.push(origin);
+        } else {
+            planar_lines.push(
+                metas
+                    .get(origin)
+                    .and_then(|meta| meta.range)
+                    .map(|range| line_of(source, range.start))
+                    .map_or(String::new(), |line| format!(" on line {line}")),
+            );
+        }
+    }
+    let planar_only = solid_shapes.is_empty() && !planar_lines.is_empty();
+    if !solid_shapes.is_empty() {
+        // OpenSCAD renders a lone 2D model as a 2D model; this workbench
+        // exports solids, so a 2D object beside 3D ones would vanish
+        // without a word.
+        for location in planar_lines {
+            evaluator.diagnostics.push(format!(
+                "WARNING: top-level 2D object{location} is not a solid and is left out of \
+                 the model; extrude it with linear_extrude() to include it."
+            ));
+        }
+    }
+    let candidacy = naming::Candidacy::new(&statements);
+    for (index, meta) in metas.iter().enumerate() {
+        if let Some(annotation) = &meta.annotation {
+            if !statements
+                .get(index)
+                .is_some_and(|statement| candidacy.can_make(statement))
+            {
+                evaluator.diagnostics.push(format!(
+                    "WARNING: \"@name: {annotation}\" is not directly before a statement that \
+                     makes geometry; the annotation is ignored."
+                ));
+            }
+        }
+    }
     if solid_shapes.is_empty() {
-        return Err(EngineError::new("The model contains no 3D geometry."));
+        return Err(evaluator.no_solid_error(planar_only));
     }
     check_cancelled(cancellation)?;
     let resolution = quality.resolution();
@@ -964,7 +1308,9 @@ fn compile_parts_unguarded(
     // The exact path builds every object's solid once and reuses those solids
     // for the union; only when the kernel declines does the slower per-shape
     // path run, because only it can substitute the sampled mesher per object.
-    let exact_meshes = exact_multipart_meshes(&solid_shapes, cancellation)?;
+    let mut notes: Vec<String> = Vec::new();
+    let open_imports = evaluator.diagnostics.iter().any(|message| message.contains(OPEN_IMPORT_NOTE));
+    let exact_meshes = exact_multipart_meshes(&solid_shapes, cancellation, open_imports, &mut notes)?;
     let (mesh, part_meshes, mut approximated) = match exact_meshes {
         Some((combined, parts)) => (combined, Some(parts), None),
         None => {
@@ -974,16 +1320,12 @@ fn compile_parts_unguarded(
             if combined.mesh.triangles.is_empty() {
                 return Err(EngineError::new("The model contains no 3D geometry."));
             }
+            notes.extend(combined.notes);
             (combined.mesh, None, combined.approximated)
         }
     };
 
-    let mut names = top_level_object_names(&statements);
-    if names.len() != solid_shapes.len() {
-        names = (1..=solid_shapes.len())
-            .map(|index| format!("object {index}"))
-            .collect();
-    }
+    let identities = naming::object_identities(&statements, &metas, &solid_origins);
     // A single top-level object *is* the union, so meshing it again would
     // repeat the whole boolean evaluation for a bit-identical answer. That
     // matters: with the exact kernel it is the difference between one and two
@@ -992,35 +1334,41 @@ fn compile_parts_unguarded(
     let single = solid_shapes.len() == 1;
     let mut part_meshes = part_meshes.map(Vec::into_iter);
     let mut parts = Vec::with_capacity(solid_shapes.len());
-    for (index, (shape, name)) in solid_shapes.into_iter().zip(names).enumerate() {
+    for ((shape, identity), origin) in solid_shapes.into_iter().zip(identities).zip(solid_origins)
+    {
         check_cancelled(cancellation)?;
         let bounds = shape.bounds();
-        let part_mesh = match part_meshes.as_mut().and_then(Iterator::next) {
+        let (part_mesh, face_colors, uniform) = match part_meshes.as_mut().and_then(Iterator::next) {
             Some(part_mesh) => part_mesh,
-            None if single => mesh.clone(),
+            None if single => (mesh.clone(), None, None),
             None => {
                 let meshed = mesh_shape_exact_first(&shape, resolution, cancellation)?;
                 if meshed.approximated.is_some() && approximated.is_none() {
                     approximated = meshed.approximated.clone();
                 }
-                meshed.mesh
+                notes.extend(meshed.notes);
+                (meshed.mesh, None, None)
             }
         };
         if part_mesh.triangles.is_empty() {
             continue;
         }
+        let color = face_colors
+            .as_ref()
+            .map_or_else(|| shape.stated_color().or(uniform), |colors| colors.dominant(&part_mesh));
         parts.push(CompiledPart {
-            id: format!("object-{}", index + 1),
-            name,
+            id: identity.id,
+            name: identity.name,
             mesh: part_mesh,
             bounds: PartBounds {
                 min: bounds.min,
                 max: bounds.max,
             },
-            source_range: None,
+            source_range: metas.get(origin).and_then(|meta| meta.range),
             visible: true,
             selectable: true,
-            color: shape.stated_color(),
+            color,
+            face_colors,
             background: false,
             quality,
             shape,
@@ -1058,6 +1406,7 @@ fn compile_parts_unguarded(
             visible: true,
             selectable: false,
             color: shape.stated_color(),
+            face_colors: None,
             background: true,
             quality,
             shape,
@@ -1066,19 +1415,31 @@ fn compile_parts_unguarded(
 
     let mut messages = evaluator.diagnostics;
     messages.push(format!("Parsed {} top-level statements.", statements.len()));
+    // The combined mesh and a part's own mesh repair the same defect when
+    // one object is the whole model; say it once.
+    for note in notes {
+        if !messages.contains(&note) {
+            messages.push(note);
+        }
+    }
+    // Two different counts, both named: the objects' own meshes (what the
+    // object list, measure and a per-object export carry) and the combined
+    // model mesh, their union, which is smaller wherever objects touch or
+    // overlap.
+    let object_triangles: usize = parts.iter().map(|part| part.mesh.triangles.len()).sum();
+    let counts = format!(
+        "{} object{} with {} triangles in total; combined (unioned) model mesh {} triangles",
+        parts.len(),
+        if parts.len() == 1 { "" } else { "s" },
+        object_triangles,
+        mesh.triangles.len()
+    );
     match approximated {
-        None => messages.push(format!(
-            "Exact polyhedral kernel generated {} triangles across {} objects.",
-            mesh.triangles.len(),
-            parts.len()
-        )),
+        None => messages.push(format!("Exact polyhedral kernel generated {counts}.")),
         Some(warning) => {
             messages.push(warning);
             messages.push(format!(
-                "Native implicit mesher generated {} triangles across {} objects at quality {}.",
-                mesh.triangles.len(),
-                parts.len(),
-                resolution
+                "Native implicit mesher generated {counts} at quality {resolution}."
             ));
         }
     }
@@ -1087,6 +1448,7 @@ fn compile_parts_unguarded(
         parts,
         background_parts,
         messages,
+        nondeterministic: builtins::nondeterminism_observed(),
     })
 }
 
@@ -1155,7 +1517,12 @@ pub fn mesh_selected_parts(
     })?;
     check_cancelled(cancellation)?;
     let resolution = quality.resolution();
-    let mesh = mesh_shape_exact_first(&selected_shape, resolution, cancellation)?.mesh;
+    // The union is a fresh boolean outside `compile`'s own guard: a kernel
+    // budget or deadline abort here must be an error, not a dropped socket.
+    let mesh = guarded(cancellation, || {
+        mesh_shape_exact_first(&selected_shape, resolution, cancellation)
+    })?
+    .mesh;
     if mesh.triangles.is_empty() {
         return Err(EngineError::new(
             "The selected objects contain no 3D geometry.",
@@ -1164,252 +1531,14 @@ pub fn mesh_selected_parts(
     Ok(mesh)
 }
 
-/// Check every visible pair. Hidden IDs are intentionally request state rather
-/// than mutations of compiled parts, so one compiled result can serve multiple
-/// UI or MCP clients safely.
-pub fn check_part_clearances(
-    parts: &[CompiledPart],
-    tolerance: f64,
-    hidden_object_ids: &[String],
-) -> Result<Vec<PartIntersection>, EngineError> {
-    if !tolerance.is_finite() || tolerance < 0.0 {
-        return Err(EngineError::new(
-            "Intersection tolerance must be finite and non-negative.",
-        ));
-    }
-    let hidden = hidden_object_ids
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    let visible = parts
-        .iter()
-        .filter(|part| part.visible && !hidden.contains(part.id.as_str()))
-        .collect::<Vec<_>>();
-    // Every pair is an independent sweep of one part's surface against the
-    // other's distance field, and that sweep is the whole cost of this check:
-    // tens of thousands of sample points, each evaluated against a full shape
-    // tree. Running the pairs concurrently is the difference between a check
-    // that outlasts the render that produced it and one that follows it.
-    let mut pairs = Vec::with_capacity(visible.len().saturating_sub(1) * visible.len() / 2);
-    for (left_index, left) in visible.iter().enumerate() {
-        for right in visible.iter().skip(left_index + 1) {
-            pairs.push((*left, *right));
-        }
-    }
-    let results = exact::map_indexed(pairs.len(), |index| {
-        let (left, right) = pairs[index];
-        let (signed_distance, location) = sampled_part_distance(left, right);
-        let scale = part_maximum_span(left).max(part_maximum_span(right));
-        let numerical_epsilon = (scale * 1e-7).max(1e-8);
-        let intersects = signed_distance < -numerical_epsilon;
-        let clearance = if intersects {
-            0.0
-        } else {
-            signed_distance.max(0.0)
-        };
-        PartIntersection {
-            a: left.id.clone(),
-            b: right.id.clone(),
-            intersects,
-            within_tolerance: !intersects && clearance <= tolerance + numerical_epsilon,
-            clearance,
-            depth: intersects.then_some(-signed_distance),
-            location,
-            overlap: bounds_overlap(left.bounds, right.bounds),
-        }
-    });
-    Ok(results)
-}
-
-/// The sampled signed distance between two parts, together with the point that
-/// realised it.
-///
-/// The extremum point is what callers need in order to say *where* a clash or
-/// a tolerance violation happens, so it is tracked alongside the minimum
-/// instead of being recomputed by a second sweep.
-fn sampled_part_distance(left: &CompiledPart, right: &CompiledPart) -> (f64, Option<Vec3>) {
-    let bounds_distance = bounds_clearance(left.bounds, right.bounds);
-    let mut sampled = f64::INFINITY;
-    let mut witness = None;
-    let mut consider = |distance: f64, point: Vec3| {
-        if distance < sampled {
-            sampled = distance;
-            witness = Some(point);
-        }
-    };
-    // How short a facet has to get before its interior stops hiding anything.
-    // Relative to the pair's own size, so it costs nothing on meshes whose
-    // facets are already small.
-    let scale = part_maximum_span(left).max(part_maximum_span(right));
-    let target_edge = (scale / 16.0).max(1e-6);
-    let mut samples = Vec::new();
-    surface_samples(&left.mesh, target_edge, &mut samples);
-    for point in samples.drain(..) {
-        consider(right.shape.distance(point), point);
-    }
-    surface_samples(&right.mesh, target_edge, &mut samples);
-    for point in samples.drain(..) {
-        consider(left.shape.distance(point), point);
-    }
-    if bounds_distance <= f64::EPSILON {
-        let centers = bounds_overlap(left.bounds, right.bounds)
-            .into_iter()
-            .map(bounds_center)
-            .chain([bounds_center(left.bounds), bounds_center(right.bounds)]);
-        for point in centers {
-            let shared_interior_distance =
-                left.shape.distance(point).max(right.shape.distance(point));
-            consider(shared_interior_distance, point);
-        }
-    }
-    if sampled < 0.0 {
-        (sampled, witness)
-    } else {
-        // The AABB distance is a strict lower bound and guards against tiny
-        // negative/positive drift in approximate meshes of distant objects.
-        (sampled.max(bounds_distance), witness)
-    }
-}
-
-/// Ceiling on how many points one mesh may contribute to a clearance sweep.
-///
-/// Reached only by a mesh with a few very large facets; a finely tessellated
-/// one never subdivides at all and stays at three points per facet.
-const MAX_CLEARANCE_SAMPLES: usize = 40_000;
-
-/// Points on a mesh's surface, dense enough that no facet interior can hide the
-/// deepest penetration.
-///
-/// Sampling mesh *vertices* alone was adequate while every mesh came off a
-/// sampling grid and carried thousands of them. It is not adequate for the
-/// exact kernel: a box is eight vertices, every one of them on the rim of any
-/// overlap, so a box buried halfway inside its neighbour reports a penetration
-/// of zero. Splitting each facet until its edges are short relative to the
-/// pair's size puts samples in the middle of large flat faces, which is exactly
-/// where the deepest penetration is.
-fn surface_samples(mesh: &Mesh, target_edge: f64, output: &mut Vec<Vec3>) {
-    for triangle in &mesh.triangles {
-        let [a, b, c] = triangle.vertices;
-        output.extend([a, b, c]);
-        subdivide_samples(a, b, c, target_edge, 5, output);
-    }
-}
-
-fn subdivide_samples(
-    a: Vec3,
-    b: Vec3,
-    c: Vec3,
-    target_edge: f64,
-    depth: usize,
-    output: &mut Vec<Vec3>,
-) {
-    if output.len() >= MAX_CLEARANCE_SAMPLES {
-        return;
-    }
-    output.push(a.add(b).add(c).mul(1.0 / 3.0));
-    let longest = b
-        .sub(a)
-        .length()
-        .max(c.sub(b).length())
-        .max(a.sub(c).length());
-    if depth == 0 || longest <= target_edge {
-        return;
-    }
-    let ab = a.add(b).mul(0.5);
-    let bc = b.add(c).mul(0.5);
-    let ca = c.add(a).mul(0.5);
-    output.extend([ab, bc, ca]);
-    subdivide_samples(a, ab, ca, target_edge, depth - 1, output);
-    subdivide_samples(ab, b, bc, target_edge, depth - 1, output);
-    subdivide_samples(ca, bc, c, target_edge, depth - 1, output);
-    subdivide_samples(ab, bc, ca, target_edge, depth - 1, output);
-}
-
-/// The shared region of two axis-aligned boxes, or `None` when they are apart
-/// on any axis.
-fn bounds_overlap(left: PartBounds, right: PartBounds) -> Option<PartBounds> {
-    let min = Vec3::new(
-        left.min.x.max(right.min.x),
-        left.min.y.max(right.min.y),
-        left.min.z.max(right.min.z),
-    );
-    let max = Vec3::new(
-        left.max.x.min(right.max.x),
-        left.max.y.min(right.max.y),
-        left.max.z.min(right.max.z),
-    );
-    (min.x <= max.x && min.y <= max.y && min.z <= max.z).then_some(PartBounds { min, max })
-}
-
-fn bounds_center(bounds: PartBounds) -> Vec3 {
-    bounds.min.add(bounds.max).mul(0.5)
-}
-
-fn bounds_clearance(left: PartBounds, right: PartBounds) -> f64 {
-    let dx = (left.min.x - right.max.x)
-        .max(right.min.x - left.max.x)
-        .max(0.0);
-    let dy = (left.min.y - right.max.y)
-        .max(right.min.y - left.max.y)
-        .max(0.0);
-    let dz = (left.min.z - right.max.z)
-        .max(right.min.z - left.max.z)
-        .max(0.0);
-    Vec3::new(dx, dy, dz).length()
-}
-
-fn part_maximum_span(part: &CompiledPart) -> f64 {
-    let span = part.bounds.max.sub(part.bounds.min);
-    span.x.max(span.y).max(span.z)
-}
-
-fn top_level_object_names(statements: &[Stmt]) -> Vec<String> {
-    statements
-        .iter()
-        .filter_map(top_level_statement_name)
-        .enumerate()
-        .map(|(index, name)| format!("{name} {}", index + 1))
-        .collect()
-}
-
-fn top_level_statement_name(statement: &Stmt) -> Option<String> {
-    match statement {
-        Stmt::Call { .. } => statement_object_name(statement),
-        Stmt::Block(_) => Some("group".into()),
-        Stmt::For { .. } => Some("for".into()),
-        Stmt::Let { .. } => Some("let".into()),
-        Stmt::If { .. } => Some("if".into()),
-        // `!` keeps producing the marked subtree, so it is named after it.
-        Stmt::Root(inner) => top_level_statement_name(inner),
-        // `%` contributes no object to the CSG result; its geometry is named
-        // separately as a background object.
-        Stmt::Background(_)
-        | Stmt::Disabled
-        | Stmt::Assign { .. }
-        | Stmt::FileDirective { .. }
-        | Stmt::Function { .. }
-        | Stmt::Module { .. } => None,
-    }
-}
-
-fn statement_object_name(statement: &Stmt) -> Option<String> {
-    let Stmt::Call { name, children, .. } = statement else {
-        return None;
-    };
-    let transparent_wrapper = matches!(
-        name.as_str(),
-        "translate" | "rotate" | "scale" | "mirror" | "color" | "render" | "resize" | "multmatrix"
-    );
-    if transparent_wrapper && children.len() == 1 {
-        statement_object_name(&children[0]).or_else(|| Some(name.clone()))
-    } else {
-        Some(name.clone())
-    }
-}
-
 fn check_cancelled(cancellation: Option<&AtomicBool>) -> Result<(), EngineError> {
     if cancellation.is_some_and(|signal| signal.load(Ordering::Acquire)) {
         Err(EngineError::new("Render cancelled."))
+    } else if let Some(message) = crate::csg::bsp::interrupt_message() {
+        // The thread's kernel interrupts (an analysis request's deadline, or
+        // a flag installed by `guarded`) stop evaluation too, not only the
+        // booleans: a long `for` loop is as able to outlive a request.
+        Err(EngineError::new(message))
     } else {
         Ok(())
     }
@@ -1462,6 +1591,37 @@ struct Lexer<'a> {
     line: usize,
 }
 
+/// A token stream with what the parser needs to point back into the source:
+/// each token's byte span, and every `@name` comment annotation keyed by the
+/// index of the token that follows it.
+struct LexedSource {
+    tokens: Vec<Token>,
+    spans: Vec<(usize, usize)>,
+    annotations: Vec<(usize, String)>,
+}
+
+/// Reads an object-name annotation out of a comment's text.
+///
+/// `// @name: Lid`, `// @name = "Lid"` and `/* @name Lid */` all name the
+/// statement that follows. A comment is the one spelling that keeps the file
+/// valid OpenSCAD with no change in meaning there.
+fn name_annotation(comment: &str) -> Option<String> {
+    let rest = comment.trim().strip_prefix("@name")?;
+    if !rest.starts_with(|character: char| character.is_whitespace() || character == ':' || character == '=') {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let rest = rest
+        .strip_prefix(':')
+        .or_else(|| rest.strip_prefix('='))
+        .unwrap_or(rest);
+    let name = rest.trim().trim_matches('"').trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.chars().take(naming::MAX_OBJECT_NAME_CHARACTERS).collect())
+}
+
 impl<'a> Lexer<'a> {
     fn new(source: &'a str) -> Self {
         Self {
@@ -1471,17 +1631,38 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn tokenize(mut self) -> Result<Vec<Token>, EngineError> {
+    fn tokenize(self) -> Result<Vec<Token>, EngineError> {
+        Ok(self.tokenize_with_spans()?.tokens)
+    }
+
+    fn tokenize_with_spans(mut self) -> Result<LexedSource, EngineError> {
         let mut tokens = Vec::new();
+        let mut spans = Vec::new();
+        let mut annotations = Vec::new();
         while let Some(byte) = self.peek() {
+            let token_start = self.cursor;
+            let token_count = tokens.len();
             match byte {
                 b' ' | b'\t' | b'\r' => self.cursor += 1,
                 b'\n' => {
                     self.line += 1;
                     self.cursor += 1;
                 }
-                b'/' if self.peek_next() == Some(b'/') => self.skip_line_comment(),
-                b'/' if self.peek_next() == Some(b'*') => self.skip_block_comment()?,
+                b'/' if self.peek_next() == Some(b'/') => {
+                    self.skip_line_comment();
+                    let text = String::from_utf8_lossy(&self.source[token_start + 2..self.cursor]);
+                    if let Some(name) = name_annotation(&text) {
+                        annotations.push((tokens.len(), name));
+                    }
+                }
+                b'/' if self.peek_next() == Some(b'*') => {
+                    self.skip_block_comment()?;
+                    let end = self.cursor.saturating_sub(2).max(token_start + 2);
+                    let text = String::from_utf8_lossy(&self.source[token_start + 2..end]);
+                    if let Some(name) = name_annotation(&text) {
+                        annotations.push((tokens.len(), name));
+                    }
+                }
                 b'0'..=b'9' | b'.'
                     if byte != b'.'
                         || self.peek_next().is_some_and(|next| next.is_ascii_digit()) =>
@@ -1546,8 +1727,15 @@ impl<'a> Lexer<'a> {
                     )))
                 }
             }
+            if tokens.len() > token_count {
+                spans.push((token_start, self.cursor));
+            }
         }
-        Ok(tokens)
+        Ok(LexedSource {
+            tokens,
+            spans,
+            annotations,
+        })
     }
 
     fn peek(&self) -> Option<u8> {
@@ -1916,6 +2104,8 @@ struct Parser {
     tokens: Vec<Token>,
     cursor: usize,
     expression_depth: usize,
+    /// Token range `[start, end)` of each top-level statement, in order.
+    top_level_spans: Vec<(usize, usize)>,
 }
 
 impl Parser {
@@ -1924,6 +2114,7 @@ impl Parser {
             tokens,
             cursor: 0,
             expression_depth: 0,
+            top_level_spans: Vec::new(),
         }
     }
 
@@ -1933,7 +2124,9 @@ impl Parser {
             if self.consume(&Token::Semicolon) {
                 continue;
             }
+            let start = self.cursor;
             statements.push(self.statement()?);
+            self.top_level_spans.push((start, self.cursor));
         }
         Ok(statements)
     }
@@ -2570,7 +2763,11 @@ enum Value {
     Number(f64),
     Bool(bool),
     String(String),
-    Vector(Vec<Value>),
+    /// Shared so that binding, passing, and looking up a list is a reference
+    /// count bump: SCAD values are immutable, and programs routinely pass
+    /// large point/face tables through every helper call and comprehension
+    /// scope, which made each of those a deep copy.
+    Vector(Rc<ValueList>),
     Range { start: f64, step: f64, end: f64 },
     Function(Rc<FunctionValue>),
     Undefined,
@@ -2602,7 +2799,78 @@ impl PartialEq for Value {
     }
 }
 
+/// Upper bound on a list's [`ValueList::weight`].
+///
+/// Sharing makes a list a DAG: `[a, a]` costs one node however large `a` is,
+/// so twenty doublings build a value with a million leaves out of twenty
+/// allocations, and sixty build one no walk (equality, formatting, the
+/// non-finite check, comprehension budgeting) could ever finish. Capping the
+/// expanded size at construction bounds every recursive walker at once. A deep
+/// copy of a list this size would already have been hundreds of megabytes, so
+/// nothing the old copying evaluator could build is refused.
+const MAX_VALUE_WEIGHT: usize = 4_000_000;
+
+/// A list's elements plus its expanded size, cached so it never has to be
+/// recomputed by walking a shared structure.
+#[derive(Debug)]
+struct ValueList {
+    items: Vec<Value>,
+    /// Nodes in the fully expanded tree: one for the list itself plus each
+    /// element's weight. Never above [`MAX_VALUE_WEIGHT`].
+    weight: usize,
+}
+
+impl std::ops::Deref for ValueList {
+    type Target = Vec<Value>;
+
+    fn deref(&self) -> &Vec<Value> {
+        &self.items
+    }
+}
+
+impl PartialEq for ValueList {
+    fn eq(&self, other: &Self) -> bool {
+        self.weight == other.weight && self.items == other.items
+    }
+}
+
 impl Value {
+    /// Builds a list, or undef with a warning when its expanded size would
+    /// exceed [`MAX_VALUE_WEIGHT`].
+    fn vector(values: Vec<Value>) -> Self {
+        let weight = values
+            .iter()
+            .fold(1usize, |total, value| total.saturating_add(value.weight()));
+        if weight > MAX_VALUE_WEIGHT {
+            expression_warning(format!(
+                "List exceeds the {MAX_VALUE_WEIGHT} element limit; returning undef."
+            ));
+            return Value::Undefined;
+        }
+        Value::Vector(Rc::new(ValueList {
+            items: values,
+            weight,
+        }))
+    }
+
+    /// Nodes in this value's fully expanded tree; bounded by
+    /// [`MAX_VALUE_WEIGHT`], so a walk over the value is too.
+    fn weight(&self) -> usize {
+        match self {
+            Value::Vector(values) => values.weight,
+            _ => 1,
+        }
+    }
+
+    /// Takes a vector's elements by value, copying only when the list is
+    /// still shared with another binding.
+    fn unshare(values: Rc<ValueList>) -> Vec<Value> {
+        match Rc::try_unwrap(values) {
+            Ok(list) => list.items,
+            Err(shared) => shared.items.clone(),
+        }
+    }
+
     fn has_non_finite_number(&self) -> bool {
         match self {
             Value::Number(value) => !value.is_finite(),
@@ -2713,17 +2981,19 @@ impl Environment {
     }
 }
 
+/// Parameters and body are shared: every call re-creates the scope's sibling
+/// functions as values, and that must not deep-copy their syntax trees.
 #[derive(Clone, Debug)]
 struct FunctionDefinition {
-    parameters: Vec<(String, Option<Expr>)>,
-    body: Expr,
+    parameters: Rc<Vec<(String, Option<Expr>)>>,
+    body: Rc<Expr>,
 }
 
 #[derive(Clone, Debug)]
 struct FunctionValue {
     name: Option<String>,
-    parameters: Vec<(String, Option<Expr>)>,
-    body: Expr,
+    parameters: Rc<Vec<(String, Option<Expr>)>>,
+    body: Rc<Expr>,
     /// The defining scope, shared rather than copied: every call to this
     /// function layers its own bindings over this one map.
     environment: Rc<Environment>,
@@ -2749,8 +3019,8 @@ fn install_scope_functions(
             name.clone(),
             Value::Function(Rc::new(FunctionValue {
                 name: Some(name.clone()),
-                parameters: definition.parameters.clone(),
-                body: definition.body.clone(),
+                parameters: Rc::clone(&definition.parameters),
+                body: Rc::clone(&definition.body),
                 environment: Rc::clone(&captured),
                 same_scope_functions: definitions.clone(),
             })),
@@ -3205,6 +3475,15 @@ struct Evaluator<'a> {
     /// Address of a local in the frame evaluation started in, or 0 before it
     /// has been taken. Recursion is measured against this rather than counted.
     stack_origin: usize,
+    /// For each shape `evaluate_objects` returns, the index of the top-level
+    /// statement that produced it. This is what ties an object to its source
+    /// statement, so statements that produce nothing (`assert`, `echo`, an
+    /// assignment, an empty module call) cannot shift anyone's name.
+    top_level_origins: Vec<usize>,
+    /// Index of the top-level statement being evaluated.
+    current_top_level: usize,
+    /// Top-level statement that holds the `!` subtree, once one is claimed.
+    root_origin: Option<usize>,
 }
 
 impl Default for Evaluator<'_> {
@@ -3223,6 +3502,9 @@ impl Default for Evaluator<'_> {
             root_shapes: None,
             root_claimed: false,
             stack_origin: 0,
+            top_level_origins: Vec::new(),
+            current_top_level: 0,
+            root_origin: None,
         }
     }
 }
@@ -3259,6 +3541,12 @@ const MAX_MODULE_RECURSION_DEPTH: usize = 256;
 /// it. A model that needs more than this is refused with a diagnostic.
 const MAX_EVALUATION_STACK_BYTES: usize = 1_500_000;
 
+/// Floor on the stack one level of module nesting is charged, so the depth
+/// limit is deterministic across builds (~183 levels): measured frames range
+/// from about 7 KB to 10 KB depending on codegen, and a build with small
+/// frames used to accept recursion a build with large ones refused.
+const MIN_STACK_BYTES_PER_LEVEL: usize = 8_192;
+
 /// How many elements a `for` may walk.
 ///
 /// OpenSCAD's own range cap: it warns `too many elements` and produces nothing
@@ -3268,14 +3556,58 @@ const MAX_EVALUATION_STACK_BYTES: usize = 1_500_000;
 const MAX_FOR_ITERATIONS: usize = 1_000_000;
 const MAX_EVALUATION_WORK_STEPS: usize = 1_000_000;
 const MAX_HULL_CACHE_ENTRIES: usize = 1_024;
+/// Longest string one `text()` sets; a label longer than this is a mistake or
+/// an attack, and every glyph is a polygon the kernel has to carry.
+const MAX_TEXT_CHARACTERS: usize = 2_000;
+
+/// How `text()` lays a string out in an outline face.
+struct TextLayout<'a> {
+    /// The em size in mm.
+    em: f64,
+    spacing: f64,
+    halign: &'a str,
+    valign: &'a str,
+    direction: &'a str,
+}
 const MAX_CURVE_FRAGMENTS: usize = 100_000;
 
 impl Evaluator<'_> {
     fn evaluate(&mut self, statements: &[Stmt]) -> Result<Shape, EngineError> {
-        self.evaluate_objects(statements).and_then(|shapes| {
-            Shape::union(shapes)
-                .ok_or_else(|| EngineError::new("The program produced no geometry."))
-        })
+        let shapes = self.evaluate_objects(statements)?;
+        match Shape::union(shapes) {
+            Some(shape) => Ok(shape),
+            None => Err(self.with_warnings("The program produced no geometry.")),
+        }
+    }
+
+    /// An error for a model that came out empty, carrying the warnings that
+    /// explain why. A dropped statement is almost always the reason, and an
+    /// error that does not say which one sends the author hunting.
+    fn with_warnings(&self, message: &str) -> EngineError {
+        let warnings: Vec<&str> = self
+            .diagnostics
+            .iter()
+            .filter(|line| line.starts_with("WARNING"))
+            .map(String::as_str)
+            .take(20)
+            .collect();
+        if warnings.is_empty() {
+            EngineError::new(message)
+        } else {
+            EngineError::new(format!("{message}\n{}", warnings.join("\n")))
+        }
+    }
+
+    /// The error for a model with no solid at the top level.
+    fn no_solid_error(&self, planar: bool) -> EngineError {
+        if planar {
+            self.with_warnings(
+                "The model contains no 3D geometry. Its top-level geometry is 2D; extrude it \
+                 with linear_extrude() or rotate_extrude() to make a solid.",
+            )
+        } else {
+            self.with_warnings("The model contains no 3D geometry.")
+        }
     }
 
     fn evaluate_objects(&mut self, statements: &[Stmt]) -> Result<Vec<Shape>, EngineError> {
@@ -3300,6 +3632,8 @@ impl Evaluator<'_> {
                 "WARNING: root modifier (!) in effect; only that subtree is rendered.".into(),
             );
             self.background_shapes.clear();
+            let origin = self.root_origin.unwrap_or(0);
+            self.top_level_origins = vec![origin; root.len()];
             shapes = root;
         }
         if !self.background_shapes.is_empty() {
@@ -3327,6 +3661,26 @@ impl Evaluator<'_> {
         group_top_level: bool,
     ) -> Result<Vec<Shape>, EngineError> {
         self.consume_work(1)?;
+        // Each piece is its own never-inlined method so that this frame, which
+        // sits on the stack twice per level of user-module recursion (the
+        // module body, then the `if` inside it), stays a few hundred bytes.
+        let scope_environment = self.statement_scope(statements, environment)?;
+        let environment = scope_environment.as_ref().unwrap_or(environment);
+        let outer_modules = Rc::clone(&self.modules);
+        self.install_statement_modules(statements, environment, &outer_modules);
+        let result = self.statement_shapes(statements, environment, group_top_level);
+        self.modules = outer_modules;
+        result
+    }
+
+    /// The environment a statement list evaluates in: `None` when the list
+    /// binds no names and declares no functions, so the caller's serves.
+    #[inline(never)]
+    fn statement_scope(
+        &mut self,
+        statements: &[Stmt],
+        environment: &Environment,
+    ) -> Result<Option<Environment>, EngineError> {
         // OpenSCAD assignments and module definitions apply throughout their
         // lexical scope, including statements that appear before the definition.
         let mut final_assignments = Vec::<(String, Expr)>::new();
@@ -3374,8 +3728,8 @@ impl Evaluator<'_> {
                     } => Some((
                         name.clone(),
                         FunctionDefinition {
-                            parameters: parameters.clone(),
-                            body: body.clone(),
+                            parameters: Rc::new(parameters.clone()),
+                            body: Rc::new(body.clone()),
                         },
                     )),
                     _ => None,
@@ -3390,10 +3744,10 @@ impl Evaluator<'_> {
         // single evaluation matters for intentionally nondeterministic rands().
         // Nothing below writes to the environment unless this scope binds a
         // name or a function, so only then is a private copy made.
-        let scope_environment;
-        let environment: &Environment = if final_assignments.is_empty() && !declares_functions {
-            environment
-        } else {
+        if final_assignments.is_empty() && !declares_functions {
+            return Ok(None);
+        }
+        {
             let mut scope = environment.clone();
             let assignment_names = assignment_indices.keys().cloned().collect::<HashSet<_>>();
             let assignments = final_assignments.iter().cloned().collect::<HashMap<_, _>>();
@@ -3425,11 +3779,19 @@ impl Evaluator<'_> {
             if declares_functions {
                 install_scope_functions(&mut scope, &same_scope_functions);
             }
-            scope_environment = scope;
-            &scope_environment
-        };
+            Ok(Some(scope))
+        }
 
-        let outer_modules = Rc::clone(&self.modules);
+    }
+
+    /// Installs the modules a statement list declares, on top of `outer_modules`.
+    #[inline(never)]
+    fn install_statement_modules(
+        &mut self,
+        statements: &[Stmt],
+        environment: &Environment,
+        outer_modules: &Rc<ModuleTable>,
+    ) {
         // A scope that declares no modules inherits the caller's table
         // unchanged, so skip snapshotting the environment and rebuilding it.
         if statements
@@ -3457,123 +3819,167 @@ impl Evaluator<'_> {
                     })
                     .collect::<HashMap<_, _>>(),
             );
-            install_scope_modules(&mut self.modules, &outer_modules, &same_scope_modules);
+            install_scope_modules(&mut self.modules, outer_modules, &same_scope_modules);
         }
+    }
 
-        let result = (|| {
-            let mut shapes = Vec::new();
-            for statement in statements {
-                self.consume_work(1)?;
-                let statement_start = shapes.len();
-                match statement {
-                    Stmt::Block(body) => {
-                        shapes.extend(self.statements(body, environment, false)?);
-                    }
-                    Stmt::Disabled => {}
-                    // `%`: still evaluated, so its errors and side effects are
-                    // real, but its geometry is diverted away from `shapes`
-                    // and therefore out of the CSG result and every export.
-                    Stmt::Background(inner) => {
-                        let inner = std::slice::from_ref(inner.as_ref());
-                        let produced = self.statements(inner, environment, false)?;
-                        self.background_shapes.extend(produced);
-                    }
-                    // `!`: the marked subtree becomes the entire model. It is
-                    // captured here rather than appended, which is what drops
-                    // the transformations that wrap it.
-                    Stmt::Root(inner) => {
-                        let inner = std::slice::from_ref(inner.as_ref());
-                        // The claim is staked *before* descending, so an
-                        // enclosing `!` beats a nested one — OpenSCAD picks
-                        // the outermost root tag, not the first one reached.
-                        // A `!` inside an already-claimed subtree is then just
-                        // an ordinary node within it.
-                        if self.root_claimed {
-                            shapes.extend(self.statements(inner, environment, false)?);
-                        } else {
-                            self.root_claimed = true;
-                            let produced = self.statements(inner, environment, false)?;
-                            self.root_shapes = Some(produced);
-                        }
-                    }
-                    Stmt::Assign { .. } | Stmt::Function { .. } | Stmt::Module { .. } => {}
-                    // `resolve_file_directives` splices away every top-level
-                    // directive before evaluation, so reaching one here means
-                    // it was nested inside a block, module or loop — where
-                    // §17 does not allow it.
-                    Stmt::FileDirective { path, line, mode } => {
-                        let keyword = match mode {
-                            FileDirectiveMode::Include => "include",
-                            FileDirectiveMode::Use => "use",
-                        };
-                        self.diagnostics.push(format!(
-                            "WARNING: line {line}: {keyword} <{path}> must appear at the top \
-                             level; ignoring it."
-                        ));
-                    }
-                    Stmt::For {
-                        bindings,
-                        body,
-                        intersection,
-                    } => {
-                        let mut iteration_count = 0;
-                        let iteration_shapes = self.for_iteration_shapes(
-                            bindings,
-                            0,
-                            body,
-                            environment,
-                            &mut iteration_count,
-                        )?;
-                        if *intersection && !iteration_shapes.is_empty() {
-                            shapes.push(Shape::Intersection(iteration_shapes));
-                        } else {
-                            shapes.extend(iteration_shapes);
-                        }
-                    }
-                    Stmt::Let { bindings, body } => {
-                        let mut local = environment.clone();
-                        for (name, expression) in bindings {
-                            let value = evaluate_expression(expression, &local)?;
-                            self.note_value(&value);
-                            local.insert(name.clone(), value);
-                        }
-                        shapes.extend(self.statements(body, &local, false)?);
-                    }
-                    Stmt::If {
-                        condition,
-                        then_body,
-                        else_body,
-                    } => {
-                        let condition = evaluate_expression(condition, environment)?;
-                        self.note_value(&condition);
-                        let selected = if truthy(&condition) {
-                            then_body
-                        } else {
-                            else_body
-                        };
-                        shapes.extend(self.statements(selected, environment, false)?);
-                    }
-                    Stmt::Call {
-                        name,
-                        arguments,
-                        children,
-                    } => {
-                        if let Some(shape) = self.call(name, arguments, children, environment)? {
-                            shapes.push(shape);
-                        }
-                    }
+    /// Evaluates each statement of a list whose scope is already installed.
+    #[inline(never)]
+    fn statement_shapes(
+        &mut self,
+        statements: &[Stmt],
+        environment: &Environment,
+        group_top_level: bool,
+    ) -> Result<Vec<Shape>, EngineError> {
+        let mut shapes = Vec::new();
+        for (statement_index, statement) in statements.iter().enumerate() {
+            self.consume_work(1)?;
+            let statement_start = shapes.len();
+            if group_top_level {
+                self.current_top_level = statement_index;
+            }
+            match statement {
+                Stmt::Block(body) => {
+                    shapes.extend(self.statements(body, environment, false)?);
                 }
-                if group_top_level && shapes.len() > statement_start + 1 {
-                    let statement_shapes = shapes.drain(statement_start..).collect();
-                    if let Some(shape) = Shape::union(statement_shapes) {
+                Stmt::If {
+                    condition,
+                    then_body,
+                    else_body,
+                } => {
+                    let selected = if self.condition_holds(condition, environment)? {
+                        then_body
+                    } else {
+                        else_body
+                    };
+                    shapes.extend(self.statements(selected, environment, false)?);
+                }
+                Stmt::Call {
+                    name,
+                    arguments,
+                    children,
+                } => {
+                    if let Some(shape) = self.call(name, arguments, children, environment)? {
                         shapes.push(shape);
                     }
                 }
+                other => self.other_statement(other, environment, &mut shapes)?,
             }
-            Ok(shapes)
-        })();
-        self.modules = outer_modules;
-        result
+            if group_top_level {
+                self.group_statement_output(&mut shapes, statement_start, statement_index);
+            }
+        }
+        Ok(shapes)
+    }
+
+    /// `if`'s condition, evaluated out of line: a `Value` temporary in
+    /// [`Self::statement_shapes`] would sit on the stack at every recursion level.
+    #[inline(never)]
+    fn condition_holds(&mut self, condition: &Expr, environment: &Environment) -> Result<bool, EngineError> {
+        let condition = evaluate_expression(condition, environment)?;
+        self.note_value(&condition);
+        Ok(truthy(&condition))
+    }
+
+    /// Unions one top-level statement's output into a single object and
+    /// records which statement produced it.
+    #[inline(never)]
+    fn group_statement_output(&mut self, shapes: &mut Vec<Shape>, statement_start: usize, statement_index: usize) {
+        if shapes.len() > statement_start + 1 {
+            let statement_shapes = shapes.drain(statement_start..).collect();
+            if let Some(shape) = Shape::union(statement_shapes) {
+                shapes.push(shape);
+            }
+        }
+        let produced = shapes.len() - statement_start;
+        self.top_level_origins
+            .extend(std::iter::repeat(statement_index).take(produced));
+    }
+
+    /// Every statement kind but the three on the recursion path (block, `if`,
+    /// module call), out of line for the same frame-size reason.
+    #[inline(never)]
+    fn other_statement(
+        &mut self,
+        statement: &Stmt,
+        environment: &Environment,
+        shapes: &mut Vec<Shape>,
+    ) -> Result<(), EngineError> {
+        match statement {
+            Stmt::Disabled => {}
+            // `%`: still evaluated, so its errors and side effects are
+            // real, but its geometry is diverted away from `shapes`
+            // and therefore out of the CSG result and every export.
+            Stmt::Background(inner) => {
+                let inner = std::slice::from_ref(inner.as_ref());
+                let produced = self.statements(inner, environment, false)?;
+                self.background_shapes.extend(produced);
+            }
+            // `!`: the marked subtree becomes the entire model. It is
+            // captured here rather than appended, which is what drops
+            // the transformations that wrap it.
+            Stmt::Root(inner) => {
+                let inner = std::slice::from_ref(inner.as_ref());
+                // The claim is staked *before* descending, so an
+                // enclosing `!` beats a nested one — OpenSCAD picks
+                // the outermost root tag, not the first one reached.
+                // A `!` inside an already-claimed subtree is then just
+                // an ordinary node within it.
+                if self.root_claimed {
+                    shapes.extend(self.statements(inner, environment, false)?);
+                } else {
+                    self.root_claimed = true;
+                    self.root_origin = Some(self.current_top_level);
+                    let produced = self.statements(inner, environment, false)?;
+                    self.root_shapes = Some(produced);
+                }
+            }
+            Stmt::Assign { .. } | Stmt::Function { .. } | Stmt::Module { .. } => {}
+            // `resolve_file_directives` splices away every top-level
+            // directive before evaluation, so reaching one here means
+            // it was nested inside a block, module or loop — where
+            // §17 does not allow it.
+            Stmt::FileDirective { path, line, mode } => {
+                let keyword = match mode {
+                    FileDirectiveMode::Include => "include",
+                    FileDirectiveMode::Use => "use",
+                };
+                self.diagnostics.push(format!(
+                    "WARNING: line {line}: {keyword} <{path}> must appear at the top \
+                     level; ignoring it."
+                ));
+            }
+            Stmt::For {
+                bindings,
+                body,
+                intersection,
+            } => {
+                let mut iteration_count = 0;
+                let iteration_shapes = self.for_iteration_shapes(
+                    bindings,
+                    0,
+                    body,
+                    environment,
+                    &mut iteration_count,
+                )?;
+                if *intersection && !iteration_shapes.is_empty() {
+                    shapes.push(Shape::Intersection(iteration_shapes));
+                } else {
+                    shapes.extend(iteration_shapes);
+                }
+            }
+            Stmt::Let { bindings, body } => {
+                let mut local = environment.clone();
+                for (name, expression) in bindings {
+                    let value = evaluate_expression(expression, &local)?;
+                    self.note_value(&value);
+                    local.insert(name.clone(), value);
+                }
+                shapes.extend(self.statements(body, &local, false)?);
+            }
+            Stmt::Block(_) | Stmt::If { .. } | Stmt::Call { .. } => unreachable!("handled by statement_shapes"),
+        }
+        Ok(())
     }
 
     fn for_iteration_shapes(
@@ -3636,14 +4042,23 @@ impl Evaluator<'_> {
         if self.stack_origin == 0 {
             self.stack_origin = here;
         }
-        if self.module_depth < MAX_MODULE_RECURSION_DEPTH
-            && self.stack_origin.abs_diff(here) <= MAX_EVALUATION_STACK_BYTES
-        {
+        // Each level is charged at least `MIN_STACK_BYTES_PER_LEVEL`, so the
+        // limit does not move with how small the optimiser happens to make a
+        // frame in a given build: the same model is accepted or refused on
+        // every machine, and the measured figure still wins when it is larger.
+        let used = self
+            .stack_origin
+            .abs_diff(here)
+            .max(self.module_depth.saturating_mul(MIN_STACK_BYTES_PER_LEVEL));
+        if self.module_depth < MAX_MODULE_RECURSION_DEPTH && used <= MAX_EVALUATION_STACK_BYTES {
             return Ok(());
         }
         Err(EngineError::new(format!(
-            "Module recursion depth exceeded the limit of {MAX_MODULE_RECURSION_DEPTH} levels \
-             or {MAX_EVALUATION_STACK_BYTES} bytes of evaluation stack."
+            "Module recursion depth exceeded the limit at {} levels (at most \
+             {MAX_MODULE_RECURSION_DEPTH} levels, about {} for a simple recursive module, \
+             or {MAX_EVALUATION_STACK_BYTES} bytes of evaluation stack).",
+            self.module_depth,
+            MAX_EVALUATION_STACK_BYTES / MIN_STACK_BYTES_PER_LEVEL
         )))
     }
 
@@ -3688,7 +4103,7 @@ impl Evaluator<'_> {
                 }
                 Ok(values)
             }
-            Value::Vector(values) => Ok(values),
+            Value::Vector(values) => Ok(Value::unshare(values)),
             // A string iterates over its characters, counted by codepoint like
             // every other string operation here.
             Value::String(text) => Ok(text
@@ -3743,7 +4158,103 @@ impl Evaluator<'_> {
         } else {
             environment
         };
+        if !self.modules.contains_key(name) {
+            self.check_builtin_arguments(name, arguments, children);
+        }
 
+        match name {
+            // A user module shadows a built-in of the same name, as in
+            // OpenSCAD. Checking built-ins first would silently ignore the
+            // author's definition and draw something else.
+            module_name if self.modules.contains_key(module_name) => {
+                self.check_recursion_budget()?;
+                let module = self.modules.get(module_name).cloned().unwrap();
+                let mut local = Environment::layered_on(&module.environment);
+                for (name, value) in environment.special_variables() {
+                    local.insert(name.clone(), value.clone());
+                }
+                local.insert("$children".into(), Value::Number(children.len() as f64));
+
+                let mut bound = vec![None; module.parameters.len()];
+                let mut positional_index = 0;
+                for argument in arguments {
+                    match argument.name.as_deref() {
+                        None => {
+                            let value = evaluate_expression(&argument.value, environment)?;
+                            if let Some(slot) = bound.get_mut(positional_index) {
+                                *slot = Some(value);
+                            } else {
+                                self.diagnostics.push(format!(
+                                    "WARNING: Module {module_name}() received too many positional arguments."
+                                ));
+                            }
+                            positional_index += 1;
+                        }
+                        Some(name) if name.starts_with('$') => {}
+                        Some(name) => {
+                            let value = evaluate_expression(&argument.value, environment)?;
+                            if let Some(index) = module
+                                .parameters
+                                .iter()
+                                .position(|(parameter, _)| parameter == name)
+                            {
+                                bound[index] = Some(value);
+                            } else {
+                                self.diagnostics.push(format!(
+                                    "WARNING: Module {module_name}() has no parameter named {name}; ignoring it."
+                                ));
+                            }
+                        }
+                    }
+                }
+                for ((parameter, default), value) in module.parameters.iter().zip(bound) {
+                    let value = match value {
+                        Some(value) => value,
+                        None => match default {
+                            Some(default) => evaluate_expression(default, environment)?,
+                            None => Value::Undefined,
+                        },
+                    };
+                    self.note_value(&value);
+                    local.insert(parameter.clone(), value);
+                }
+
+                self.module_depth += 1;
+                self.child_contexts.push(ChildContext {
+                    statements: children.to_vec(),
+                    environment: environment.clone(),
+                });
+                let caller_modules = Rc::clone(&self.modules);
+                install_scope_modules(
+                    &mut self.modules,
+                    &module.outer_modules,
+                    &module.same_scope_modules,
+                );
+                let result = self.statements(&module.body, &local, false);
+                self.modules = caller_modules;
+                self.child_contexts.pop();
+                self.module_depth -= 1;
+                result.map(Shape::union)
+            }
+            _ => self.call_builtin(name, arguments, children, environment),
+        }
+    }
+
+    /// Every built-in module, dispatched from [`Self::call`].
+    ///
+    /// Kept out of `call` and never inlined on purpose: `call` is on the
+    /// stack once per level of user-module recursion, and the built-in arms
+    /// (`text`, the extrusions, `rotate`...) need tens of kilobytes of frame
+    /// between them. Inlined, every recursion level paid for all of them and
+    /// the evaluation-stack guard tripped at 17 levels of a trivial module.
+    #[inline(never)]
+    fn call_builtin(
+        &mut self,
+        name: &str,
+        arguments: &[Argument],
+        children: &[Stmt],
+        environment: &Environment,
+    ) -> Result<Option<Shape>, EngineError> {
         match name {
             "square" => {
                 let size = argument_vector(arguments, "size", 0, environment, vec![1.0]);
@@ -3982,6 +4493,52 @@ impl Evaluator<'_> {
                 }
                 Ok(Some(result))
             }
+            // ReOpenSCAD extension, not an OpenSCAD built-in: the envelope a
+            // 3D child sweeps when translated along a polyline, i.e. the union
+            // over segments of minkowski(child, segment). OpenSCAD itself
+            // warns "Ignoring unknown module 'sweep_path'" and draws nothing,
+            // and a user module of the same name shadows this one.
+            "sweep_path" => {
+                let points = argument_points3(arguments, "points", 0, environment);
+                let Some(points) = self.geometry_argument("sweep_path", points) else {
+                    return Ok(None);
+                };
+                if points.is_empty() || points.len() > MAX_SWEEP_POINTS {
+                    self.ignore_geometry(
+                        "sweep_path",
+                        &format!("points must hold 1 to {MAX_SWEEP_POINTS} points"),
+                    );
+                    return Ok(None);
+                }
+                let shapes = self.child_shapes(children, environment)?;
+                let shapes = self.keep_same_dimension(shapes);
+                let Some(child) = Shape::union(shapes) else {
+                    return Ok(None);
+                };
+                if child.dimension() == ShapeDimension::Planar {
+                    self.ignore_geometry("sweep_path", "children must be 3D");
+                    return Ok(None);
+                }
+                let child_bounds = child.bounds();
+                let mut bounds = child_bounds;
+                for point in &points {
+                    bounds = bounds.union(Bounds {
+                        min: child_bounds.min.add(*point),
+                        max: child_bounds.max.add(*point),
+                    });
+                }
+                if !self.exact {
+                    self.diagnostics.push(
+                        "WARNING: sweep_path() is approximated by sampled copies in the sampled kernel."
+                            .to_string(),
+                    );
+                }
+                Ok(Some(Shape::Sweep {
+                    shape: Box::new(child),
+                    points,
+                    bounds,
+                }))
+            }
             // `fill()` closes every hole in the union of its children. Like the
             // 2D branch of `hull()` it is evaluated here rather than carried as
             // a node: the result is a set of closed contours, which is exactly
@@ -4094,6 +4651,7 @@ impl Evaluator<'_> {
                 }
                 Ok(Some(Shape::Polyhedron { points, faces }))
             }
+            "import" => self.import_asset(arguments, environment),
             "resize" => {
                 let newsize =
                     argument_vector(arguments, "newsize", 0, environment, vec![0.0, 0.0, 0.0]);
@@ -4117,7 +4675,7 @@ impl Evaluator<'_> {
                     Some(expression) => match evaluate_expression(expression, environment)? {
                         Value::Vector(values) => {
                             let mut flags = [false; 3];
-                            for (flag, value) in flags.iter_mut().zip(&values) {
+                            for (flag, value) in flags.iter_mut().zip(values.iter()) {
                                 *flag = truthy(value);
                             }
                             flags
@@ -4260,7 +4818,7 @@ impl Evaluator<'_> {
                     // ignored, as in OpenSCAD.
                     (Value::Vector(components), _) => {
                         let mut degrees = [0.0f64; 3];
-                        for (slot, component) in degrees.iter_mut().zip(components) {
+                        for (slot, component) in degrees.iter_mut().zip(components.iter()) {
                             let Some(value) = numeric_value(component) else {
                                 self.ignore_geometry(
                                     "rotate",
@@ -4292,19 +4850,38 @@ impl Evaluator<'_> {
                 };
                 let vector = match values.as_slice() {
                     [one] => Vec3::new(*one, *one, *one),
+                    // A 2-vector leaves z alone, as in OpenSCAD — the usual
+                    // way to scale a profile before extruding it.
+                    [x, y] => Vec3::new(*x, *y, 1.0),
                     [x, y, z, ..] => Vec3::new(*x, *y, *z),
                     _ => {
                         self.ignore_geometry("scale", "value must be a number or 3-vector");
                         return Ok(None);
                     }
                 };
-                if !vec3_is_finite(vector)
-                    || vector.x == 0.0
-                    || vector.y == 0.0
-                    || vector.z == 0.0
-                {
+                if !vec3_is_finite(vector) || vector.x == 0.0 || vector.y == 0.0 {
                     self.ignore_geometry("scale", "components must be finite and non-zero");
                     return Ok(None);
+                }
+                if vector.z == 0.0 {
+                    // OpenSCAD drops z for 2D children, so `scale([2, 2, 0])`
+                    // on a profile is a plain 2D scale. On a solid it would
+                    // flatten it to nothing, which is refused out loud.
+                    let shapes = self.child_shapes(children, environment)?;
+                    if shapes
+                        .iter()
+                        .any(|shape| shape.dimension() == ShapeDimension::Solid)
+                    {
+                        self.ignore_geometry(
+                            "scale",
+                            "a zero z component flattens 3D children to nothing",
+                        );
+                        return Ok(None);
+                    }
+                    return Ok(Shape::union(shapes).map(|shape| Shape::Transform {
+                        shape: Box::new(shape),
+                        transform: Transform::scale(Vec3::new(vector.x, vector.y, 1.0)),
+                    }));
                 }
                 self.transform_children(children, environment, Transform::scale(vector))
             }
@@ -4417,6 +4994,31 @@ impl Evaluator<'_> {
                 else {
                     return Ok(None);
                 };
+                // Development-snapshot parameters this engine does not model.
+                if named_argument(arguments, "segments").is_some() {
+                    self.warn_once(
+                        "WARNING: linear_extrude() segments is not supported and is ignored.",
+                    );
+                }
+                if let Some(expression) = named_argument(arguments, "v") {
+                    let value = evaluate_expression(expression, environment)?;
+                    let upright = number_vector(match &value {
+                        Value::Vector(values) => values,
+                        _ => &[],
+                    })
+                    .is_some_and(|components| {
+                        components.len() >= 3
+                            && components[0] == 0.0
+                            && components[1] == 0.0
+                            && components[2] > 0.0
+                    });
+                    if !upright {
+                        self.warn_once(
+                            "WARNING: linear_extrude() v (extrusion direction) is not supported; \
+                             extruding along +Z.",
+                        );
+                    }
+                }
                 let shapes = self.child_shapes(children, environment)?;
                 let shapes = self.keep_planar_children(shapes);
                 if !self.exact && (twist != 0.0 || scale != [1.0, 1.0]) {
@@ -4489,27 +5091,121 @@ impl Evaluator<'_> {
                     self.ignore_geometry("text", "spacing must be finite and positive");
                     return Ok(None);
                 }
-                let halign = argument_text(arguments, "halign", usize::MAX, environment)?
+                let mut halign = argument_text(arguments, "halign", usize::MAX, environment)?
                     .unwrap_or_else(|| "left".to_string());
-                let valign = argument_text(arguments, "valign", usize::MAX, environment)?
+                if !matches!(halign.as_str(), "left" | "center" | "right") {
+                    self.warn_once(&format!(
+                        "WARNING: text(): unknown halign \"{halign}\"; using \"left\" \
+                         (expected left, center or right)."
+                    ));
+                    halign = "left".into();
+                }
+                let mut valign = argument_text(arguments, "valign", usize::MAX, environment)?
                     .unwrap_or_else(|| "baseline".to_string());
-                // `font`, `direction`, `language` and `script` select a face and
-                // a shaper this engine does not have. Accepted so a source
-                // written for OpenSCAD still parses, and reported once, because
-                // silently drawing a different face than the one asked for is
-                // the kind of difference that only shows up on the printed part.
-                for named in ["font", "direction", "language", "script"] {
-                    if let Some(expression) = argument(arguments, named, usize::MAX) {
+                if !matches!(valign.as_str(), "baseline" | "top" | "center" | "bottom") {
+                    self.warn_once(&format!(
+                        "WARNING: text(): unknown valign \"{valign}\"; using \"baseline\" \
+                         (expected baseline, top, center or bottom)."
+                    ));
+                    valign = "baseline".into();
+                }
+                let mut direction =
+                    argument_text(arguments, "direction", usize::MAX, environment)?
+                        .unwrap_or_else(|| "ltr".to_string())
+                        .to_ascii_lowercase();
+                if !matches!(direction.as_str(), "ltr" | "rtl" | "ttb" | "btt") {
+                    self.warn_once(&format!(
+                        "WARNING: text(): unknown direction \"{direction}\"; using \"ltr\" \
+                         (expected ltr, rtl, ttb or btt)."
+                    ));
+                    direction = "ltr".into();
+                }
+                // Positional order is OpenSCAD's: text, size, font.
+                let font_name = match argument(arguments, "font", 2) {
+                    Some(expression) => match evaluate_expression(expression, environment)? {
+                        Value::String(value) => value,
+                        Value::Undefined => String::new(),
+                        other => {
+                            self.warn_once(&format!(
+                                "WARNING: text(): font must be a string, got {}; using \"{}\".",
+                                value_type_name(&other),
+                                typeface::DEFAULT_FAMILY
+                            ));
+                            String::new()
+                        }
+                    },
+                    None => String::new(),
+                };
+                let resolution = typeface::resolve(&font_name);
+                if let Some(warning) = &resolution.warning {
+                    for line in warning.lines() {
+                        self.warn_once(line);
+                    }
+                }
+                // `em` is the font's em size in mm; `size` is OpenSCAD's
+                // "roughly the cap height" unit, an em of `size / 0.72`.
+                let em = match named_argument(arguments, "em") {
+                    Some(expression) => {
                         let value = evaluate_expression(expression, environment)?;
-                        self.note_value(&value);
-                        self.diagnostics.push(format!(
-                            "WARNING: text() ignores {named}; this engine has one built-in \
-                             single-stroke font and cannot load others."
+                        match numeric_value(&value) {
+                            Some(em) if em.is_finite() && em > 0.0 => Some(em),
+                            _ => {
+                                self.ignore_geometry("text", "em must be finite and positive");
+                                return Ok(None);
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                // `language` and `script` steer a shaper. This engine places
+                // glyphs one by one with pair kerning, which is what a shaper
+                // does for Latin text; anything else is said out loud.
+                if let Some(script) = argument_text(arguments, "script", usize::MAX, environment)?
+                {
+                    if !script.eq_ignore_ascii_case("latin") && !script.eq_ignore_ascii_case("latn")
+                    {
+                        self.warn_once(&format!(
+                            "WARNING: text(): script \"{script}\" is not shaped; glyphs are \
+                             placed one by one as for Latin text."
                         ));
                     }
                 }
-                let fragments = fragment_count(size * 0.35, environment);
-                Ok(self.stroke_text(&string, size, spacing, &halign, &valign, fragments))
+                if let Some(expression) = named_argument(arguments, "language") {
+                    let value = evaluate_expression(expression, environment)?;
+                    self.note_value(&value);
+                }
+                match resolution.font {
+                    Some(font) => {
+                        let layout = TextLayout {
+                            em: em.unwrap_or(size / 0.72),
+                            spacing,
+                            halign: &halign,
+                            valign: &valign,
+                            direction: &direction,
+                        };
+                        let fragments = fragment_count(size, environment);
+                        Ok(self.outline_text(&string, font, &layout, fragments))
+                    }
+                    None => {
+                        let mut string = string;
+                        match direction.as_str() {
+                            "rtl" => string = string.chars().rev().collect(),
+                            "ttb" | "btt" => self.warn_once(
+                                "WARNING: text(): the ReOpenSCAD Stroke face only sets \
+                                 horizontal text; direction ignored.",
+                            ),
+                            _ => {}
+                        }
+                        if em.is_some() {
+                            self.warn_once(
+                                "WARNING: text(): em is ignored by the ReOpenSCAD Stroke face; \
+                                 use size.",
+                            );
+                        }
+                        let fragments = fragment_count(size * 0.35, environment);
+                        Ok(self.stroke_text(&string, size, spacing, &halign, &valign, fragments))
+                    }
+                }
             }
             "rotate_extrude" => {
                 // OpenSCAD's own default, and the reason `angle` is not simply
@@ -4529,9 +5225,23 @@ impl Evaluator<'_> {
                     let value = evaluate_expression(convexity, environment)?;
                     self.note_value(&value);
                 }
+                // `start` (newer OpenSCAD): where the sweep begins, which for a
+                // partial sweep is just a turn of the result about Z.
+                let start = argument_number_optional(arguments, "start", usize::MAX, environment);
+                let Some(start) = self.geometry_argument("rotate_extrude", start) else {
+                    return Ok(None);
+                };
+                let start = match start {
+                    Some(value) if !value.is_finite() => {
+                        self.ignore_geometry("rotate_extrude", "start must be finite");
+                        return Ok(None);
+                    }
+                    Some(value) if value != 0.0 => Some(value),
+                    _ => None,
+                };
                 let shapes = self.child_shapes(children, environment)?;
                 let shapes = self.keep_planar_children(shapes);
-                Ok(Shape::union(shapes).and_then(|shape| {
+                let swept = Shape::union(shapes).and_then(|shape| {
                     // A profile crossing the axis would sweep through itself.
                     // OpenSCAD refuses outright; so does this, because the
                     // alternative is a self-intersecting solid that every
@@ -4562,7 +5272,14 @@ impl Evaluator<'_> {
                         angle,
                         fragments,
                     })
-                }))
+                });
+                Ok(match (swept, start) {
+                    (Some(shape), Some(start)) => Some(Shape::Transform {
+                        shape: Box::new(shape),
+                        transform: Transform::rotation_xyz(Vec3::new(0.0, 0.0, start)),
+                    }),
+                    (swept, _) => swept,
+                })
             }
             "color" => {
                 // `color()` never changes geometry, so an unusable argument is
@@ -4648,76 +5365,6 @@ impl Evaluator<'_> {
                 Ok(Shape::union(self.child_shapes(children, environment)?))
             }
             "children" => self.selected_children(arguments, environment),
-            module_name if self.modules.contains_key(module_name) => {
-                self.check_recursion_budget()?;
-                let module = self.modules.get(module_name).cloned().unwrap();
-                let mut local = Environment::layered_on(&module.environment);
-                for (name, value) in environment.special_variables() {
-                    local.insert(name.clone(), value.clone());
-                }
-                local.insert("$children".into(), Value::Number(children.len() as f64));
-
-                let mut bound = vec![None; module.parameters.len()];
-                let mut positional_index = 0;
-                for argument in arguments {
-                    match argument.name.as_deref() {
-                        None => {
-                            let value = evaluate_expression(&argument.value, environment)?;
-                            if let Some(slot) = bound.get_mut(positional_index) {
-                                *slot = Some(value);
-                            } else {
-                                self.diagnostics.push(format!(
-                                    "WARNING: Module {module_name}() received too many positional arguments."
-                                ));
-                            }
-                            positional_index += 1;
-                        }
-                        Some(name) if name.starts_with('$') => {}
-                        Some(name) => {
-                            let value = evaluate_expression(&argument.value, environment)?;
-                            if let Some(index) = module
-                                .parameters
-                                .iter()
-                                .position(|(parameter, _)| parameter == name)
-                            {
-                                bound[index] = Some(value);
-                            } else {
-                                self.diagnostics.push(format!(
-                                    "WARNING: Module {module_name}() has no parameter named {name}; ignoring it."
-                                ));
-                            }
-                        }
-                    }
-                }
-                for ((parameter, default), value) in module.parameters.iter().zip(bound) {
-                    let value = match value {
-                        Some(value) => value,
-                        None => match default {
-                            Some(default) => evaluate_expression(default, environment)?,
-                            None => Value::Undefined,
-                        },
-                    };
-                    self.note_value(&value);
-                    local.insert(parameter.clone(), value);
-                }
-
-                self.module_depth += 1;
-                self.child_contexts.push(ChildContext {
-                    statements: children.to_vec(),
-                    environment: environment.clone(),
-                });
-                let caller_modules = Rc::clone(&self.modules);
-                install_scope_modules(
-                    &mut self.modules,
-                    &module.outer_modules,
-                    &module.same_scope_modules,
-                );
-                let result = self.statements(&module.body, &local, false);
-                self.modules = caller_modules;
-                self.child_contexts.pop();
-                self.module_depth -= 1;
-                result.map(Shape::union)
-            }
             // A module this engine does not implement — a typo, an `import()`,
             // or anything else — contributes no geometry and is otherwise
             // ignored, exactly as OpenSCAD does: probing the binary with
@@ -4787,7 +5434,7 @@ impl Evaluator<'_> {
     fn child_indices(&mut self, selector: Value) -> Result<Vec<usize>, EngineError> {
         let values = match selector {
             Value::Number(value) => vec![Value::Number(value)],
-            Value::Vector(values) => values,
+            Value::Vector(values) => Value::unshare(values),
             Value::Range { start, step, end } => {
                 Self::iterable_values(Value::Range { start, step, end })?
             }
@@ -4850,6 +5497,63 @@ impl Evaluator<'_> {
         kept
     }
 
+    /// Reports arguments a built-in module will never read: a misspelt name
+    /// (`centre = true`) or a surplus positional value. OpenSCAD warns about
+    /// both; staying quiet would leave the author with a part that ignores
+    /// what they asked for and no hint why. `$`-variables are always allowed.
+    fn check_builtin_arguments(&mut self, module: &str, arguments: &[Argument], children: &[Stmt]) {
+        let Some((positional, named_only)) = builtin_module_parameters(module) else {
+            return;
+        };
+        let primitive = matches!(
+            module,
+            "cube"
+                | "sphere"
+                | "cylinder"
+                | "polyhedron"
+                | "square"
+                | "circle"
+                | "polygon"
+                | "text"
+                | "import"
+        );
+        if primitive && children.iter().any(|child| !matches!(child, Stmt::Disabled)) {
+            self.warn_once(&format!(
+                "WARNING: {module}() does not take children; ignoring them."
+            ));
+        }
+        let unnamed = arguments
+            .iter()
+            .filter(|argument| argument.name.is_none())
+            .count();
+        if unnamed > positional.len() {
+            self.warn_once(&format!(
+                "WARNING: {module}() takes {} positional argument{}; ignoring {} extra.",
+                positional.len(),
+                if positional.len() == 1 { "" } else { "s" },
+                unnamed - positional.len()
+            ));
+        }
+        for argument in arguments {
+            let Some(name) = argument.name.as_deref() else {
+                continue;
+            };
+            if name.starts_with('$') || positional.contains(&name) || named_only.contains(&name)
+            {
+                continue;
+            }
+            let known: Vec<&str> = positional.iter().chain(named_only).copied().collect();
+            self.warn_once(&format!(
+                "WARNING: {module}() has no parameter named '{name}'; ignoring it.{}",
+                if known.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Parameters: {}.", known.join(", "))
+                }
+            ));
+        }
+    }
+
     /// Pushes a diagnostic unless it is already there.
     ///
     /// A warning inside a loop body would otherwise repeat once per iteration
@@ -4858,6 +5562,203 @@ impl Evaluator<'_> {
         if !self.diagnostics.iter().any(|existing| existing == message) {
             self.diagnostics.push(message.to_string());
         }
+    }
+
+    /// Sets a string in one of the bundled outline faces.
+    ///
+    /// Glyphs are placed one by one along the pen with the face's pair
+    /// kerning; characters the chosen face lacks are taken from the default
+    /// face when it has them, and named in a warning when nothing does.
+    /// Horizontal alignment uses the advance width (so trailing spaces count,
+    /// as they do in OpenSCAD); vertical alignment uses the inked extent.
+    fn outline_text(
+        &mut self,
+        string: &str,
+        font: usize,
+        layout: &TextLayout<'_>,
+        fragments: usize,
+    ) -> Option<Shape> {
+        let primary = typeface::face(font)?;
+        let fallback = typeface::face(0);
+        let mut characters: Vec<char> = string.chars().collect();
+        if characters.len() > MAX_TEXT_CHARACTERS {
+            self.warn_once(&format!(
+                "WARNING: text(): string truncated to its first {MAX_TEXT_CHARACTERS} characters."
+            ));
+            characters.truncate(MAX_TEXT_CHARACTERS);
+        }
+        if matches!(layout.direction, "rtl" | "btt") {
+            characters.reverse();
+        }
+        let vertical = matches!(layout.direction, "ttb" | "btt");
+        let mut missing: Vec<char> = Vec::new();
+        let mut substituted = false;
+        // (face, glyph, origin x, origin y) in mm.
+        let mut placed: Vec<(&truetype::Face, u16, f64, f64)> = Vec::new();
+        let mut pen = 0.0f64;
+        let mut previous: Option<(*const truetype::Face, u16)> = None;
+        for character in characters {
+            if character == '\n' || character == '\r' {
+                continue;
+            }
+            let (face, glyph) = match primary.glyph_index(character) {
+                Some(glyph) => (primary, glyph),
+                None => match fallback.and_then(|face| Some((face, face.glyph_index(character)?))) {
+                    Some(found) => {
+                        substituted = true;
+                        found
+                    }
+                    None => {
+                        if !missing.contains(&character) {
+                            missing.push(character);
+                        }
+                        continue;
+                    }
+                },
+            };
+            let scale = layout.em / face.units_per_em;
+            if vertical {
+                let line = (face.ascender - face.descender + face.line_gap) * scale;
+                let x = -face.advance(glyph) * scale / 2.0;
+                placed.push((face, glyph, x, pen - face.ascender * scale));
+                pen -= line * layout.spacing;
+            } else {
+                if let Some((previous_face, previous_glyph)) = previous {
+                    if std::ptr::eq(previous_face, face) {
+                        pen += face.kerning(previous_glyph, glyph) * scale * layout.spacing;
+                    }
+                }
+                placed.push((face, glyph, pen, 0.0));
+                pen += face.advance(glyph) * scale * layout.spacing;
+            }
+            previous = Some((face as *const _, glyph));
+        }
+        if substituted {
+            self.warn_once(&format!(
+                "WARNING: text(): some characters are missing from \"{}\" and were taken from \
+                 \"{}\".",
+                typeface::FONTS[font].family,
+                typeface::DEFAULT_FAMILY
+            ));
+        }
+        if !missing.is_empty() {
+            let list: Vec<String> = missing.iter().map(|value| format!("{value:?}")).collect();
+            self.diagnostics.push(format!(
+                "WARNING: text() has no glyph for {} and left {} out; no bundled font covers {}.",
+                list.join(", "),
+                if missing.len() == 1 { "it" } else { "them" },
+                if missing.len() == 1 { "it" } else { "them" },
+            ));
+        }
+
+        // Flatten every glyph into filled regions, in mm, before alignment.
+        let mut regions: Vec<Vec<Vec<[f64; 2]>>> = Vec::new();
+        let mut ink: Option<([f64; 2], [f64; 2])> = None;
+        for (face, glyph, x, y) in &placed {
+            let scale = layout.em / face.units_per_em;
+            let contours: Vec<Vec<[f64; 2]>> = face
+                .outline(*glyph)
+                .iter()
+                .map(|contour| {
+                    typeface::flatten_contour(contour, fragments)
+                        .into_iter()
+                        .map(|point| [x + point[0] * scale, y + point[1] * scale])
+                        .collect()
+                })
+                .collect();
+            for region in typeface::nonzero_regions(contours) {
+                for point in &region[0] {
+                    let (low, high) = ink.get_or_insert((*point, *point));
+                    low[0] = low[0].min(point[0]);
+                    low[1] = low[1].min(point[1]);
+                    high[0] = high[0].max(point[0]);
+                    high[1] = high[1].max(point[1]);
+                }
+                regions.push(region);
+            }
+        }
+        let Some((low, high)) = ink else {
+            if missing.is_empty() && !string.trim().is_empty() {
+                self.ignore_geometry("text", "the string sets no visible glyph");
+            }
+            return None;
+        };
+        let shift_x = if vertical {
+            match layout.halign {
+                "center" => -(low[0] + high[0]) / 2.0,
+                "right" => -high[0],
+                _ => -low[0],
+            }
+        } else {
+            match layout.halign {
+                "center" => -pen / 2.0,
+                "right" => -pen,
+                _ => 0.0,
+            }
+        };
+        let shift_y = match layout.valign {
+            "top" => -high[1],
+            "center" => -(low[1] + high[1]) / 2.0,
+            "bottom" => -low[1],
+            _ => 0.0,
+        };
+        for region in &mut regions {
+            for contour in region.iter_mut() {
+                for point in contour.iter_mut() {
+                    point[0] += shift_x;
+                    point[1] += shift_y;
+                }
+            }
+        }
+
+        // Regions whose boxes touch nothing else can share one even-odd
+        // polygon; only the overlapping ones (connected script, a variable
+        // font's crossing strokes) need a real union.
+        let boxes: Vec<([f64; 2], [f64; 2])> = regions
+            .iter()
+            .map(|region| {
+                let mut low = [f64::INFINITY; 2];
+                let mut high = [f64::NEG_INFINITY; 2];
+                for point in &region[0] {
+                    low = [low[0].min(point[0]), low[1].min(point[1])];
+                    high = [high[0].max(point[0]), high[1].max(point[1])];
+                }
+                (low, high)
+            })
+            .collect();
+        let overlaps = |a: usize, b: usize| {
+            boxes[a].0[0] <= boxes[b].1[0]
+                && boxes[b].0[0] <= boxes[a].1[0]
+                && boxes[a].0[1] <= boxes[b].1[1]
+                && boxes[b].0[1] <= boxes[a].1[1]
+        };
+        let mut shared: Vec<Vec<[f64; 2]>> = Vec::new();
+        let mut pieces: Vec<Shape> = Vec::new();
+        let mut order: Vec<usize> = (0..regions.len()).collect();
+        order.sort_by(|a, b| boxes[*a].0[0].total_cmp(&boxes[*b].0[0]));
+        let mut isolated = vec![true; regions.len()];
+        for (position, &a) in order.iter().enumerate() {
+            for &b in &order[position + 1..] {
+                if boxes[b].0[0] > boxes[a].1[0] {
+                    break;
+                }
+                if overlaps(a, b) {
+                    isolated[a] = false;
+                    isolated[b] = false;
+                }
+            }
+        }
+        for (index, region) in regions.into_iter().enumerate() {
+            if isolated[index] {
+                shared.extend(region);
+            } else {
+                pieces.push(Shape::Polygon2d { contours: region });
+            }
+        }
+        if !shared.is_empty() {
+            pieces.push(Shape::Polygon2d { contours: shared });
+        }
+        Shape::union(pieces)
     }
 
     /// Lays a string out in the built-in font and returns it as one 2D shape.
@@ -5039,6 +5940,110 @@ impl Evaluator<'_> {
             self.hull_cache.insert(key, shape.clone());
         }
         Ok(shape)
+    }
+
+    /// `import(file, center)`: a mesh asset uploaded to the workspace.
+    ///
+    /// The file name resolves through [`crate::assets::try_lookup`] — exactly as
+    /// written, or without a leading `./` — never through the filesystem, so
+    /// a public server cannot be talked into reading its own disk. Only STL
+    /// assets exist. A name that resolves to nothing contributes no geometry
+    /// and warns in OpenSCAD's words (`Can't open import file 'x'.`), which
+    /// is also what the binary does with a missing file: the rest of the
+    /// model still renders.
+    ///
+    /// `center = true` moves the bounding box's centre to the origin.
+    /// `convexity` is a preview hint and the 2D-format parameters (`layer`,
+    /// `origin`, `scale`, `dpi`, `id`, ...) mean nothing to an STL in
+    /// OpenSCAD either, so they are accepted and ignored.
+    fn import_asset(
+        &mut self,
+        arguments: &[Argument],
+        environment: &Environment,
+    ) -> Result<Option<Shape>, EngineError> {
+        // `filename` is the pre-2015 spelling of `file`.
+        let parameter = if named_argument(arguments, "file").is_none()
+            && named_argument(arguments, "filename").is_some()
+        {
+            self.warn_once("WARNING: filename= is deprecated. Please use file=");
+            "filename"
+        } else {
+            "file"
+        };
+        let file = argument_text(arguments, parameter, 0, environment);
+        let Some(file) = self.geometry_argument("import", file) else {
+            return Ok(None);
+        };
+        let Some(file) = file else {
+            self.ignore_geometry("import", "no file name given");
+            return Ok(None);
+        };
+        if let Some(convexity) = argument(arguments, "convexity", 2) {
+            let value = evaluate_expression(convexity, environment)?;
+            self.note_value(&value);
+        }
+        let center = argument_bool(arguments, "center", usize::MAX, environment, false);
+        let Some(center) = self.geometry_argument("import", center) else {
+            return Ok(None);
+        };
+
+        let extension = std::path::Path::new(&file)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if extension != "stl" {
+            self.warn_once(&format!(
+                "WARNING: Unsupported file format while trying to import file '{file}'; \
+                 only STL workspace assets can be imported."
+            ));
+            return Ok(None);
+        }
+        // An asset that exists but cannot be read (storage failure, or
+        // replaced while this compile ran) fails the compile: dropping it
+        // would silently render a different model.
+        let mut asset = crate::assets::try_lookup(&file).map_err(EngineError::new)?;
+        if asset.is_none() {
+            if let Some(stripped) = file.strip_prefix("./") {
+                asset = crate::assets::try_lookup(stripped).map_err(EngineError::new)?;
+            }
+        }
+        let Some(asset) = asset else {
+            // Never there, or removed, stays OpenSCAD's warning. An expired
+            // upload fails the compile: the design once showed that mesh, and
+            // quietly rendering without it would be a different model.
+            let stripped = file.strip_prefix("./").unwrap_or(&file);
+            if let Some(expired_at) = crate::assets::expired_at(stripped) {
+                return Err(EngineError::new(crate::assets::expired_import_message(&file, expired_at)));
+            }
+            self.warn_once(&format!("WARNING: Can't open import file '{file}'."));
+            return Ok(None);
+        };
+        let Some(bounds) = mesh_bounds(&asset.mesh) else {
+            self.ignore_geometry("import", &format!("'{file}' contains no triangles"));
+            return Ok(None);
+        };
+        let open = open_edge_count(&asset.sha256, &asset.mesh);
+        if open > 0 {
+            self.warn_once(&format!(
+                "WARNING: import(\"{file}\") {OPEN_IMPORT_NOTE} ({open} open edges): it renders and exports as \
+                 uploaded, but booleans, volume and intersection checks with it are unreliable. They need a \
+                 closed solid: model the part in SCAD instead."
+            ));
+        }
+        let shape = Shape::Mesh {
+            mesh: Arc::clone(&asset.mesh),
+            bounds,
+            index: MeshIndexCache::default(),
+        };
+        if !center {
+            return Ok(Some(shape));
+        }
+        let middle = bounds.min.add(bounds.max).mul(0.5);
+        Ok(Some(Shape::Transform {
+            shape: Box::new(shape),
+            transform: Transform::translation(middle.mul(-1.0)),
+        }))
     }
 
     fn ignore_geometry(&mut self, module: &str, reason: &str) {
@@ -5274,7 +6279,7 @@ fn evaluate_expression(expression: &Expr, environment: &Environment) -> Result<V
             .iter()
             .map(|value| evaluate_expression(value, environment))
             .collect::<Result<Vec<_>, _>>()
-            .map(Value::Vector),
+            .map(Value::vector),
         Expr::Range(start, step, end) => {
             let start = evaluate_expression(start, environment)?;
             let step = evaluate_expression(step, environment)?;
@@ -5473,8 +6478,8 @@ fn evaluate_expression(expression: &Expr, environment: &Environment) -> Result<V
         }
         Expr::Lambda(parameters, body) => Ok(Value::Function(Rc::new(FunctionValue {
             name: None,
-            parameters: parameters.clone(),
-            body: body.as_ref().clone(),
+            parameters: Rc::new(parameters.clone()),
+            body: Rc::new(body.as_ref().clone()),
             environment: Rc::new(environment.flattened()),
             same_scope_functions: Rc::new(HashMap::new()),
         }))),
@@ -5484,12 +6489,12 @@ fn evaluate_expression(expression: &Expr, environment: &Environment) -> Result<V
             for element in elements {
                 evaluate_list_element(element, environment, &mut budget, &mut values)?;
             }
-            Ok(Value::Vector(values))
+            Ok(Value::vector(values))
         }
     }
 }
 
-const MAX_COMPREHENSION_STEPS: usize = 100_000;
+const MAX_COMPREHENSION_STEPS: usize = 1_000_000;
 
 #[derive(Default)]
 struct ComprehensionBudget {
@@ -5518,12 +6523,7 @@ impl ComprehensionBudget {
 }
 
 fn value_work_cost(value: &Value) -> usize {
-    match value {
-        Value::Vector(values) => values.iter().fold(1usize, |cost, value| {
-            cost.saturating_add(value_work_cost(value))
-        }),
-        _ => 1,
-    }
+    value.weight()
 }
 
 fn evaluate_list_element(
@@ -5541,7 +6541,7 @@ fn evaluate_list_element(
         }
         ListElement::Each(value) => {
             let values = match evaluate_expression(value, environment)? {
-                Value::Vector(values) => values,
+                Value::Vector(values) => Value::unshare(values),
                 // A range and a string both splice their elements; everything
                 // else splices as a single element.
                 value @ (Value::Range { .. } | Value::String(_)) => {
@@ -5790,8 +6790,8 @@ fn bind_function_arguments(
             name.clone(),
             Value::Function(Rc::new(FunctionValue {
                 name: Some(name.clone()),
-                parameters: definition.parameters.clone(),
-                body: definition.body.clone(),
+                parameters: Rc::clone(&definition.parameters),
+                body: Rc::clone(&definition.body),
                 environment: Rc::clone(&function.environment),
                 same_scope_functions: function.same_scope_functions.clone(),
             })),
@@ -5888,14 +6888,17 @@ fn negate_value(value: Value) -> Value {
     match value {
         Value::Number(value) => Value::Number(-value),
         Value::Vector(values) => {
-            let values = values.into_iter().map(negate_value).collect::<Vec<_>>();
+            let values = Value::unshare(values)
+                .into_iter()
+                .map(negate_value)
+                .collect::<Vec<_>>();
             if values.iter().any(|value| matches!(value, Value::Undefined)) {
                 expression_warning(
                     "Unsupported vector component for unary minus; returning undef.",
                 );
                 Value::Undefined
             } else {
-                Value::Vector(values)
+                Value::vector(values)
             }
         }
         Value::Undefined => Value::Undefined,
@@ -5923,13 +6926,13 @@ fn arithmetic_values(left: Value, right: Value, operator: BinaryOp) -> Value {
         // `[1,2] + [1,2,3]` is `[2,4]` rather than undef.
         (Value::Vector(left), Value::Vector(right), BinaryOp::Add)
         | (Value::Vector(left), Value::Vector(right), BinaryOp::Subtract) => {
-            let values = left
+            let values = Value::unshare(left)
                 .into_iter()
-                .zip(right)
+                .zip(Value::unshare(right))
                 .map(|(left, right)| arithmetic_values(left, right, operator))
                 .collect::<Vec<_>>();
             (!values.iter().any(|value| matches!(value, Value::Undefined)))
-                .then_some(Value::Vector(values))
+                .then_some(Value::vector(values))
         }
         (Value::Number(scalar), Value::Vector(values), BinaryOp::Multiply) => {
             scale_vector(values, scalar, false)
@@ -5951,8 +6954,8 @@ fn arithmetic_values(left: Value, right: Value, operator: BinaryOp) -> Value {
     })
 }
 
-fn scale_vector(values: Vec<Value>, scalar: f64, divide: bool) -> Option<Value> {
-    values
+fn scale_vector(values: Rc<ValueList>, scalar: f64, divide: bool) -> Option<Value> {
+    Value::unshare(values)
         .into_iter()
         .map(|value| {
             Some(match value {
@@ -5966,10 +6969,10 @@ fn scale_vector(values: Vec<Value>, scalar: f64, divide: bool) -> Option<Value> 
             })
         })
         .collect::<Option<Vec<_>>>()
-        .map(Value::Vector)
+        .map(Value::vector)
 }
 
-fn multiply_vectors(left: Vec<Value>, right: Vec<Value>) -> Option<Value> {
+fn multiply_vectors(left: Rc<ValueList>, right: Rc<ValueList>) -> Option<Value> {
     match (number_vector(&left), number_vector(&right)) {
         (Some(left), Some(right)) => dot_product(&left, &right).map(Value::Number),
         (None, Some(right)) => {
@@ -5977,7 +6980,7 @@ fn multiply_vectors(left: Vec<Value>, right: Vec<Value>) -> Option<Value> {
             left.iter()
                 .map(|row| dot_product(row, &right).map(Value::Number))
                 .collect::<Option<Vec<_>>>()
-                .map(Value::Vector)
+                .map(Value::vector)
         }
         (Some(left), None) => {
             let right = number_matrix(&right)?;
@@ -5995,7 +6998,7 @@ fn multiply_vectors(left: Vec<Value>, right: Vec<Value>) -> Option<Value> {
                     ))
                 })
                 .collect::<Option<Vec<_>>>()?;
-            Some(Value::Vector(values))
+            Some(Value::vector(values))
         }
         (None, None) => {
             let left = number_matrix(&left)?;
@@ -6020,9 +7023,9 @@ fn multiply_vectors(left: Vec<Value>, right: Vec<Value>) -> Option<Value> {
                         })
                         .collect::<Vec<_>>()
                 })
-                .map(Value::Vector)
+                .map(Value::vector)
                 .collect::<Vec<_>>();
-            Some(Value::Vector(rows))
+            Some(Value::vector(rows))
         }
     }
 }
@@ -6125,6 +7128,68 @@ fn number(value: Value, context: &str) -> Result<f64, EngineError> {
             "Expected a number for {context}."
         ))),
     }
+}
+
+/// Most points one `sweep_path()` polyline may hold (a ReOpenSCAD extension).
+pub(crate) const MAX_SWEEP_POINTS: usize = 65;
+
+/// Offsets the sampled kernel unions copies of a `sweep_path()` child at:
+/// every vertex plus points along each segment at a quarter of the child's
+/// smallest extent, at most 256 in all. An approximation; the exact kernel
+/// computes the true sweep.
+fn sweep_samples(shape: &Shape, points: &[Vec3]) -> Vec<Vec3> {
+    let size = shape.bounds().max.sub(shape.bounds().min);
+    let spacing = (size.x.min(size.y).min(size.z) / 4.0).max(1e-3);
+    let total: f64 = points.windows(2).map(|pair| pair[1].sub(pair[0]).length()).sum();
+    let spacing = spacing.max(total / 256.0);
+    let mut samples = vec![points[0]];
+    for pair in points.windows(2) {
+        let length = pair[1].sub(pair[0]).length();
+        let steps = ((length / spacing).ceil() as usize).max(1);
+        for step in 1..=steps {
+            samples.push(pair[0].add(pair[1].sub(pair[0]).mul(step as f64 / steps as f64)));
+        }
+    }
+    samples
+}
+
+/// The parameters a built-in module reads: positional ones in order, then the
+/// named-only ones. `None` for modules that take arbitrary arguments (`echo`)
+/// or are not built in.
+fn builtin_module_parameters(name: &str) -> Option<(&'static [&'static str], &'static [&'static str])> {
+    Some(match name {
+        "cube" | "square" => (&["size", "center"], &[]),
+        "sphere" | "circle" => (&["r"], &["d"]),
+        "cylinder" => (&["h", "r1", "r2", "center"], &["r", "d", "d1", "d2"]),
+        "polyhedron" => (&["points", "faces", "convexity"], &["triangles"]),
+        "import" => (
+            &["file", "layer", "convexity", "origin", "scale"],
+            &["width", "height", "filename", "layername", "center", "dpi", "id"],
+        ),
+        "polygon" => (&["points", "paths", "convexity"], &[]),
+        "text" => (
+            &["text", "size", "font"],
+            &["direction", "language", "script", "halign", "valign", "spacing", "em"],
+        ),
+        "translate" | "scale" | "mirror" => (&["v"], &[]),
+        "rotate" => (&["a", "v"], &[]),
+        "multmatrix" => (&["m"], &[]),
+        "resize" => (&["newsize", "auto", "convexity"], &[]),
+        "color" => (&["c", "alpha"], &[]),
+        "offset" => (&["r"], &["delta", "chamfer"]),
+        "union" | "difference" | "intersection" | "hull" | "fill" | "group" => (&[], &[]),
+        "minkowski" | "render" => (&["convexity"], &[]),
+        "sweep_path" => (&["points"], &[]),
+        "projection" => (&["cut", "convexity"], &[]),
+        "linear_extrude" => (
+            &["height", "center", "convexity"],
+            &["twist", "slices", "scale", "segments", "v"],
+        ),
+        "rotate_extrude" => (&["angle"], &["convexity", "start"]),
+        "assert" => (&["condition", "message"], &[]),
+        "children" => (&["index"], &[]),
+        _ => return None,
+    })
 }
 
 fn argument<'a>(arguments: &'a [Argument], name: &str, index: usize) -> Option<&'a Expr> {
@@ -6342,7 +7407,7 @@ fn argument_points3(
             "Expected a vector of 3D points for {name}."
         )));
     };
-    points
+    Value::unshare(points)
         .into_iter()
         .map(|point| {
             let Value::Vector(components) = point else {
@@ -6356,7 +7421,7 @@ fn argument_points3(
                     "Expected 2 or 3 components per point for {name}."
                 )));
             }
-            for (coordinate, value) in coordinates.iter_mut().zip(&components) {
+            for (coordinate, value) in coordinates.iter_mut().zip(components.iter()) {
                 let Some(value) = numeric_value(value).filter(|value| value.is_finite()) else {
                     return Err(EngineError::new(format!(
                         "Expected finite numeric point components for {name}."
@@ -6388,13 +7453,13 @@ fn argument_matrix4(
         return Err(EngineError::new(format!("Expected a matrix for {name}.")));
     };
     let mut matrix = identity();
-    for (row, values) in matrix.iter_mut().zip(&rows) {
+    for (row, values) in matrix.iter_mut().zip(rows.iter()) {
         let Value::Vector(values) = values else {
             return Err(EngineError::new(format!(
                 "Expected a vector of rows for {name}."
             )));
         };
-        for (cell, value) in row.iter_mut().zip(values) {
+        for (cell, value) in row.iter_mut().zip(values.iter()) {
             // A non-numeric cell keeps its identity value, as it does in the
             // reference, rather than failing the whole transform.
             if let Some(value) = numeric_value(value) {
@@ -6426,7 +7491,7 @@ fn argument_points2(
             "Expected a vector of 2D points for {name}."
         )));
     };
-    points
+    Value::unshare(points)
         .into_iter()
         .map(|point| {
             let Value::Vector(components) = point else {
@@ -6478,7 +7543,7 @@ fn argument_index_paths(
             "Expected a vector of index lists for {name}."
         )));
     };
-    paths
+    Value::unshare(paths)
         .into_iter()
         .map(|path| {
             let Value::Vector(indices) = path else {
@@ -6487,7 +7552,7 @@ fn argument_index_paths(
                 )));
             };
             indices
-                .into_iter()
+                .iter()
                 .map(|entry| {
                     let index = numeric_value(&entry).ok_or_else(|| {
                         EngineError::new(format!("Expected numeric indices for {name}."))
@@ -7441,6 +8506,15 @@ enum Shape {
         /// Facets a full turn is cut into, from `$fn`/`$fa`/`$fs`.
         fragments: usize,
     },
+    /// `sweep_path(points)` (a ReOpenSCAD extension): the volume `shape`
+    /// sweeps translated along the polyline `points`, i.e. the union over
+    /// segments of its Minkowski sum with the segment. The child is held once
+    /// and decomposed once by the exact kernel (`exact::sweep_solid`).
+    Sweep {
+        shape: Box<Shape>,
+        points: Vec<Vec3>,
+        bounds: Bounds,
+    },
     MinkowskiDilation {
         shape: Box<Shape>,
         /// Centre of the second operand's bounding box.
@@ -7466,6 +8540,22 @@ enum Shape {
     Polyhedron {
         points: Vec<Vec3>,
         faces: Vec<Vec<usize>>,
+    },
+    /// `import("scan.stl")`: a workspace mesh asset, shared rather than
+    /// copied.
+    ///
+    /// Not a `Polyhedron` because a scan is hundreds of thousands of
+    /// triangles: one `Vec` per face plus a reversed copy of the winding
+    /// would cost more than the import itself, and every `Shape::clone` of
+    /// the tree would pay it again. The mesh is wound counter-clockwise seen
+    /// from outside (the STL convention, which is also the kernel's), so it
+    /// goes into the kernel as it is. `bounds` is computed once at import.
+    Mesh {
+        mesh: Arc<crate::assets::TriMesh>,
+        bounds: Bounds,
+        /// BVH over `mesh` for the sampled mesher's distance queries, built
+        /// on first use and shared by every clone of this shape.
+        index: MeshIndexCache,
     },
     /// `resize(newsize, auto)`: a scale whose factors are not known until the
     /// child's bounding box is.
@@ -7590,8 +8680,16 @@ impl Shape {
             | Shape::Offset2d { shape, .. }
             | Shape::LinearExtrude { shape, .. }
             | Shape::RotateExtrude { shape, .. }
-            | Shape::MinkowskiDilation { shape, .. } => shape.stated_color(),
+            | Shape::MinkowskiDilation { shape, .. }
+            | Shape::Sweep { shape, .. } => shape.stated_color(),
             Shape::Difference { base, .. } => base.stated_color(),
+            // A union whose children all state the same colour is that colour:
+            // `if (c) color("red") cube();` or a module body of one colour.
+            Shape::Union { children, .. } => {
+                let mut colors = children.iter().map(|child| child.shape.stated_color());
+                let first = colors.next()??;
+                colors.all(|color| color == Some(first)).then_some(first)
+            }
             _ => None,
         }
     }
@@ -7606,10 +8704,12 @@ impl Shape {
             Shape::Sphere { .. } => 0.0,
             // `polyhedron_distance` measures the true Euclidean distance to
             // the surface, so outside the body it is never an underestimate.
-            Shape::Polyhedron { .. } => 1.0,
+            Shape::Polyhedron { .. } | Shape::Mesh { .. } => 1.0,
             // A resize scales each axis differently and a projection collapses
             // one, so neither can promise anything about its child's bound.
-            Shape::Resize { .. } | Shape::Projection { .. } => 0.0,
+            // A sweep's sampled distance is the minimum over sampled copies,
+            // not a bound.
+            Shape::Resize { .. } | Shape::Projection { .. } | Shape::Sweep { .. } => 0.0,
             Shape::Cylinder {
                 radius1, radius2, ..
             } => {
@@ -7672,11 +8772,13 @@ impl Shape {
             | Shape::LinearExtrude { .. }
             | Shape::RotateExtrude { .. }
             | Shape::Polyhedron { .. }
+            | Shape::Mesh { .. }
             | Shape::Hull { .. } => ShapeDimension::Solid,
             Shape::Resize { shape, .. } => shape.dimension(),
             Shape::Transform { shape, .. }
             | Shape::Color { shape, .. }
-            | Shape::MinkowskiDilation { shape, .. } => shape.dimension(),
+            | Shape::MinkowskiDilation { shape, .. }
+            | Shape::Sweep { shape, .. } => shape.dimension(),
             Shape::Union { children, .. } => children
                 .first()
                 .map(|child| child.dimension)
@@ -7781,7 +8883,12 @@ impl Shape {
                 radius,
                 ..
             } => shape.distance(point.sub(*offset)) - radius,
+            Shape::Sweep { shape, points, .. } => sweep_samples(shape, points)
+                .into_iter()
+                .map(|offset| shape.distance(point.sub(offset)))
+                .fold(f64::INFINITY, f64::min),
             Shape::Polyhedron { points, faces } => polyhedron_distance(points, faces, point),
+            Shape::Mesh { mesh, index, .. } => mesh_distance(mesh, index, point),
             Shape::Resize {
                 shape,
                 newsize,
@@ -7979,6 +9086,7 @@ impl Shape {
                     max: Vec3::new(radius, radius, bounds.max.y),
                 }
             }
+            Shape::Sweep { bounds, .. } => *bounds,
             Shape::MinkowskiDilation {
                 shape,
                 offset,
@@ -8001,6 +9109,7 @@ impl Shape {
                 min: Vec3::default(),
                 max: Vec3::default(),
             }),
+            Shape::Mesh { bounds, .. } => *bounds,
             Shape::Resize {
                 shape,
                 newsize,
@@ -8132,6 +9241,9 @@ impl Shape {
             Shape::Hull { points, .. } | Shape::Polyhedron { points, .. } => {
                 output.extend(points.iter().copied());
             }
+            Shape::Mesh { mesh, .. } => {
+                output.extend(mesh.points.iter().map(|&[x, y, z]| Vec3::new(x, y, z)));
+            }
             other => {
                 let solid = exact::shape_to_solid(other, cancellation)?;
                 for polygon in &solid.polygons {
@@ -8176,6 +9288,37 @@ fn resize_factors(size: Vec3, newsize: Vec3, auto: [bool; 3]) -> Vec3 {
         auto,
     );
     Vec3::new(factors.x, factors.y, factors.z)
+}
+
+/// Bounding box of the points an imported mesh's triangles use; `None` for
+/// a mesh with no usable triangle.
+fn mesh_bounds(mesh: &crate::assets::TriMesh) -> Option<Bounds> {
+    let mut bounds: Option<Bounds> = None;
+    for index in mesh.triangles.iter().flatten() {
+        let Some(&[x, y, z]) = mesh.points.get(*index as usize) else {
+            continue;
+        };
+        let point = Vec3::new(x, y, z);
+        bounds = Some(match bounds {
+            None => Bounds {
+                min: point,
+                max: point,
+            },
+            Some(bounds) => Bounds {
+                min: Vec3::new(
+                    bounds.min.x.min(x),
+                    bounds.min.y.min(y),
+                    bounds.min.z.min(z),
+                ),
+                max: Vec3::new(
+                    bounds.max.x.max(x),
+                    bounds.max.y.max(y),
+                    bounds.max.z.max(z),
+                ),
+            },
+        });
+    }
+    bounds
 }
 
 fn point_bounds(points: &[Vec3]) -> Option<Bounds> {
@@ -8281,6 +9424,40 @@ fn polyhedron_distance(points: &[Vec3], faces: &[Vec<usize>], point: Vec3) -> f6
         return f64::INFINITY;
     }
     if crossings % 2 == 1 {
+        -distance
+    } else {
+        distance
+    }
+}
+
+/// Signed distance to an imported mesh: [`polyhedron_distance`] over the
+/// shared triangles, without first copying them into faces. Winding does not
+/// enter into it — the sign comes from ray parity — so the STL convention
+/// needs no reversal here.
+/// Lazily built [`crate::meshanalysis::MeshIndex`] for a `Shape::Mesh`.
+///
+/// A scan is up to hundreds of thousands of triangles; a linear scan per
+/// distance sample made the sampled mesher O(samples x triangles), seconds
+/// past any deadline. The index makes each sample logarithmic.
+#[derive(Clone, Default)]
+struct MeshIndexCache(Arc<std::sync::OnceLock<crate::meshanalysis::MeshIndex>>);
+
+impl fmt::Debug for MeshIndexCache {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(if self.0.get().is_some() { "MeshIndex(built)" } else { "MeshIndex(lazy)" })
+    }
+}
+
+/// Signed distance to an imported mesh: negative inside (majority vote of
+/// three skewed ray-parity tests, robust to rays grazing edges).
+fn mesh_distance(mesh: &crate::assets::TriMesh, cache: &MeshIndexCache, point: Vec3) -> f64 {
+    let index = cache.0.get_or_init(|| crate::meshanalysis::MeshIndex::new(mesh));
+    let at = [point.x, point.y, point.z];
+    let distance = index.distance(at);
+    if !distance.is_finite() {
+        return f64::INFINITY;
+    }
+    if index.contains(at) {
         -distance
     } else {
         distance
@@ -8677,15 +9854,19 @@ fn sample_distance_field(
         .min(nz + 1);
     let layers_per_worker = (nz + 1).div_ceil(worker_count);
 
+    crate::csg::bsp::Interrupts::with_current(|interrupts| {
     std::thread::scope(|scope| -> Result<(), EngineError> {
         let mut workers = Vec::with_capacity(worker_count);
         for (chunk_index, layers) in field.chunks_mut(layer_size * layers_per_worker).enumerate() {
             let start_z = chunk_index * layers_per_worker;
             workers.push(scope.spawn(move || -> Result<(), EngineError> {
+                interrupts.install(|| -> Result<(), EngineError> {
                 for (local_z, layer) in layers.chunks_mut(layer_size).enumerate() {
-                    check_cancelled(cancellation)?;
                     let z = start_z + local_z;
                     for y in 0..=ny {
+                        // Per row, not per layer: a sample can be costly
+                        // (imported meshes), and a layer is many rows.
+                        check_cancelled(cancellation)?;
                         for x in 0..=nx {
                             let point = Vec3::new(
                                 bounds.min.x + x as f64 * dx,
@@ -8697,6 +9878,7 @@ fn sample_distance_field(
                     }
                 }
                 Ok(())
+                })
             }));
         }
         for worker in workers {
@@ -8705,6 +9887,7 @@ fn sample_distance_field(
             })??;
         }
         Ok(())
+    })
     })?;
     Ok(field)
 }
@@ -9229,7 +10412,7 @@ mod tests {
         assert!(first.parts.iter().all(|part| {
             part.visible
                 && part.selectable
-                && part.source_range.is_none()
+                && part.source_range.is_some()
                 && !part.mesh.triangles.is_empty()
         }));
         assert_eq!(
@@ -9351,73 +10534,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("cancelled"));
-    }
-
-    #[test]
-    fn part_clearances_distinguish_overlap_touching_tolerance_and_hidden_state() {
-        let output = compile_parts(
-            r#"
-              cube([10, 10, 10]);
-              translate([8, 0, 0]) cube([10, 10, 10]);
-              translate([20, 0, 0]) cube([10, 10, 10]);
-              translate([10, 0, 0]) cube([10, 10, 10]);
-            "#,
-            Quality::Preview,
-            None,
-        )
-        .unwrap();
-
-        let checks = check_part_clearances(&output.parts, 0.25, &[]).unwrap();
-        let overlap = checks
-            .iter()
-            .find(|pair| pair.a == "object-1" && pair.b == "object-2")
-            .unwrap();
-        assert!(overlap.intersects);
-        assert!(!overlap.within_tolerance);
-        assert!(overlap.depth.is_some_and(|depth| depth > 1.9));
-
-        let touching = checks
-            .iter()
-            .find(|pair| pair.a == "object-1" && pair.b == "object-4")
-            .unwrap();
-        assert!(!touching.intersects);
-        assert!(touching.within_tolerance);
-        assert!(touching.clearance <= 1e-6);
-
-        let clear = checks
-            .iter()
-            .find(|pair| pair.a == "object-1" && pair.b == "object-3")
-            .unwrap();
-        assert!(!clear.intersects);
-        assert!(!clear.within_tolerance);
-        assert!((clear.clearance - 10.0).abs() <= 1e-9);
-
-        let tolerance_checks = check_part_clearances(&output.parts, 10.0, &[]).unwrap();
-        let within_tolerance = tolerance_checks
-            .iter()
-            .find(|pair| pair.a == "object-1" && pair.b == "object-3")
-            .unwrap();
-        assert!(within_tolerance.within_tolerance);
-
-        let hidden = check_part_clearances(&output.parts, 10.0, &["object-2".into()]).unwrap();
-        assert!(hidden
-            .iter()
-            .all(|pair| pair.a != "object-2" && pair.b != "object-2"));
-
-        let mut coincident = output.parts[0].clone();
-        coincident.id = "object-copy".into();
-        let coincident_check =
-            check_part_clearances(&[output.parts[0].clone(), coincident], 0.0, &[]).unwrap();
-        assert!(coincident_check[0].intersects);
-        assert!(coincident_check[0].depth.is_some_and(|depth| depth > 4.9));
-
-        let mut visibility = output.parts;
-        visibility[3].visible = false;
-        let visible_checks = check_part_clearances(&visibility, 0.25, &[]).unwrap();
-        assert!(visible_checks
-            .iter()
-            .all(|pair| pair.a != "object-4" && pair.b != "object-4"));
-        assert!(check_part_clearances(&visibility, -0.1, &[]).is_err());
     }
 
     #[test]
@@ -9903,6 +11019,27 @@ mod tests {
     }
 
     #[test]
+    fn self_doubling_shared_lists_are_capped_instead_of_walked_exponentially() {
+        // Shared lists make `[a, a]` one node, so sixty doublings would build a
+        // 2^60-leaf value from sixty allocations; every walk over it (equality,
+        // echo, the non-finite check) must stay bounded.
+        let source = "function f(n, a = [0]) = n == 0 ? a : f(n - 1, [a, a]);\n\
+                      x = f(60);\necho(x == x);\ncube(1);";
+        let started = std::time::Instant::now();
+        let output = compile_parts(source, Quality::Preview, None).expect("compile");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(output.parts.len(), 1);
+        assert!(
+            output
+                .messages
+                .iter()
+                .any(|message| message.contains("element limit")),
+            "{:?}",
+            output.messages
+        );
+    }
+
+    #[test]
     fn resolves_assignment_dependencies_and_same_scope_functions_declaratively() {
         let shape = evaluate_source(
             r#"
@@ -9998,6 +11135,59 @@ mod tests {
         // different complaint from "unsupported module".
         let empty = compile("torus(10);", Quality::Preview, None).unwrap_err();
         assert!(empty.to_string().contains("produced no geometry"));
+    }
+
+    /// Render hints are accepted silently; arguments that would change the
+    /// geometry in OpenSCAD but are not modelled must say so.
+    #[test]
+    fn render_hints_are_silent_and_ignored_geometry_arguments_warn() {
+        let hints = compile(
+            "render(convexity = 4) cube(1);\n\
+             minkowski(convexity = 2) { cube(1); sphere(0.1, $fn = 8); }\n\
+             linear_extrude(height = 1, convexity = 3) square(1);\n\
+             rotate_extrude(convexity = 3) translate([2, 0]) square(1);\n\
+             polyhedron([[0,0,0],[1,0,0],[0,1,0],[0,0,1]], [[0,1,2],[0,3,1],[0,2,3],[1,3,2]], convexity = 2);\n\
+             linear_extrude(1) polygon([[0,0],[1,0],[0,1]], convexity = 2);\n\
+             linear_extrude(1) projection(convexity = 2) cube(1);\n\
+             resize([2, 2, 2], convexity = 2) cube(1);\n\
+             linear_extrude(1) text(\"A\", language = \"en\");",
+            Quality::Preview,
+            None,
+        )
+        .unwrap();
+        assert!(
+            hints.messages.iter().all(|message| !message.starts_with("WARNING")),
+            "{:?}",
+            hints.messages
+        );
+        // A 2D scale with z = 0 is a plain 2D scale in OpenSCAD.
+        let flat = compile("linear_extrude(1) scale([2, 3, 0]) square(1);", Quality::Preview, None)
+            .unwrap();
+        let top = |axis: fn(&Vec3) -> f64| {
+            flat.mesh
+                .triangles
+                .iter()
+                .flat_map(|triangle| triangle.vertices.iter().map(axis))
+                .fold(f64::MIN, f64::max)
+        };
+        assert!((top(|v| v.x) - 2.0).abs() < 1e-9 && (top(|v| v.y) - 3.0).abs() < 1e-9);
+        let flattened = compile("scale([1, 1, 0]) cube(1); cube(2);", Quality::Preview, None)
+            .unwrap();
+        assert!(flattened.messages.iter().any(|message| message.contains("zero z")));
+        let ignored = compile(
+            "linear_extrude(height = 1, segments = 4) square(1);\n\
+             linear_extrude(height = 1, v = [1, 0, 1]) square(1);",
+            Quality::Preview,
+            None,
+        )
+        .unwrap();
+        for needle in ["segments", "extrusion direction"] {
+            assert!(
+                ignored.messages.iter().any(|message| message.contains(needle)),
+                "{needle}: {:?}",
+                ignored.messages
+            );
+        }
     }
 
     #[test]
@@ -10488,6 +11678,84 @@ mod tests {
         let error = compile("sphere(10);", Quality::Render, Some(&cancellation)).unwrap_err();
         assert!(error.to_string().contains("cancelled"));
     }
+
+    /// Several seconds of exact booleans even in release, most of it inside
+    /// single unions and face merges (and on worker threads), where the
+    /// flag used to go unread until the boolean finished.
+    pub(crate) const HEAVY_UNION: &str = "union() { for (i = [0:3]) translate([i * 6, 0, 0]) \
+         difference() { sphere(10, $fn = 120); sphere(9, $fn = 120); } }";
+
+    /// Runs `compile` with a flag tripped after `after`, returning the result
+    /// and how long the compile took past the trip.
+    fn compile_cancelled_after(
+        after: std::time::Duration,
+        compile: impl FnOnce(&AtomicBool) -> Result<MultipartCompileOutput, EngineError>,
+    ) -> (Result<MultipartCompileOutput, EngineError>, std::time::Duration) {
+        let flag = std::sync::Arc::new(AtomicBool::new(false));
+        let tripper = {
+            let flag = std::sync::Arc::clone(&flag);
+            std::thread::spawn(move || {
+                std::thread::sleep(after);
+                flag.store(true, Ordering::Release);
+                std::time::Instant::now()
+            })
+        };
+        let result = compile(&flag);
+        let finished = std::time::Instant::now();
+        let tripped = tripper.join().unwrap();
+        (result, finished.saturating_duration_since(tripped))
+    }
+
+    #[test]
+    fn a_cancelled_compile_stops_inside_its_booleans_promptly() {
+        let (result, overrun) = compile_cancelled_after(std::time::Duration::from_millis(300), |flag| {
+            compile_parts(HEAVY_UNION, Quality::Preview, Some(flag))
+        });
+        let error = result.expect_err("the compile must not outrun a 300 ms cancel");
+        assert_eq!(error.to_string(), "Render cancelled.");
+        assert!(
+            overrun < std::time::Duration::from_secs(2),
+            "the compile ran {overrun:?} past its cancellation"
+        );
+    }
+
+    /// A 100k-gon is convex, so its caps take the linear fan rather than
+    /// quadratic ear clipping; a non-convex one of the same size still has
+    /// to stop within a second of its cancel.
+    #[test]
+    fn a_hundred_thousand_segment_extrusion_is_fast_and_cancellable() {
+        let started = std::time::Instant::now();
+        let output = compile_parts("linear_extrude(1) circle(r=100,$fn=100000);", Quality::Render, None)
+            .expect("a large circle compiles");
+        let elapsed = started.elapsed();
+        assert!(!output.mesh.triangles.is_empty());
+        assert!(elapsed < std::time::Duration::from_secs(10), "took {elapsed:?}");
+
+        let star = "linear_extrude(1) polygon([for (i = [0:99999]) \
+             let (r = i % 2 == 0 ? 100 : 98) [r * cos(i * 360 / 100000), r * sin(i * 360 / 100000)]]);";
+        let (result, overrun) = compile_cancelled_after(std::time::Duration::from_millis(500), |flag| {
+            compile_parts(star, Quality::Render, Some(flag))
+        });
+        let error = result.expect_err("the star must not finish within 500 ms");
+        assert_eq!(error.to_string(), "Render cancelled.");
+        assert!(overrun < std::time::Duration::from_secs(1), "ran {overrun:?} past its cancellation");
+    }
+
+    #[test]
+    fn a_kernel_deadline_alone_stops_a_compile_and_its_workers() {
+        // No flag at all: only the thread's deadline, as analysis requests
+        // set it. The union's children are converted on worker threads.
+        let started = std::time::Instant::now();
+        let _deadline = crate::csg::bsp::deadline_scope(started + std::time::Duration::from_millis(300));
+        let error = compile_parts(HEAVY_UNION, Quality::Preview, None)
+            .expect_err("the compile must not outrun its deadline");
+        assert!(error.to_string().contains("time budget"), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(2300),
+            "the compile ran {:?} against a 300 ms deadline",
+            started.elapsed()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -10518,15 +11786,33 @@ mod spec_comprehensions;
 #[path = "engine/spec_bounds_pruning.rs"]
 mod spec_bounds_pruning;
 
+#[cfg(test)]
+#[path = "engine/spec_object_naming.rs"]
+mod spec_object_naming;
+
+#[cfg(test)]
+#[path = "engine/spec_dialect_diagnostics.rs"]
+mod spec_dialect_diagnostics;
+
+#[cfg(test)]
+#[path = "engine/spec_colors.rs"]
+mod spec_colors;
+
+#[cfg(test)]
+#[path = "engine/spec_import.rs"]
+mod spec_import;
+
+#[cfg(test)]
+#[path = "engine/spec_sweep_path.rs"]
+mod spec_sweep_path;
+
 /// The exact polyhedral CSG kernel bridge.
 ///
 /// `compile` above meshes the shape tree by sampling `Shape::distance`;
-/// `exact::compile_exact` meshes the same tree exactly. The sampled path stays
-/// the default so nothing regresses; callers opt in through
-/// [`exact::Kernel::Exact`].
+/// `exact::compile_exact` meshes the same tree exactly.
 #[allow(dead_code)]
 #[path = "engine/exact.rs"]
 pub mod exact;
 
 #[allow(unused_imports)]
-pub use exact::{compile_exact, compile_with_kernel, Kernel};
+pub use exact::compile_exact;

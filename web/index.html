@@ -2,9 +2,9 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="theme-color" content="#15191f" />
-    <!-- A workspace URL is its own credential, so the shell is noindex by
+    <!-- A design URL is its own credential, so the shell is noindex by
          default and the server strips this line for the one route that is
          meant to be found — the landing page. Failing to strip it costs
          discoverability; failing to add it would cost confidentiality, so it
@@ -12,91 +12,241 @@
          and `X-Robots-Tag` accompany it on every response. -->
     <meta name="robots" content="noindex, nofollow, noarchive" />
     <title>ReOpenSCAD</title>
+    <meta name="description" content="ReOpenSCAD is OpenSCAD reincarnated for the web and built for AI agents: an MCP server lets agents create, edit, render and export parametric CAD designs while you watch." />
     <link rel="icon" type="image/svg+xml" href="/legacy-assets/icons/reopenscad.svg" />
     <link rel="stylesheet" href="/styles.css" />
+    <!-- Decided before first paint, so "/" never flashes the editor shell before
+         app.js swaps the landing page in. app.js owns the class from then on. -->
+    <script>
+      if (/^\/(index\.html)?$/.test(location.pathname) && !new URLSearchParams(location.search).has('workspace') && !new URLSearchParams(location.search).has('design')) {
+        document.documentElement.classList.add('landing-mode');
+      }
+    </script>
   </head>
   <body>
-    <div class="mobile-gate" role="alert">
-      <img src="/legacy-assets/icons/reopenscad.svg" alt="" />
-      <h1>Works only on desktop, sorry!</h1>
-      <p>ReOpenSCAD needs a keyboard for writing OpenSCAD and a mouse or trackpad for orbiting, panning and zooming the model. Open it on a laptop or desktop.</p>
-      <span>Your workspace is safe — the link you used is its only key, so it will be here when you get back.</span>
-    </div>
+    <main class="landing" id="landing" aria-labelledby="landingTitle">
+      <div class="landing-inner">
+        <div class="landing-top">
+          <span class="landing-brand"><img src="/legacy-assets/icons/reopenscad.svg" alt="" />ReOpenSCAD</span>
+          <nav class="landing-links" aria-label="Project links">
+            <a href="https://github.com/Matvey-Kuk/reopenscad" target="_blank" rel="noreferrer noopener">GitHub</a>
+            <a href="https://github.com/Matvey-Kuk/reopenscad/issues" target="_blank" rel="noreferrer noopener">Report issues<span class="issue-count" data-issue-count hidden></span></a>
+          </nav>
+        </div>
+
+        <section class="landing-hero">
+          <div class="landing-pitch">
+            <h1 id="landingTitle">OpenSCAD, rebuilt for AI agents.</h1>
+            <p>AI agents are surprisingly good at writing OpenSCAD code. ReOpenSCAD gives them the tools: they write and render the code, and you watch every change in your browser.<span class="landing-stats" id="landingStats" hidden> <b id="landingStatsDay"></b> <span id="landingStatsDayLabel">designs</span> today<span data-stats-week>, <b id="landingStatsWeek"></b> this week</span>, <b id="landingStatsTotal"></b> in total.</span></p>
+            <div class="landing-agents">
+              <h2 id="landingAgentsLabel">Connect your agent</h2>
+              <ul class="landing-agent-grid" id="landingAgents" aria-labelledby="landingAgentsLabel"></ul>
+            </div>
+            <div class="landing-actions">
+              <button type="button" class="landing-new" id="landingNew">Or open a blank design</button>
+            </div>
+          </div>
+          <figure class="landing-showcase">
+            <!-- The ad lands in web/media/. Until it does (or if it fails to load),
+                 app.js leaves data-state="missing" and the placeholder shows. -->
+            <div class="landing-video" id="landingVideoFrame" data-state="loading">
+              <div class="landing-video-placeholder" aria-hidden="true">
+                <svg viewBox="0 0 120 90" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"><path d="M60 14 98 34v34L60 88 22 68V34Z" opacity=".9"/><path d="M22 34l38 20 38-20M60 54v34" opacity=".9"/><path d="M41 44l19 10 19-10M60 54V24" opacity=".35" stroke-dasharray="3 3"/></svg>
+                <span>Describe a part. Your agent builds it here.</span>
+              </div>
+              <video id="landingVideo" muted playsinline preload="auto" poster="/media/reopenscad-ad-poster.jpg" aria-label="30-second demo: an agent designs a printable part in ReOpenSCAD">
+                <!-- MP4 (H.264) first: iOS Safari takes the first source it thinks it can play. -->
+                <source src="/media/reopenscad-ad.mp4" type='video/mp4; codecs="avc1.640032"' />
+                <source src="/media/reopenscad-ad.webm" type='video/webm; codecs="vp9"' />
+              </video>
+              <button type="button" class="landing-video-play" id="landingVideoPlay"><i aria-hidden="true"></i>Watch · 24 sec</button>
+              <button type="button" class="landing-video-replay" id="landingVideoReplay"><i aria-hidden="true"></i>Play again</button>
+            </div>
+          </figure>
+        </section>
+
+        <div class="landing-missing" id="landingMissing" hidden role="status">
+          <b>That design is gone.</b>
+          <p><code id="landingMissingId"></code> no longer exists on this server. Designs that go untouched for a long time can be evicted.</p>
+          <button type="button" id="landingRecoverMissing" hidden>Recover this browser's copy into a new design</button>
+        </div>
+
+        <section class="landing-features" aria-labelledby="landingFeaturesTitle">
+          <h2 id="landingFeaturesTitle">What's different from OpenSCAD</h2>
+          <div class="landing-feature-grid">
+            <article class="landing-feature">
+              <div class="landing-feature-visual feature-parts">
+                <img src="/media/landing-multipart.png" width="899" height="846" loading="lazy" alt="Exploded desk cabinet: the shell, three drawers and a lid tray, each a separate coloured part" />
+                <ul aria-hidden="true">
+                  <li style="--c:#e4665f">lid_tray</li>
+                  <li style="--c:#aab3bd">cabinet</li>
+                  <li style="--c:#89c454">drawer</li>
+                  <li style="--c:#55a9e8">drawer</li>
+                  <li style="--c:#f1c44c">drawer</li>
+                </ul>
+              </div>
+              <h3>Multi-part designs</h3>
+              <p>Every top-level object is its own part: own colour, show/hide, STL or 3MF export, and clearance checks against the others.</p>
+            </article>
+            <article class="landing-feature">
+              <div class="landing-feature-visual feature-tools" aria-hidden="true">
+                <code class="feature-call"><b>evaluate</b>(design, checks: ["supports"])</code>
+                <ul>
+                  <li><i>✓</i>5 parts, all closed solids</li>
+                  <li><i>✓</i>Bounds 90 × 227 × 118 mm</li>
+                  <li><i>✓</i>Tightest gap 0.4 mm, tolerance 0.2</li>
+                  <li class="warn"><i>!</i>Shelf overhangs 42.5 mm: needs support</li>
+                </ul>
+                <div class="feature-tool-names"><span>measure</span><span>check_intersections</span><span>render_image</span><span>diff</span><span>set_parameters</span></div>
+              </div>
+              <h3>Tools for agents to check their work</h3>
+              <p>Over MCP an agent measures parts, finds collisions and tolerance misses, renders views, diffs revisions and checks printability.</p>
+            </article>
+            <article class="landing-feature">
+              <div class="landing-feature-visual feature-link" aria-hidden="true">
+                <div class="feature-url"><span>Edit</span><code>/designs/<b>plucky-otter</b>-3f9a…</code></div>
+                <div class="feature-url view"><span>View</span><code>/shared/<b>k7Qm</b>…</code></div>
+                <p>No password. No email. The link is the key.</p>
+              </div>
+              <h3>It's a free web app with no sign-up, no accounts</h3>
+              <p>Open a design's link and you're in. Share a read-only link for people who should only look.</p>
+            </article>
+          </div>
+        </section>
+
+        <section class="landing-recents" aria-labelledby="landingRecentsTitle">
+          <div class="landing-recents-head">
+            <h2 id="landingRecentsTitle">Your designs</h2>
+            <span>Kept in this browser only</span>
+          </div>
+          <p class="landing-touch-note">On a phone your designs open as a 3D viewer: orbit, inspect each object and download STL, 3MF or STEP. Editing the source needs a desktop.</p>
+          <ul class="landing-list" id="landingRecents"></ul>
+        </section>
+
+        <section class="landing-examples" aria-labelledby="landingExamplesTitle">
+          <div class="landing-recents-head">
+            <h2 id="landingExamplesTitle">Examples</h2>
+            <span>Each opens as a new design</span>
+          </div>
+          <div class="example-catalogue" id="landingExamples"></div>
+        </section>
+
+        <div class="landing-foot">
+          <span>Inspired by <a href="https://github.com/openscad/openscad/" target="_blank" rel="noreferrer noopener">OpenSCAD</a>. An independent reimplementation with no ties to the OpenSCAD project.</span>
+          <span>Design links are their only key. Anyone holding one can edit it.</span>
+        </div>
+      </div>
+    </main>
+
     <div class="app-shell">
       <header class="app-header">
-        <div class="brand" aria-label="ReOpenSCAD">
-          <img src="/legacy-assets/icons/reopenscad.svg" alt="" />
-          <span>ReOpenSCAD</span>
+        <div class="brand">
+          <a class="brand-home" id="brandHome" href="/" title="Back to the start page"><img src="/legacy-assets/icons/reopenscad.svg" alt="" /><span>ReOpenSCAD</span></a>
           <a class="brand-credit" href="https://github.com/openscad/openscad/" target="_blank" rel="noreferrer noopener">Inspired by OpenSCAD</a>
-          <a class="brand-credit" href="https://www.linkedin.com/in/motakuk/" target="_blank" rel="noreferrer noopener">Vibecoded by Matvey Kukuy</a>
+          <a class="brand-credit" href="https://www.linkedin.com/in/motakuk/" target="_blank" rel="noreferrer noopener">Created by Matvey Kukuy</a>
           <a class="brand-credit" href="https://github.com/Matvey-Kuk/reopenscad" target="_blank" rel="noreferrer noopener">GitHub</a>
-          <a class="brand-credit" href="https://github.com/Matvey-Kuk/reopenscad/issues" target="_blank" rel="noreferrer noopener">Report issues</a>
+          <a class="brand-credit" href="https://github.com/Matvey-Kuk/reopenscad/issues" target="_blank" rel="noreferrer noopener">Report issues<span class="issue-count" data-issue-count hidden></span></a>
         </div>
         <div class="workspace-identity">
-          <button id="copyWorkspaceLink" class="workspace-link" title="Copy this workspace's URL — it is the only key to your work">
-            <span id="workspaceName">starting-up</span>
-            <i aria-hidden="true"></i>
-          </button>
+          <!-- The address bar is the design: there is no login, so its URL is the
+               only way back. Points up at it rather than repeating the id. -->
+          <p class="url-hint" title="There is no login: this URL is the only key to your work">
+            <svg viewBox="0 0 34 26" aria-hidden="true"><path d="M31 22C21 23 10 19 5.5 4.5"/><path d="M2 9.5 5.2 3.6l5.6 3.6"/></svg>
+            <span>Use this URL to access your design at any time</span>
+          </p>
           <span class="sync-state" id="syncState" data-state="local">Local</span>
         </div>
         <div class="engine-pill" id="enginePill" hidden><span></span><b></b></div>
       </header>
 
       <div class="toolbar" role="toolbar" aria-label="Model tools">
+        <button class="share-button" id="shareButton" data-icon="share" title="Share this design" aria-haspopup="dialog"><span>Share</span></button>
+        <button class="export-button" id="exportButton" data-icon="export"><span>Export</span><kbd>STL</kbd></button>
+        <!-- Phone layout only: the panels that sit beside the viewport on a desktop
+             open as bottom sheets from here. -->
+        <button type="button" class="mobile-tool mobile-only" data-sheet="objects" aria-expanded="false"><span>Objects</span><b id="mobileObjectCount">0</b></button>
         <div class="tool-group">
-          <button class="tool-button" id="newButton" title="New workspace (⌘N)" aria-label="New workspace" data-icon="new"></button>
+          <button class="tool-button" id="newButton" title="New design (⌘N)" aria-label="New design" data-icon="new"></button>
           <button class="tool-button" id="openButton" title="Open (⌘O)" aria-label="Open file" data-icon="open"></button>
           <button class="tool-button" id="saveButton" title="Save SCAD (⌘S)" aria-label="Save file" data-icon="save"></button>
-          <input id="fileInput" type="file" accept=".scad,text/plain" hidden />
+          <input id="fileInput" type="file" accept=".scad,.stl,text/plain,model/stl,application/sla" multiple hidden />
         </div>
-        <div class="tool-divider"></div>
-        <div class="tool-group">
-          <button class="tool-button primary" id="previewButton" title="Preview (F5)" aria-label="Preview model" data-icon="preview"></button>
-          <button class="tool-button render" id="renderButton" title="Render (F6)" aria-label="Render model" data-icon="render"></button>
-          <button class="tool-button" id="stopButton" title="Cancel render" aria-label="Cancel render" data-icon="stop" disabled></button>
-        </div>
-        <div class="tool-divider"></div>
         <div class="tool-group view-presets" aria-label="View presets">
           <button class="tool-button" data-view="top" title="Top view" aria-label="Top view" data-icon="top"></button>
           <button class="tool-button" data-view="front" title="Front view" aria-label="Front view" data-icon="front"></button>
           <button class="tool-button" data-view="right" title="Right view" aria-label="Right view" data-icon="right"></button>
           <button class="tool-button" data-view="reset" title="Reset view" aria-label="Reset view" data-icon="reset"></button>
         </div>
-        <div class="toolbar-spacer"></div>
+        <div class="view-mode">
+          <button class="view-toggle" data-projection="perspective" aria-pressed="true">Perspective</button>
+          <button class="view-toggle" data-projection="orthographic" aria-pressed="false">Orthographic</button>
+        </div>
+        <div class="viewport-options">
+          <button class="view-toggle" id="edgesToggle" aria-pressed="false">Edges</button>
+          <button class="pane-action" id="slicerButton" title="Section view: cut the model to look inside" aria-label="Section view" aria-pressed="false" aria-controls="slicerPanel" data-icon="slice"></button>
+          <button class="pane-action feedback-toggle" id="feedbackButton" title="Comments for the agent" aria-label="Comments for the agent" aria-pressed="false" aria-expanded="false" aria-controls="feedbackPanel" data-icon="comment" hidden><b id="feedbackBadge" hidden>0</b></button>
+        </div>
         <button class="agent-button" id="mcpButton" data-icon="agent" title="Connect an AI agent over MCP" aria-haspopup="dialog"><span>Connect AI</span><kbd>MCP</kbd></button>
-        <button class="tool-button" id="shareButton" data-icon="share" title="Share this workspace" aria-label="Share this workspace" aria-haspopup="dialog"></button>
-        <button class="export-button" id="exportButton" data-icon="export"><span>Export</span><kbd>STL</kbd></button>
       </div>
 
       <div class="readonly-banner" id="readonlyBanner" hidden>
         <span><b>Read-only view.</b> You are looking at a shared copy; edits are not saved.</span>
-        <button type="button" id="forkWorkspace">Copy to a new workspace to edit</button>
+        <button type="button" id="forkWorkspace">Copy to a new design to edit</button>
       </div>
 
       <main class="workspace" id="workspace">
         <aside class="objects-pane" aria-label="Objects and inspection">
+          <button type="button" class="sheet-handle mobile-only" data-close-sheet aria-label="Close objects"></button>
           <div class="objects-title">
-            <div><span class="eyebrow">Scene</span><h2>Objects</h2></div>
-            <span class="object-count" id="objectCount">0</span>
+            <h2>Objects</h2>
+            <span class="objects-count" id="objectCount">0</span>
+            <div class="objects-bulk">
+              <button type="button" class="visibility-toggle" id="showAllObjects" aria-label="Show all objects" title="Show all" disabled></button>
+              <button type="button" class="visibility-toggle" id="hideAllObjects" aria-label="Hide all objects" title="Hide all" disabled></button>
+            </div>
           </div>
           <div class="object-list" id="objectList" role="listbox" aria-label="Model objects">
-            <div class="objects-empty"><i></i><span>Objects appear after preview.</span></div>
+            <div class="objects-empty">Objects appear after preview.</div>
           </div>
-          <section class="intersection-tool" aria-labelledby="intersectionTitle">
-            <div class="inspection-heading">
-              <span class="eyebrow">Inspection</span>
-              <span class="inspection-state" id="inspectionState">Not checked</span>
+          <div class="splitter horizontal" id="objectsDivider" role="separator" aria-orientation="horizontal" aria-label="Resize objects list" aria-controls="objectList" tabindex="0" title="Drag to resize, double-click to reset"></div>
+          <div class="tools" id="panelTools">
+          <section class="tool intersection-tool" aria-labelledby="intersectionTitle">
+            <div class="tool-head"><h3 id="intersectionTitle">Intersections</h3><span class="inspection-state" id="inspectionState">Not checked</span></div>
+            <div class="tool-line">
+              <label for="toleranceInput">Tolerance</label>
+              <span class="number-input"><input id="toleranceInput" type="number" min="0" max="1000" step="0.01" value="0.2" inputmode="decimal" aria-label="Tolerance in millimetres" title="Tolerance" /><b>mm</b></span>
+              <button type="button" class="panel-button check-intersections" id="checkIntersections" aria-label="Check intersections">Check</button>
             </div>
-            <h3 id="intersectionTitle">Part intersections</h3>
-            <p>Check visible parts with a fabrication clearance.</p>
-            <label class="tolerance-field">
-              <span>Tolerance</span>
-              <span class="number-input"><input id="toleranceInput" type="number" min="0" max="1000" step="0.01" value="0.2" inputmode="decimal" /><b>mm</b></span>
-            </label>
-            <button class="check-intersections" id="checkIntersections"><span></span>Check intersections</button>
-            <div class="intersection-results" id="intersectionResults" aria-live="polite">
-              <div class="inspection-empty">No inspection run yet.</div>
+            <div class="intersection-results" id="intersectionResults" aria-live="polite"></div>
+          </section>
+          <section class="tool compare-section" aria-labelledby="compareTitle">
+            <div class="tool-head"><h3 id="compareTitle">Compare parts</h3></div>
+            <div class="compare-pick">
+              <span class="compare-part"><span class="compare-swatch" id="compareSwatchA"></span><select id="comparePartA" aria-label="First part" disabled></select></span>
+              <span class="compare-part"><span class="compare-swatch" id="compareSwatchB"></span><select id="comparePartB" aria-label="Second part" disabled></select></span>
             </div>
+            <div class="tool-line compare-run">
+              <span class="tool-status" id="compareStatus" aria-live="polite">Needs 2 parts</span>
+              <button type="button" class="panel-button" id="compareButton" disabled>Compare</button>
+            </div>
+            <p class="compare-error" id="compareError" role="alert" hidden></p>
+            <div class="compare-scale" id="compareScale" tabindex="0" aria-label="Heatmap scale" hidden></div>
+          </section>
+          <section class="tool assets-section" id="assetsSection" aria-labelledby="assetsTitle">
+            <div class="tool-head"><h3 id="assetsTitle">Reference STL</h3><button type="button" class="panel-button asset-upload" id="assetUploadButton">Upload STL</button></div>
+            <div class="asset-row" id="assetRow">
+              <span class="asset-hint" id="assetHint">Kept for 3 hours, for reverse engineering</span>
+              <span class="asset-copy" id="assetCurrent" hidden><b id="assetName"></b><small id="assetCountdown"></small></span>
+              <button type="button" class="asset-remove" id="assetRemoveButton" data-icon="trash" hidden></button>
+            </div>
+            <div class="asset-status" id="assetStatus" aria-live="polite" hidden></div>
+            <span class="sr-only" id="assetAnnounce" role="status"></span>
+          </section>
+          </div>
+          <div class="splitter horizontal" id="revisionsDivider" role="separator" aria-orientation="horizontal" aria-label="Resize revisions list" aria-controls="revisionList" tabindex="0" title="Drag to resize, double-click to reset"></div>
+          <section class="tool revisions-section" id="revisionsSection" aria-labelledby="revisionsTitle">
+            <div class="tool-head"><h3 id="revisionsTitle">Revisions</h3><span class="tool-status number" id="revisionCount"></span></div>
+            <ul class="revision-list" id="revisionList" aria-label="Revisions, newest first"></ul>
           </section>
         </aside>
 
@@ -107,49 +257,58 @@
               <div class="ai-revision-badge" id="aiRevisionBadge" hidden><i></i><span>AI revised source</span><button id="dismissAiHighlight" aria-label="Dismiss AI change highlight">×</button></div>
             </div>
             <div class="line-numbers" id="lineNumbers" aria-hidden="true"></div>
+            <div class="agent-read-layer" id="agentReadLayer" aria-hidden="true"></div>
             <pre class="highlight" id="highlight" aria-hidden="true"></pre>
-            <textarea id="codeEditor" aria-label="OpenSCAD source code" spellcheck="false" autocomplete="off"></textarea>
-            <div class="kickstart" id="kickstart" hidden>
-              <div class="kickstart-catalogue" id="kickstartRecents"></div>
-              <div class="kickstart-catalogue" id="kickstartGrid"></div>
-            </div>
+            <textarea id="codeEditor" aria-label="OpenSCAD source code" spellcheck="false" autocomplete="off" placeholder="// Write OpenSCAD here, or connect an AI agent over MCP."></textarea>
           </div>
         </section>
 
         <div class="splitter vertical" id="mainSplitter" aria-hidden="true"></div>
 
         <section class="viewer-pane" aria-label="3D viewport">
-          <div class="pane-header viewport-header">
-            <div class="view-mode">
-              <button class="active" data-projection="perspective">Perspective</button>
-              <button data-projection="orthographic">Orthographic</button>
-            </div>
-            <div class="viewport-options">
-              <label class="plate-field" title="Show the model on a 3D printer build plate">
-                <span class="sr-only">Build plate</span>
-                <select id="plateSelect" aria-label="Build plate"></select>
-              </label>
-              <label><input id="edgesToggle" type="checkbox" /><span>Edges</span></label>
-              <label><input id="axesToggle" type="checkbox" checked /><span>Axes</span></label>
-              <label><input id="groundToggle" type="checkbox" checked /><span>Ground</span></label>
-              <button class="pane-action" id="customizerButton" title="Toggle customizer" aria-label="Toggle customizer" data-icon="sliders"></button>
-            </div>
+          <!-- In flow above the viewport (below it on phones), so it never covers the
+               viewport controls; shown while in comment mode. -->
+          <div class="feedback-banner" id="feedbackBanner" role="status" aria-live="polite" hidden>
+            <b id="feedbackBannerText">Click the model to pin a comment</b>
+            <button type="button" class="feedback-close" id="feedbackExit" aria-label="Leave comment mode" title="Leave comment mode (Esc)">×</button>
           </div>
           <div class="viewport" id="viewport">
             <div class="empty-state" id="emptyState">
               <img src="/legacy-assets/icons/reopenscad.svg" alt="" />
               <h1>Shape the idea.</h1>
               <p id="emptyHint">Press <kbd>F5</kbd> to preview your OpenSCAD model.</p>
+              <p class="mobile-only" id="emptyMobileHint" hidden>This design has no source yet. Write it on a desktop, or have an AI agent write it over MCP.</p>
               <button id="firstPreview">Preview model</button>
             </div>
             <canvas id="renderCanvas" class="render-canvas" aria-label="Rendered OpenSCAD model"></canvas>
             <canvas id="groundLabels" class="ground-labels" aria-hidden="true"></canvas>
             <div class="grid-scale" id="gridScale"><span>Grid</span><b>10 mm</b></div>
-            <div class="plate-badge" id="plateBadge" hidden aria-live="polite"><b id="plateBadgeName"></b><span id="plateBadgeFit"></span></div>
+            <!-- Section view: a clip plane across X, Y or Z with solid caps on the cut. -->
+            <div class="slicer-panel" id="slicerPanel" role="group" aria-label="Section view" hidden>
+              <div class="slicer-axes" role="radiogroup" aria-label="Cut axis">
+                <button type="button" role="radio" data-slice-axis="x" aria-checked="false">X</button>
+                <button type="button" role="radio" data-slice-axis="y" aria-checked="false">Y</button>
+                <button type="button" role="radio" data-slice-axis="z" aria-checked="true">Z</button>
+              </div>
+              <input type="range" id="slicerPosition" min="0" max="1" step="0.01" value="0.5" aria-label="Cut position" />
+              <output id="slicerValue" for="slicerPosition">0 mm</output>
+              <button type="button" class="slicer-flip" id="slicerFlip" title="Keep the other side" aria-label="Flip cut side" aria-pressed="false" data-icon="flip"></button>
+            </div>
             <!-- The compiler reports nothing until it is finished, so this overlay counts
                  real elapsed time instead of animating a percentage nobody can compute. A
                  ticking clock is what separates "working" from "hung", and the cancel
                  button means a wait the user regrets is always one click from over. -->
+            <!-- A model is already on screen: it stays, in full and under the pointer, and
+                 only this box says a newer one is on its way. The percentage runs against
+                 how long the last render took; with no last render it has no number. -->
+            <div class="rerender-bar" id="rerenderBar" hidden>
+              <div class="rerender-progress" id="rerenderProgress" role="progressbar" aria-label="Re-rendering" aria-valuemin="0" aria-valuemax="100"><i></i></div>
+              <span class="rerender-percent" id="rerenderPercent" aria-hidden="true"></span>
+              <div class="rerender-actions">
+                <button type="button" class="overlay-cancel" id="rerenderCancel">Cancel</button>
+                <button type="button" class="overlay-cancel" id="rerenderReport">Report an issue</button>
+              </div>
+            </div>
             <div class="render-overlay" id="renderOverlay" hidden>
               <div class="spinner"><i></i><i></i><i></i></div>
               <b id="renderLabel">Compiling geometry</b>
@@ -160,7 +319,7 @@
             <!-- A failed render is a dead end: the message names what broke, but the
                  person who can fix it is not in this tab. The report button turns the
                  failure into a filed issue carrying the exact source that produced it.
-                 The workspace URL is a credential, so it is never part of that report. -->
+                 The design URL is a credential, so it is never part of that report. -->
             <div class="render-failure" id="renderFailure" hidden role="alert">
               <i aria-hidden="true">!</i>
               <b>Rendering failed</b>
@@ -170,7 +329,7 @@
                 <button type="button" class="failure-ghost" id="copyRenderFailure"><span>Copy report</span></button>
                 <button type="button" class="failure-ghost" id="dismissRenderFailure"><span>Dismiss</span></button>
               </div>
-              <small>Opens a prefilled issue with your OpenSCAD source and the error. Your workspace link is never included.</small>
+              <small>Opens a prefilled issue with your OpenSCAD source and the error. Your design link is never included.</small>
             </div>
             <!-- Two lines, because one would run under the scale badge on the left and the
                  zoom cluster on the right at the pane's usual width. -->
@@ -178,6 +337,32 @@
               <div><span>DRAG / SHIFT+MIDDLE</span> orbit <span>SWIPE ←→</span> turn</div>
               <div><span>ALT+DRAG / MIDDLE / RIGHT</span> pan <span>SCROLL</span> zoom</div>
             </div>
+            <div class="view-hint touch-hint mobile-only" aria-hidden="true"><div><span>DRAG</span> orbit <span>PINCH</span> zoom <span>TWO FINGERS</span> pan</div></div>
+            <!-- Comments pinned to the model for the AI agent (list_feedback over MCP).
+                 Editable designs only: none of this is shown on a read-only link. -->
+            <div class="feedback-pins" id="feedbackPins" aria-label="Comment pins"></div>
+            <span class="feedback-pin ghost" id="feedbackPinCursor" aria-hidden="true" hidden></span>
+            <form class="feedback-composer" id="feedbackComposer" hidden>
+              <label class="sr-only" for="feedbackText">Comment</label>
+              <textarea id="feedbackText" rows="3" maxlength="1000" placeholder="What should change here?"></textarea>
+              <small id="feedbackComposerTarget"></small>
+              <div class="feedback-composer-actions">
+                <button type="button" class="feedback-cancel" id="feedbackComposerCancel">Cancel</button>
+                <button type="submit" class="feedback-done" id="feedbackComposerSave">Pin comment</button>
+              </div>
+            </form>
+            <section class="feedback-panel" id="feedbackPanel" aria-labelledby="feedbackPanelTitle" hidden>
+              <header>
+                <h3 id="feedbackPanelTitle">Comments for the agent</h3>
+                <button type="button" class="feedback-close" id="feedbackPanelClose" aria-label="Close comments">×</button>
+              </header>
+              <div class="feedback-tabs" role="tablist" aria-label="Comment status">
+                <button type="button" role="tab" data-feedback-tab="open" aria-selected="true">Open <b id="feedbackOpenCount">0</b></button>
+                <button type="button" role="tab" data-feedback-tab="resolved" aria-selected="false">Resolved <b id="feedbackResolvedCount">0</b></button>
+              </div>
+              <ol class="feedback-list" id="feedbackList"></ol>
+              <button type="button" class="feedback-add" id="feedbackAdd">Pin a comment on the model</button>
+            </section>
             <div class="viewport-fab">
               <button id="zoomIn" aria-label="Zoom in">+</button>
               <button id="zoomOut" aria-label="Zoom out">−</button>
@@ -186,35 +371,27 @@
           </div>
         </section>
 
-        <aside class="customizer" id="customizer" aria-label="Customizer">
-          <div class="pane-header"><b>Customizer</b><button id="closeCustomizer" aria-label="Close customizer">×</button></div>
-          <div class="customizer-body" id="customizerBody">
-            <div class="customizer-empty"><span>{ }</span><p>Named variables from your model appear here.</p></div>
-          </div>
-        </aside>
-
         <section class="console-pane" id="consolePane" aria-label="Console">
-          <div class="pane-header console-header">
-            <div class="console-tabs"><button class="active">Console</button><button>Problems <span id="problemCount">0</span></button></div>
-            <div class="console-actions"><button id="clearConsole">Clear</button><button id="collapseConsole" aria-label="Collapse console">⌄</button></div>
-          </div>
-          <div class="console-output" id="consoleOutput"><span class="timestamp">00:00:00</span><span class="info">ReOpenSCAD ready. Waiting for first preview.</span></div>
+          <div class="console-actions"><button id="clearConsole">Clear</button><button id="collapseConsole" aria-label="Collapse console">⌄</button></div>
+          <div class="console-output" id="consoleOutput" aria-live="polite"><span class="timestamp">00:00:00</span><span class="info">ReOpenSCAD ready. Waiting for first preview.</span></div>
         </section>
       </main>
 
       <footer class="status-bar">
         <div><span class="status-ready" id="statusDot"></span><span id="statusText">Ready</span></div>
-        <div class="status-attribution"><span>Independent reimplementation — not affiliated with or endorsed by the <a href="https://openscad.org" target="_blank" rel="noreferrer noopener">OpenSCAD project</a>.<span class="attribution-more"> Implements the OpenSCAD language; contains no OpenSCAD source code.</span></span><button type="button" class="status-disclaimer" id="showDisclaimer" title="Show the first-use disclaimer again">Disclaimer</button></div>
+        <div class="status-attribution"><span>Independent reimplementation — not affiliated with or endorsed by the <a href="https://openscad.org" target="_blank" rel="noreferrer noopener">OpenSCAD project</a>.<span class="attribution-more"> Implements the OpenSCAD language; contains no OpenSCAD source code.</span></span></div>
         <div class="status-right"><span id="cursorPosition">Ln 1, Col 1</span><span>Spaces: 2</span><span>UTF-8</span><span id="renderTime">No render yet</span></div>
       </footer>
     </div>
 
-    <div class="share-popover" id="sharePopover" hidden role="dialog" aria-label="Share this workspace">
+    <div class="mobile-sheet-scrim" id="mobileSheetScrim" hidden></div>
+
+    <div class="share-popover" id="sharePopover" hidden role="dialog" aria-label="Share this design">
       <b>Share</b>
       <div class="share-link">
         <label for="shareEditLink">Anyone with this link can edit</label>
         <div><input id="shareEditLink" readonly spellcheck="false" /><button type="button" data-copy="shareEditLink">Copy</button></div>
-        <small>The same link you are on. It is the only key this workspace has.</small>
+        <small>The same link you are on. It is the only key this design has.</small>
       </div>
       <div class="share-link">
         <label for="shareViewLink">Anyone with this link can view</label>
@@ -224,85 +401,75 @@
     </div>
 
     <div class="export-popover" id="exportPopover" hidden>
-      <b>Export model</b>
+      <b>Export all objects</b>
       <button data-format="stl"><span>STL</span><small>Mesh for fabrication</small></button>
-      <button data-format="stl" data-scope="selected"><span>STL · 1</span><small>Selected object only</small></button>
-      <button data-format="off"><span>OFF</span><small>Geometry exchange</small></button>
-      <button data-format="obj"><span>OBJ</span><small>Indexed mesh exchange</small></button>
-      <button data-format="3mf"><span>3MF</span><small>Slicer package with units</small></button>
+      <button data-format="3mf"><span>3MF</span><small>Slicer package, one object per part</small></button>
       <button data-format="step"><span>STEP</span><small>Solid B-rep for CAD</small></button>
+      <button data-format="obj"><span>OBJ</span><small>Indexed mesh exchange</small></button>
+      <button data-format="off"><span>OFF</span><small>Geometry exchange</small></button>
       <button data-format="glb"><span>GLB</span><small>glTF for web and AR</small></button>
       <button id="exportPng"><span>PNG</span><small>Current viewport image</small></button>
+      <small class="export-popover-hint">One file with every object as its own body, hidden ones included. Export one object from its row in Objects.</small>
     </div>
 
-    <div class="mcp-modal" id="mcpModal" hidden>
+    <div class="export-popover object-export-popover" id="objectExportPopover" role="menu" aria-labelledby="objectExportTitle" hidden>
+      <b id="objectExportTitle">Export object</b>
+      <div id="objectExportFormats"></div>
+      <small class="export-popover-hint" id="objectExportHint" hidden>The source changed since the last preview. Exporting previews it first so this object is current.</small>
+    </div>
+
+    <div class="mcp-modal connect-modal" id="mcpModal" hidden>
       <div class="mcp-scrim" id="mcpScrim"></div>
-      <div class="mcp-dialog" role="dialog" aria-modal="true" aria-labelledby="mcpTitle">
+      <div class="mcp-dialog connect-dialog" role="dialog" aria-modal="true" aria-labelledby="mcpTitle">
         <header class="mcp-head">
           <div class="mcp-head-text">
-            <span class="eyebrow">AI ready · Model Context Protocol</span>
-            <h2 id="mcpTitle">Wire an agent into this workspace</h2>
+            <span class="eyebrow">Connect AI</span>
+            <h2 id="mcpTitle">Let your AI agent build with you</h2>
           </div>
           <button class="mcp-close" id="closeMcp" aria-label="Close">×</button>
         </header>
-        <div class="mcp-body">
-          <div class="mcp-rail">
-            <section class="mcp-card">
-              <span class="mcp-label">Server endpoint</span>
-              <div class="mcp-endpoint"><b>POST</b><code id="mcpEndpoint">…</code></div>
-              <button class="mcp-copy" data-copy="mcpEndpoint"><i></i><span>Copy endpoint</span></button>
-              <p class="mcp-note">JSON-RPC 2.0 over HTTP — the <em>streamable-http</em> transport. No stdio, no auth, no SSE stream.</p>
-            </section>
-            <section class="mcp-card">
-              <span class="mcp-label">Connection check</span>
-              <button class="mcp-test" id="mcpTest"><i></i><span>Test connection</span></button>
-              <div class="mcp-status" id="mcpStatus" data-state="idle" aria-live="polite"><i></i><span>Not tested yet.</span></div>
-              <dl class="mcp-facts" id="mcpFacts" hidden></dl>
-            </section>
-            <section class="mcp-card">
-              <span class="mcp-label">This workspace</span>
-              <code class="mcp-id" id="mcpWorkspaceId">…</code>
-              <button class="mcp-copy" data-copy="mcpWorkspaceId"><i></i><span>Copy workspace id</span></button>
-              <p class="mcp-note">Every tool but <em>create_workspace</em> and <em>get_supported_scad</em> is scoped by this id — paste it into your first message so the agent edits <em>this</em> file.</p>
-            </section>
+        <div class="mcp-body connect-body">
+          <div class="connect-picker" id="connectPicker">
+            <p class="connect-intro">Pick the AI you use. Setup takes a minute, and afterwards it can open, edit and check designs while you watch them change here.</p>
+            <ul class="connect-grid" id="mcpTabs" aria-label="AI agents"></ul>
           </div>
-          <div class="mcp-main">
-            <div class="mcp-tabs" id="mcpTabs" role="tablist" aria-label="MCP clients"></div>
-            <div class="mcp-client" id="mcpClient"></div>
-          </div>
-          <section class="mcp-tools">
-            <div class="mcp-tools-head">
-              <span class="mcp-label">What the agent gets</span>
-              <span class="mcp-tools-count" id="mcpToolCount">read live from tools/list</span>
+          <div class="connect-guide" id="mcpClient" hidden></div>
+          <details class="connect-details">
+            <summary>Show details <small id="mcpStatusSummary">for developers</small></summary>
+            <div class="connect-details-body">
+              <section class="mcp-card">
+                <span class="mcp-label">Server address</span>
+                <div class="mcp-endpoint"><b>MCP</b><code id="mcpEndpoint">…</code></div>
+                <button class="mcp-copy" data-copy="mcpEndpoint"><i></i><span>Copy address</span></button>
+                <p class="mcp-note">Remote MCP over plain HTTP (<em>streamable-http</em>). No sign-in, nothing to install.</p>
+              </section>
+              <section class="mcp-card">
+                <span class="mcp-label">This design</span>
+                <code class="mcp-id" id="mcpWorkspaceId">…</code>
+                <button class="mcp-copy" data-copy="mcpWorkspaceId"><i></i><span>Copy design id</span></button>
+                <p class="mcp-note">Mention it to your agent so it edits <em>this</em> design instead of starting a new one.</p>
+              </section>
+              <section class="mcp-card">
+                <span class="mcp-label">Connection check</span>
+                <button class="mcp-test" id="mcpTest"><i></i><span>Test connection</span></button>
+                <div class="mcp-status" id="mcpStatus" data-state="idle" aria-live="polite"><i></i><span>Not tested yet.</span></div>
+                <dl class="mcp-facts" id="mcpFacts" hidden></dl>
+              </section>
+              <section class="mcp-tools">
+                <div class="mcp-tools-head">
+                  <span class="mcp-label">What the agent can do</span>
+                  <span class="mcp-tools-count" id="mcpToolCount">read live from tools/list</span>
+                </div>
+                <div class="mcp-tool-grid" id="mcpToolGrid"><div class="mcp-tools-empty">Run the connection check to list the tools this server actually advertises.</div></div>
+              </section>
             </div>
-            <div class="mcp-tool-grid" id="mcpToolGrid"><div class="mcp-tools-empty">Run the connection check to list the tools this server actually advertises.</div></div>
-          </section>
+          </details>
         </div>
       </div>
     </div>
 
-    <!-- First-use disclaimer. Same modal furniture as #mcpModal (scrim, dialog,
-         crop ticks) so there is one modal system, not two — but this one has no
-         close affordance and no scrim click: the only way out is the button. -->
-    <div class="mcp-modal disclaimer-modal" id="disclaimerModal" hidden>
-      <div class="mcp-scrim"></div>
-      <div class="mcp-dialog disclaimer-dialog" role="dialog" aria-modal="true" aria-labelledby="disclaimerTitle" aria-describedby="disclaimerBody">
-        <header class="mcp-head">
-          <div class="mcp-head-text">
-            <span class="eyebrow">Before you start</span>
-            <h2 id="disclaimerTitle">A hobby project, for demonstration only</h2>
-          </div>
-        </header>
-        <div class="mcp-body disclaimer-body" id="disclaimerBody">
-          <p>ReOpenSCAD is a hobby project, published for demonstration purposes. It is provided <b>as is</b>, with <b>no warranty</b> and <b>no liability</b> of any kind.</p>
-          <p><b>Workspaces are not private.</b> There is no login — the URL is the only key, so anyone holding the link can read and change your work.</p>
-          <p>Exported geometry is not checked for you. Verify it before you print or manufacture from it.</p>
-          <p class="disclaimer-affiliation" id="disclaimerAffiliation"></p>
-        </div>
-        <footer class="disclaimer-foot">
-          <button type="button" class="disclaimer-accept" id="acceptDisclaimer">I understand</button>
-        </footer>
-      </div>
+    <div class="agent-lightbox" id="agentLightbox" role="dialog" aria-label="What the agent saw" hidden>
+      <figure><img alt="" /><figcaption></figcaption></figure>
     </div>
 
     <script src="/app.js" defer></script>
