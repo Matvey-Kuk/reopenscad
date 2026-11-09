@@ -7134,7 +7134,13 @@ function focusComment(id) {
   $(`#feedbackList [data-comment-id="${CSS.escape(id)}"]`)?.scrollIntoView({ block: 'nearest' });
 }
 
-$('#feedbackButton').addEventListener('click', () => openFeedbackPanel());
+// The button shows pressed while in comment mode, so pressing it then turns the whole
+// feature off: the panel closes and comment mode ends, not just the panel.
+$('#feedbackButton').addEventListener('click', () => {
+  if (!commentMode) { openFeedbackPanel(); return; }
+  openFeedbackPanel(false);
+  leaveCommentMode();
+});
 $('#feedbackPanelClose').addEventListener('click', () => openFeedbackPanel(false));
 $('#feedbackAdd').addEventListener('click', () => {
   if (mobileLayout.matches) $('#feedbackPanel').hidden = true;
